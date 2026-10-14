@@ -1,0 +1,2676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Order shop</title>
+<meta name="description" content="Order custom embroidered and decorated apparel. Each organization gets its own shop with its own colors and pricing.">
+<meta property="og:title" content="Order shop">
+<meta property="og:description" content="Order custom embroidered and decorated apparel. Each organization gets its own shop with its own colors and pricing.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --canvas: #1B1D22;
+    --card: #F6F3EC;
+    --card-line: #DED8C8;
+    --ink: #232323;
+    --ink-soft: #6b6558;
+    --cream-ink: #F6F3EC;
+    --accent: #1E7A4C;
+    --accent-dark: #123A24;
+    --accent-soft: #E7F2EB;
+    --radius: 2px;
+    /* Passes WCAG AA (4.5:1) against both dark backgrounds used on this
+       page (--canvas #1B1D22 and the ticket panel #151619). --ink-soft
+       and the darker grays below were tuned for the light card
+       background only and fail contrast when reused on dark ones. */
+    --dim: #999999;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--canvas);
+    color:var(--cream-ink);
+    font-family:'IBM Plex Sans', sans-serif;
+    min-height:100vh;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3{font-family:'Fraunces', serif; font-weight:600; margin:0; letter-spacing:-0.01em;}
+  .mono{font-family:'IBM Plex Mono', monospace;}
+  a{color:inherit;}
+  button{font-family:inherit; cursor:pointer;}
+  :focus-visible{outline:2px solid #fff; outline-offset:3px;}
+
+  /* ---- stitch signature ---- */
+  .stitch{
+    height:1px;
+    background-image:linear-gradient(90deg, currentColor 0 6px, transparent 6px 12px);
+    background-size:12px 1px;
+    opacity:.55;
+    border:none;
+    margin:0;
+  }
+  .stitch-thick{
+    height:2px;
+    background-image:linear-gradient(90deg, currentColor 0 8px, transparent 8px 16px);
+    background-size:16px 2px;
+  }
+  .needle-mark{display:inline-block; width:.5em;}
+
+  /* ---- shell ---- */
+  .shell{max-width:960px; margin:0 auto; padding:0 24px;}
+  /* The storefront's 960px width is a deliberate reading-width choice for
+     product copy + the 2-column cart layout — but the admin panel's order
+     table has 13 columns and just needs more room, not narrower text. Only
+     admin views get the wider shell (toggled in render(), index.html). */
+  .shell.admin-wide{max-width:none; padding:0 16px;}
+  .topbar{
+    display:flex; align-items:baseline; justify-content:space-between;
+    padding:28px 0 18px 0;
+  }
+  .brand{font-family:'Fraunces', serif; font-weight:600; font-size:20px; letter-spacing:-0.01em;}
+  .brand small{display:block; font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:400; letter-spacing:.08em; text-transform:uppercase; opacity:.5; margin-top:2px;}
+  .backlink{font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:.04em; text-transform:uppercase; opacity:.7; text-decoration:none;}
+  .backlink:hover{opacity:1;}
+
+  /* ---- hub ---- */
+  .hub-hero{padding:40px 0 8px 0;}
+  .hub-hero h1{font-size:clamp(32px,5vw,48px); color:#fff; max-width:640px; line-height:1.05;}
+  .hub-hero p{color:#a9a89e; max-width:480px; margin-top:14px; font-size:15px; line-height:1.6;}
+  .tags{display:grid; grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); gap:18px; padding:36px 0 60px 0;}
+  .tag{
+    position:relative;
+    background:var(--card);
+    color:var(--ink);
+    border-radius:var(--radius);
+    padding:22px 20px 20px 20px;
+    text-decoration:none;
+    display:block;
+    transition:transform .15s ease;
+  }
+  .tag:hover{transform:translateY(-3px);}
+  .tag::before{
+    content:"";
+    position:absolute; top:14px; right:16px;
+    width:10px; height:10px; border-radius:50%;
+    border:2px solid var(--org-accent, #1E7A4C);
+  }
+  .tag .org-eyebrow{font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.1em; color:var(--ink-soft);}
+  .tag h3{font-size:21px; margin-top:6px; line-height:1.15; color:var(--ink);}
+  .tag .status{
+    margin-top:14px; font-family:'IBM Plex Mono',monospace; font-size:11px;
+    text-transform:uppercase; letter-spacing:.06em;
+    color:var(--ink-soft);
+  }
+  .tag .status.open{color:var(--org-accent,#1E7A4C); font-weight:600;}
+  .tag .stitch{margin-top:14px; color:var(--ink-soft);}
+
+  /* ---- org page ---- */
+  .org-hero{padding:20px 0 30px 0; border-bottom:none;}
+  .org-eyebrow-lg{font-family:'IBM Plex Mono',monospace; font-size:12px; text-transform:uppercase; letter-spacing:.12em; color:color-mix(in srgb, var(--org-accent) 65%, white 35%); font-weight:600;}
+  .org-hero h1{font-size:clamp(30px,5vw,44px); color:#fff; margin-top:8px;}
+  .org-hero .stitch{margin-top:18px; color:var(--org-accent);}
+  .org-hero p.desc{color:#a9a89e; max-width:560px; margin-top:16px; font-size:15px; line-height:1.6;}
+
+  .not-ready{
+    background:var(--card); color:var(--ink); border-radius:var(--radius);
+    padding:40px 32px; margin:24px 0 60px 0; text-align:left;
+  }
+  .not-ready .stitch{color:var(--org-accent); margin-bottom:18px;}
+  .not-ready h2{font-size:22px;}
+  .not-ready p{color:var(--ink-soft); font-size:14px; margin-top:10px; line-height:1.6;}
+
+  .layout{display:grid; grid-template-columns:1.5fr 1fr; gap:0; margin:24px 0 60px 0;}
+  @media(max-width:760px){.layout{grid-template-columns:1fr;}}
+
+  .catalog{background:var(--card); color:var(--ink); border-radius:var(--radius) 0 0 var(--radius); padding:28px;}
+  @media(max-width:760px){.catalog{border-radius:var(--radius) var(--radius) 0 0;}}
+  .catalog h2:not(.cat-heading){font-size:12px; text-transform:uppercase; letter-spacing:.12em; font-family:'IBM Plex Mono',monospace; color:var(--ink-soft); margin-bottom:18px; font-weight:600;}
+
+  .cat-nav{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px;}
+  .cat-nav-link{
+    font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:600;
+    text-transform:uppercase; letter-spacing:.1em; text-decoration:none;
+    padding:5px 12px; border-radius:20px;
+    border:1px solid var(--org-accent,var(--card-line)); color:var(--org-accent,var(--ink));
+    transition:background .15s,color .15s;
+  }
+  .cat-nav-link:hover{background:var(--org-accent,var(--card-line)); color:var(--org-accent-ink,#fff);}
+
+  .cat-section{margin-bottom:8px;}
+  .cat-heading{
+    font-family:'Fraunces',serif; font-size:22px; font-weight:700;
+    color:var(--ink); letter-spacing:-0.01em;
+    padding:24px 0 10px 0; border-bottom:3px solid var(--org-accent,var(--accent)); margin-bottom:0;
+    scroll-margin-top:16px;
+  }
+  .cat-section:first-child .cat-heading{padding-top:0;}
+
+  .product{border-top:1px solid var(--card-line); padding:20px 0;}
+  .product:first-of-type{border-top:none; padding-top:0;}
+  .product-head{display:flex; justify-content:space-between; align-items:flex-start; gap:12px;}
+  .product-head h3{font-size:18px;}
+  .product-price{font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; color:var(--org-accent); white-space:nowrap;}
+  .product-desc{font-size:13px; color:var(--ink-soft); margin-top:4px; line-height:1.55; max-width:420px;}
+  .feature-list{list-style:none; margin:8px 0 0 0; padding:0; display:flex; flex-direction:column; gap:3px;}
+  .feature-list li{font-size:12px; color:var(--ink-soft); padding-left:14px; position:relative; line-height:1.5;}
+  .feature-list li::before{content:"\2014"; position:absolute; left:0; color:var(--org-accent); font-size:11px;}
+
+  .product-images{display:flex; gap:8px; margin-top:8px;}
+  .product-images a{display:inline-block; line-height:0;}
+  .product-images img{
+    width:96px; height:96px; object-fit:contain; background:#fff;
+    border:1px solid var(--card-line); border-radius:2px;
+    transition:opacity .15s ease; cursor:zoom-in;
+  }
+  .product-images a:hover img{opacity:.85;}
+
+  .design-preview{margin-bottom:8px;}
+  .design-preview-imgs{display:flex; gap:12px; flex-wrap:wrap;}
+  .design-preview-imgs a{display:inline-block; line-height:0;}
+  .design-preview-imgs img{
+    border-radius:2px; border:1px solid var(--card-line); background:#fff;
+    height:150px; width:auto; object-fit:contain; transition:opacity .15s ease;
+    cursor:zoom-in;
+  }
+  .design-preview-imgs a:hover img{opacity:.85;}
+  .design-preview-caption{font-size:11px; color:var(--dim); margin-top:6px; font-family:'IBM Plex Mono',monospace;}
+  .product-controls{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center;}
+  select, input[type=text], input[type=email], input[type=tel]{
+    font-family:'IBM Plex Mono', monospace; font-size:13px;
+    border:1px solid var(--card-line); background:#fff; color:var(--ink);
+    padding:8px 10px; border-radius:var(--radius);
+  }
+  .qty-input{width:56px; text-align:center;}
+  .add-btn{
+    font-family:'IBM Plex Mono',monospace; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+    background:var(--org-accent); color:var(--org-accent-ink,#fff); border:none; padding:9px 16px; border-radius:var(--radius);
+    font-weight:600;
+  }
+  .add-btn:hover{filter:brightness(1.08);}
+  .stock-badge-wrap{display:block; margin-top:8px;}
+  .stock-badge{display:inline-block; font-size:11px; font-weight:600; color:#166534; background:#dcfce7; border:1px solid #bbf7d0; border-radius:4px; padding:2px 8px; letter-spacing:.01em;}
+  .personalize-row{display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px; color:var(--ink-soft);}
+  .personalize-row input[type=checkbox]{accent-color:var(--org-accent);}
+  /* The customer's own design (migrations/0054): the upload box under a product or a location. */
+  .cd-box{margin-top:10px; padding:10px; border:1px dashed #cfcabf; border-radius:8px; font-size:13px; color:var(--ink-soft);}
+  .cd-box[hidden]{display:none;}
+  .cd-head{font-weight:600; color:inherit; margin-bottom:6px;}
+  .cd-file{display:block; max-width:100%; font-size:13px;}
+  .cd-rules, .cd-hint{font-size:12px; margin-top:6px;}
+  .cd-status{font-size:12px; margin-top:6px; min-height:1em; overflow-wrap:anywhere;}
+  .cd-status.cd-err{color:#b42318;}
+  .cd-status.cd-warn{color:#8a5a00;}
+  .cd-preview{margin-top:6px;}
+  .cd-preview a{display:inline-block; line-height:0;}
+  .cd-preview img{max-width:120px; max-height:120px; object-fit:contain; border:1px solid #cfcabf; border-radius:8px; background:#fff; cursor:zoom-in;}
+  .cart-line .l-desc .cd-cart{display:flex; align-items:center; gap:6px; overflow-wrap:anywhere;}
+  .cart-line .l-desc .cd-cart img{width:32px; height:32px; object-fit:contain; border:1px solid #cfcabf; border-radius:4px; background:#fff; flex:none;}
+
+  /* ---- ticket / cart panel ---- */
+  .ticket{
+    background:#151619; color:#F6F3EC; padding:28px; border-radius:0 var(--radius) var(--radius) 0;
+    display:flex; flex-direction:column;
+  }
+  @media(max-width:760px){.ticket{border-radius:0 0 var(--radius) var(--radius);}}
+  .ticket h2{font-size:12px; text-transform:uppercase; letter-spacing:.12em; font-family:'IBM Plex Mono',monospace; color:#8b8a82; margin-bottom:16px; font-weight:600;}
+  .cart-empty{color:var(--dim); font-size:13px; padding:20px 0; font-family:'IBM Plex Mono',monospace;}
+  .cart-line{display:flex; justify-content:space-between; gap:10px; font-size:13px; padding:10px 0; border-bottom:1px dashed #3a3a38;}
+  .cart-line .l-desc{line-height:1.4;}
+  .cart-line .l-desc small{display:block; color:#8b8a82; font-family:'IBM Plex Mono',monospace; font-size:11px; margin-top:2px;}
+  .cart-line .l-price{font-family:'IBM Plex Mono',monospace; white-space:nowrap;}
+  .cfg-field-label{font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:4px;}
+  .cfg-swatches{display:flex; gap:6px; flex-wrap:wrap; margin-bottom:4px;}
+  .cfg-swatch{font-size:12px; padding:5px 10px; border:1px solid #cfcabf; border-radius:16px; background:#fff; cursor:pointer;}
+  .cfg-swatch.sel{border-color:var(--org-accent); background:var(--org-accent); color:#fff;}
+  .cfg-locs{display:flex; flex-direction:column; gap:8px;}
+  .cfg-loc-label{display:block; font-size:12px; font-weight:600;}
+  .cfg-loc-select,.cfg-ink-select{width:100%; margin-top:3px;}
+  .cfg-preview{display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;}
+  .cfg-prev-item{position:relative; width:72px; height:72px;}
+  .cfg-prev-item a{display:block; line-height:0;}
+  .cfg-prev-item img{width:72px; height:72px; object-fit:contain; border:1px solid #cfcabf; border-radius:8px; transition:opacity .15s ease; cursor:zoom-in;}
+  .cfg-prev-item a:hover img{opacity:.85;}
+  /* A composed mockup is a full-garment photo — show it larger and whole, not a cropped patch;
+     a white background so a photo (typically shot on white) reads cleanly. */
+  .cfg-prev-item.cfg-prev-mockup{width:150px; height:170px;}
+  .cfg-prev-item.cfg-prev-mockup img{width:150px; height:170px; object-fit:contain; background:#fff;}
+  .cfg-prev-badge{position:absolute; left:0; bottom:0; right:0; font-size:10px; text-align:center; background:rgba(0,0,0,.6); color:#fff; border-radius:0 0 8px 8px; padding:1px 0;}
+  .cfg-breakdown{margin-top:8px; font-size:12px; color:var(--ink-soft);}
+  .cfg-bd-row{display:flex; justify-content:space-between; gap:10px;}
+  .remove-x{background:none; border:none; color:#8b8a82; font-size:14px; margin-left:8px;}
+  .remove-x:hover{color:#fff;}
+  .ticket-total{display:flex; justify-content:space-between; align-items:baseline; padding-top:16px; margin-top:8px; border-top:1px solid #3a3a38;}
+  .ticket-total .t-label{font-family:'IBM Plex Mono',monospace; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#8b8a82;}
+  .ticket-total .t-amount{font-family:'IBM Plex Mono',monospace; font-size:24px; font-weight:600; color:var(--org-accent);}
+
+  .checkout-fields{margin-top:20px; display:flex; flex-direction:column; gap:10px;}
+  .checkout-fields input{background:#0f1012; border:1px solid #3a3a38; color:#F6F3EC;}
+  .checkout-fields input::placeholder{color:#6b6a63;}
+  .place-order-btn{
+    margin-top:16px; background:var(--org-accent); color:var(--org-accent-ink,#fff); border:none; padding:14px; border-radius:var(--radius);
+    font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:.08em;
+  }
+  .place-order-btn:disabled{background:#3a3a38; color:#6b6a63; cursor:not-allowed;}
+  .place-order-btn:not(:disabled):hover{filter:brightness(1.08);}
+  .form-hint{font-size:11px; color:var(--dim); margin-top:-4px; font-family:'IBM Plex Mono',monospace;}
+
+  .confirmation{
+    background:var(--card); color:var(--ink); border-radius:var(--radius); padding:40px 32px; margin:24px 0 60px 0;
+  }
+  .confirmation .stitch{color:var(--org-accent); margin-bottom:18px;}
+  .confirmation h2{font-size:24px;}
+  .order-number{font-family:'IBM Plex Mono',monospace; font-size:13px; color:var(--org-accent); font-weight:600; margin-top:4px;}
+  .confirmation p{color:var(--ink-soft); font-size:14px; margin-top:14px; line-height:1.6;}
+  .confirmation-back{
+    display:inline-block; margin-top:20px; font-family:'IBM Plex Mono',monospace; font-size:12px;
+    text-transform:uppercase; letter-spacing:.06em; color:var(--org-accent); text-decoration:none; font-weight:600;
+  }
+
+  /* ---- admin ---- */
+  .admin-panel{background:var(--card); color:var(--ink); border-radius:var(--radius); padding:28px; margin:8px 0 60px 0;}
+  .admin-panel.orders-panel{background:var(--card); border-radius:0; padding:16px 0; margin:0 0 40px;}
+  .admin-panel h2{font-size:12px; text-transform:uppercase; letter-spacing:.12em; font-family:'IBM Plex Mono',monospace; color:var(--ink-soft); margin-bottom:16px; font-weight:600;}
+  .admin-lock{display:flex; gap:8px; max-width:320px;}
+  /* The table has more columns than fit in the card's width — without
+     this, the overflow renders past the card's cream background onto
+     the page's dark background behind it, making that spilled-over text
+     unreadable. Scrolling inside this wrapper instead keeps the whole
+     table on the card's own background at every scroll position. */
+  .admin-table-wrap{max-height:62vh; overflow:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--card-line); border-radius:4px;}
+  .admin-table-wrap thead th{position:sticky; top:0; z-index:2; background:var(--card);}
+  /* Orders table: capped at half the screen height so its horizontal scrollbar
+     is in view below the page header and bulk buttons; rows scroll inside it
+     and the header row stays put. */
+  .orders-table-wrap{max-height:50vh; overflow:auto; border:1px solid var(--card-line); border-radius:4px;}
+  .orders-table-wrap .admin-table{margin-top:0;}
+  .orders-table-wrap thead th{position:sticky; top:0; z-index:2; background:var(--card);}
+  .admin-table{width:100%; border-collapse:collapse; font-size:12px; font-family:'IBM Plex Mono',monospace; margin-top:6px;}
+  .admin-table th{text-align:left; padding:6px 10px; border-bottom:2px solid var(--card-line); color:var(--ink-soft); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.05em;}
+  .admin-table td{padding:6px 10px; border-bottom:1px solid color-mix(in srgb,var(--card-line) 30%,transparent); vertical-align:top;}
+  .admin-empty{color:var(--ink-soft); font-size:13px; padding:20px 0;}
+  .admin-actions{display:flex; gap:10px; margin-top:16px; flex-wrap:wrap;}
+  .admin-btn{
+    font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+    /* Fall back to --accent when a button sits outside an org panel that sets --org-accent
+       (e.g. the Orders filter bar, or the All-shops table) — otherwise the background is
+       invalid and the white text lands on the cream panel, unreadable. */
+    background:var(--org-accent, var(--accent)); color:var(--org-accent-ink,#fff); border:none; padding:8px 14px; border-radius:var(--radius); font-weight:600;
+  }
+  /* ---- admin: persistent header (shops + tools) ---- */
+  #adminNav{position:sticky; top:0; z-index:900; background:#fff; border-bottom:1px solid var(--card-line); padding:8px 16px; box-shadow:0 1px 4px rgba(0,0,0,.12);}
+  /* The per-page header (breadcrumb + title) is redundant with the highlighted menu above,
+     so it's removed entirely on admin screens — content sits right under the sticky menu.
+     Applied only to admin.js pages (they add .admin-hero); the storefront's .org-hero is
+     untouched. */
+  .admin-hero{display:none!important;}
+  .admin-nav-row{display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:2px 0;}
+  .admin-nav-label{font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-soft); margin:0 4px 0 8px;}
+  .admin-nav-btn{font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:.03em; background:#fff; color:var(--ink); border:1px solid #bbb; border-radius:var(--radius); padding:5px 10px; cursor:pointer;}
+  .admin-nav-btn:hover{background:var(--accent-soft);}
+  .admin-nav-btn.active{background:var(--accent); color:#fff; border-color:var(--accent);}
+  .admin-nav-out{margin-left:auto; color:#666;}
+  /* Grouped dropdowns so the whole admin menu fits on one line. */
+  .admin-nav-group{position:relative; display:inline-block;}
+  .admin-nav-drop::after{content:" \25be"; font-size:9px; opacity:.7;}
+  .admin-nav-menu{position:absolute; top:calc(100% + 4px); left:0; z-index:950; background:#fff; border:1px solid var(--card-line); border-radius:6px; box-shadow:0 6px 18px rgba(0,0,0,.16); min-width:190px; padding:5px; display:none; flex-direction:column; gap:2px;}
+  .admin-nav-group.open .admin-nav-menu{display:flex;}
+  .admin-nav-menu .admin-nav-btn{display:block; width:100%; text-align:left; border-color:transparent; background:#fff; white-space:nowrap;}
+  .admin-nav-menu .admin-nav-btn:hover{background:var(--accent-soft);}
+  .admin-nav-menu .admin-nav-btn.active{background:var(--accent); color:#fff;}
+  .admin-summary{font-family:'IBM Plex Mono',monospace; font-size:13px; margin-bottom:14px; color:var(--ink-soft);}
+  .admin-summary strong{color:var(--ink);}
+  textarea.export-box{
+    width:100%; margin-top:14px; font-family:'IBM Plex Mono',monospace; font-size:11px;
+    padding:10px; border:1px solid var(--card-line); border-radius:var(--radius); min-height:100px;
+  }
+
+  /* ---- admin: dynamic catalog forms (create/edit org, create/edit product) ---- */
+  .admin-form{display:flex; flex-direction:column; gap:12px; max-width:520px; margin-top:6px;}
+  .admin-form label{font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-soft); display:flex; flex-direction:column; gap:5px;}
+  .admin-form input[type=text], .admin-form input[type=email], .admin-form input[type=password], .admin-form input[type=number], .admin-form input[type=url], .admin-form input[type=date], .admin-form textarea, .admin-form select{
+    font-family:'IBM Plex Mono', monospace; font-size:13px; border:1px solid var(--card-line);
+    background:#fff; color:var(--ink); padding:8px 10px; border-radius:var(--radius); width:100%;
+  }
+  .admin-form textarea{min-height:70px; resize:vertical;}
+  .admin-form .checkbox-row{flex-direction:row; align-items:center; gap:8px;}
+  .admin-form .checkbox-row input{width:auto;}
+  /* Tick lists inside the product form (blanks, colors): plain rows, not field labels. */
+  .admin-form label.pick-row{flex-direction:row; align-items:center; gap:6px; font-family:inherit; font-size:13px; text-transform:none; letter-spacing:0; color:var(--ink);}
+  .admin-form label.pick-row input{width:auto; margin:0;}
+  .size-price-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(90px,1fr)); gap:10px;}
+  .size-price-grid label{gap:3px;}
+  .admin-error{color:#b3261e; font-size:13px; margin-top:8px; font-family:'IBM Plex Mono',monospace;}
+  .admin-note{color:var(--ink-soft); font-size:12px; margin-top:2px; line-height:1.5;}
+  .img-upload{display:flex; align-items:center; gap:10px; margin-top:6px; flex-wrap:wrap;}
+  .img-upload input[type=file]{font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--ink-soft);}
+  .img-upload-status{font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--ink-soft);}
+
+  /* ---- admin: passphrase prompt (masked input, replaces window.prompt()) ---- */
+  .bulk-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 12px;background:var(--card-bg);border:1px solid var(--card-line);border-radius:6px;margin-bottom:8px;}
+  .bulk-bar-count{font-weight:600;font-size:13px;min-width:80px;}
+  .order-select{width:15px;height:15px;cursor:pointer;accent-color:var(--org-accent,var(--accent));}
+
+  /* ---- admin: cancel / refund states ---- */
+  .admin-btn-sm{font-size:11px;padding:3px 8px;}
+  tr.item-canceled td{opacity:.55;}
+  .canceled-badge{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);white-space:nowrap;}
+  .cancel-reason{font-size:11px;color:var(--ink-soft);max-width:120px;word-break:break-word;}
+  .late-cancel-warn{font-size:11px;color:#b85c00;font-weight:600;cursor:help;}
+  .refund-badge{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#1a6a2e;}
+  .muted-cell{font-size:11px;color:var(--ink-soft);}
+
+  /* ---- admin: phone layouts (admin.js picks the Orders cards via adminIsMobile_, same 760px) ---- */
+  .admin-nav-mobile{display:none;}
+  .dsg-layout{display:grid; grid-template-columns:260px 1fr; gap:20px;}
+  .dsg-layout #dsgList{max-height:70vh; overflow-y:auto;}
+  .dsg-layout #dsgDetail{max-height:75vh; overflow-y:auto;}
+  .dsg-back{display:none;}
+  .order-cards{display:flex; flex-direction:column; gap:10px;}
+  .order-card{background:#fff; color:var(--ink); border:1px solid var(--card-line); border-radius:8px; padding:12px; font-size:14px; line-height:1.4;}
+  .oc-head{display:flex; gap:10px; align-items:flex-start;}
+  .oc-head .order-select{width:22px; height:22px; margin-top:2px; flex:none;}
+  .oc-who{flex:1; min-width:0;}
+  .oc-name{font-weight:700; font-size:15px; overflow-wrap:anywhere;}
+  .oc-dim{color:var(--ink-soft); font-size:12px;}
+  .oc-amt{text-align:right; flex:none;}
+  .oc-total{font-weight:700; font-size:15px;}
+  .oc-num{white-space:nowrap; font-variant-numeric:tabular-nums;}
+  .oc-icon-btn{font-size:12px; padding:2px 7px; margin-left:2px; border:1px solid #ccc; border-radius:4px; background:#fff; color:var(--ink-soft); cursor:pointer;}
+  .oc-tag{font-size:10px; font-weight:700; padding:1px 5px; border-radius:3px;}
+  .oc-tag-void{background:#fee2e2; color:#b03a2e;}
+  .oc-tag-test{background:#e0e7ff; color:#3730a3;}
+  .oc-status{margin:8px 0 4px;}
+  .oc-chip{display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; background:#eef3ee; color:#1f4d2e; margin:0 4px 4px 0;}
+  .oc-chip br{display:none;}
+  .oc-chip-done{background:#dcfce7; color:#166534;}
+  .oc-chip-bad{background:#fee2e2; color:#b03a2e;}
+  .oc-chip-warn{background:#fef3c7; color:#92400e;}
+  .oc-items{list-style:none; margin:6px 0; padding:0; border-top:1px solid #eee;}
+  .oc-items li{padding:6px 0; border-bottom:1px solid #eee;}
+  .oc-item-main{display:flex; justify-content:space-between; gap:10px;}
+  .oc-item-cancelled .oc-item-main{opacity:.55;}
+  .oc-item-extra{margin-top:4px;}
+  .oc-money, .oc-track{font-size:13px; margin:6px 0;}
+  .oc-more{margin:6px 0; font-size:13px;}
+  .oc-more summary{cursor:pointer; color:var(--ink-soft); padding:4px 0;}
+  .oc-more dl{display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:6px 0 0;}
+  .oc-more dt{color:var(--ink-soft);}
+  .oc-more dd{margin:0;}
+  .oc-actions{display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;}
+  .oc-actions > select, .oc-actions > span, .oc-actions > div{flex:1 1 100%; margin:0!important;}
+  .oc-actions > select{font-size:15px!important; padding:9px 8px!important;}
+  .oc-actions > .admin-btn{flex:1 1 calc(50% - 6px); margin:0!important; padding:10px 8px;}
+  .oc-select-all{display:flex; align-items:center; gap:8px; margin:0 0 8px; font-size:14px;}
+  .oc-select-all input{width:20px; height:20px;}
+  @media (max-width:760px){
+    .shell.admin-wide{padding:0 10px;}
+    .admin-panel{padding:14px;}
+    .admin-panel.orders-panel{padding:8px 0;}
+    /* Header: one "☰ Menu" bar; the sheet lists every page, full width. */
+    #adminNav{padding:6px 10px;}
+    #adminNav .admin-nav-row{display:none;}
+    .admin-nav-mobile{display:flex; align-items:center; gap:10px; position:relative;}
+    .admin-nav-menu-btn{font-size:14px; padding:8px 14px;}
+    .admin-nav-current{font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; color:var(--ink);}
+    .admin-nav-sheet{left:0; right:0; min-width:0; max-height:75vh; overflow-y:auto; padding:8px;}
+    .admin-nav-sheet .admin-nav-btn{font-size:14px; padding:10px 12px; white-space:normal;}
+    .admin-nav-sheet-group{border-top:1px solid #eee; margin-top:6px; padding-top:6px;}
+    .admin-nav-sheet .admin-nav-label{display:block; margin:4px 4px 2px;}
+    /* Orders filter bar: full-width shop, dates side by side, bigger tap targets. */
+    .orders-filter-bar{display:grid!important; grid-template-columns:1fr 1fr; gap:10px!important;}
+    .orders-filter-bar > label:first-child, .orders-filter-bar > div{grid-column:1 / -1;}
+    .orders-filter-bar select, .orders-filter-bar input[type=date]{width:100%; min-width:0!important; font-size:15px!important; padding:8px!important; box-sizing:border-box;}
+    .orders-filter-bar .checkbox-row{font-size:14px;}
+    .orders-filter-bar > .admin-btn{width:100%;}
+    /* The bulk bar floats at the bottom of the screen while orders are ticked, scrolling sideways. */
+    .bulk-bar{position:fixed; left:8px; right:8px; bottom:8px; z-index:850; flex-wrap:nowrap; overflow-x:auto; background:#fff; box-shadow:0 2px 14px rgba(0,0,0,.3); margin:0;}
+    .bulk-bar > *{flex:none;}
+    #ordBreakdownSection{overflow-x:auto;}
+    /* Tables marked .stack-mobile turn into one card per row, labelled by data-label. */
+    table.stack-mobile, table.stack-mobile tbody, table.stack-mobile tr, table.stack-mobile td{display:block; width:100%;}
+    table.stack-mobile thead{display:none;}
+    table.stack-mobile tr{background:#fff; border:1px solid var(--card-line); border-radius:8px; padding:10px 12px; margin-bottom:10px;}
+    table.stack-mobile td{border:none!important; padding:2px 0!important; font-size:13px;}
+    table.stack-mobile td[data-label]::before{content:attr(data-label) ": "; color:var(--ink-soft); font-size:11px; text-transform:uppercase; letter-spacing:.04em;}
+    table.stack-mobile td.stack-title{font-weight:700; font-size:15px; order:-1;}
+    table.stack-mobile td.stack-title::before{content:none;}
+    table.stack-mobile td.stack-actions{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;}
+    table.stack-mobile td.stack-actions .admin-btn{flex:1 1 auto; margin:0!important; padding:10px;}
+    table.stack-mobile tr{display:flex; flex-direction:column;}
+    .admin-table-wrap:has(> table.stack-mobile){max-height:none; overflow:visible; border:none;}
+    /* Forms: one column, inputs big enough not to trigger iOS zoom. */
+    .admin-form{max-width:none;}
+    .admin-form input[type=text], .admin-form input[type=email], .admin-form input[type=password], .admin-form input[type=number], .admin-form input[type=url], .admin-form input[type=date], .admin-form textarea, .admin-form select{font-size:16px;}
+    .admin-actions .admin-btn{flex:1 1 auto;}
+    /* Designs: the list, or the open design — not both squeezed side by side. */
+    .dsg-layout{grid-template-columns:1fr; margin:8px 0 40px!important;}
+    .dsg-layout #dsgList, .dsg-layout #dsgDetail{max-height:none; overflow:visible;}
+    .dsg-layout.dsg-has-open .dsg-list-col{display:none;}
+    .dsg-back{display:inline-block; margin-bottom:12px;}
+    .dsg-detail-col canvas{width:100%!important; height:auto!important; aspect-ratio:1;}
+    /* Product form → Blank links: size | blank | blank size on one line, "Use for all" under it. */
+    .blank-links-table thead{display:none;}
+    .blank-links-table tr{display:grid; grid-template-columns:44px 1fr 88px; align-items:center; gap:6px; padding:5px 0; border-bottom:1px solid #eee;}
+    .blank-links-table td{padding:0!important;}
+    .blank-links-table td:empty{display:none;}
+    .blank-links-table td:nth-child(4){grid-column:2 / -1;}
+    .blank-links-table select{min-width:0!important; width:100%; font-size:15px!important; padding:7px 6px!important;}
+  }
+
+  /* ---- print: @page at top level (not inside @media print) so all browsers honor it ---- */
+  @page{size:letter;margin:0;}
+
+  /* ---- admin: packing labels (Avery 5160 — 2.625"×1", 3 cols × 10 rows) ----
+     Uses CSS `in` units so dimensions are exact at print time.
+     Side margins: 0.1875" (3/16"), column gap: 0.125" (1/8"), top margin: 0.5".
+     Check: 0.1875×2 + 2.625×3 + 0.125×2 = 0.375 + 7.875 + 0.25 = 8.5" ✓ */
+  .label-sheet{
+    width:8.5in; box-sizing:border-box;
+    padding:0.5in 0.1875in 0 0.1875in;
+    display:flex; flex-wrap:wrap; column-gap:0.125in; row-gap:0;
+    background:#fff; color:#000;
+  }
+  .packing-label{
+    width:2.625in; height:1in; box-sizing:border-box; overflow:hidden;
+    padding:0.06in 0.1in;
+    display:flex; flex-direction:column; justify-content:flex-start;
+    border:0.5pt dashed #bbb; /* guide line — hidden when printing */
+  }
+  .packing-label-name{font-family:'Fraunces',serif;font-size:9pt;font-weight:700;line-height:1.2;margin-bottom:1pt;}
+  .packing-label-orderid{font-family:'IBM Plex Mono',monospace;font-size:6pt;color:#555;margin-bottom:2pt;letter-spacing:.03em;}
+  .packing-label-items{margin:0;padding:0;list-style:none;font-size:7pt;line-height:1.35;font-family:'IBM Plex Sans',sans-serif;}
+  .packing-label-items li{padding-left:8pt;position:relative;}
+  .packing-label-items li::before{content:"•";position:absolute;left:0;color:#555;}
+  .mail-label-name{font-family:'Fraunces',serif;font-size:9.5pt;font-weight:700;line-height:1.2;margin-bottom:2pt;}
+  .mail-label-line{font-size:8pt;line-height:1.4;font-family:'IBM Plex Sans',sans-serif;}
+  /* Branded labels (Avery 2163 mini-sheet, 4.25"×10", 2 pairs of 2) — on-screen preview */
+  .bl-sheet{
+    width:4.25in; height:10in; box-sizing:border-box;
+    padding:0.25in 0.125in;
+    display:flex; flex-direction:column; justify-content:space-between;
+    background:#fff; color:#000;
+    margin-bottom:16px; /* visual gap between sheets in on-screen preview */
+  }
+  .bl-pair{display:flex;flex-direction:column;}
+  .bl{
+    position:relative; width:4in; height:2in; max-height:2in; box-sizing:border-box; overflow:hidden;
+    padding:0.1in 0.12in 0.08in 0.12in;
+    display:flex; flex-direction:column; flex-shrink:0;
+  }
+  .bl-content{flex:1;min-width:0;display:flex;flex-direction:column;}
+  .bl-top-text{min-height:0.75in;padding-right:calc(0.75in + 8pt);}
+  .bl-orgname{font-family:'Fraunces',serif;font-size:10pt;font-weight:700;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .bl-byline{font-size:6pt;color:#555;font-family:'IBM Plex Sans',sans-serif;margin-top:1pt;}
+  .bl-reorder{font-size:6pt;color:#666;font-family:'IBM Plex Sans',sans-serif;letter-spacing:.02em;margin-top:2pt;}
+  .bl-gap{height:0.05in;flex-shrink:0;}
+  .bl-qr{position:absolute;top:0.1in;right:0.12in;display:block;width:0.75in;height:0.75in;}
+  .bl-header-row{display:flex;justify-content:space-between;align-items:baseline;gap:4pt;margin-bottom:1pt;}
+  .bl-customer{font-family:'Fraunces',serif;font-size:9pt;font-weight:700;line-height:1.2;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .bl-orderid{font-family:'IBM Plex Mono',monospace;font-size:6pt;color:#555;letter-spacing:.03em;flex:0 0 auto;white-space:nowrap;}
+  .bl-items{margin:0;padding:0;list-style:none;font-size:7pt;line-height:1.35;font-family:'IBM Plex Sans',sans-serif;}
+  .bl-items li{padding-left:8pt;position:relative;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .bl-items li::before{content:"•";position:absolute;left:0;color:#555;}
+
+  .lbl-controls{
+    position:sticky; top:0; z-index:100;
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    background:#f5f5f5; border-bottom:1px solid #ddd;
+    padding:8px 12px; margin:0 0 4px 0;
+  }
+  .lbl-controls label{font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;}
+
+  @media print{
+    .no-print,.lbl-controls{display:none!important; visibility:hidden!important;}
+    .org-hero,.admin-actions,.bulk-bar,.export-box,.admin-summary,#adminNav{display:none!important;}
+    .packing-label,.bl{border:none;}
+    body{background:#fff!important;color:#000!important;}
+  }
+
+  .breadcrumbs{font-size:12px;font-family:'IBM Plex Mono',monospace;margin-bottom:8px;padding:4px 0;}
+  .bc-link{color:var(--org-accent,var(--accent));text-decoration:none;}
+  .bc-link:hover{text-decoration:underline;}
+  .bc-sep{color:var(--ink-soft);margin:0 4px;}
+  .bc-current{color:var(--ink);font-weight:600;}
+  .admin-pass-overlay{
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:flex; align-items:center; justify-content:center; z-index:1000; padding:20px;
+  }
+  .admin-pass-box{
+    background:var(--card); color:var(--ink); border-radius:var(--radius);
+    padding:24px; max-width:320px; width:100%;
+    /* Tall prompts scroll inside the box, so Cancel / Submit are always reachable. */
+    max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box;
+  }
+  .admin-pass-box label{
+    font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--ink-soft); display:block; margin-bottom:8px;
+  }
+  .admin-pass-box input[type=password]{
+    font-family:'IBM Plex Mono', monospace; font-size:14px; border:1px solid var(--card-line);
+    background:#fff; color:var(--ink); padding:9px 10px; border-radius:var(--radius); width:100%;
+  }
+  .admin-pass-actions{display:flex; gap:10px; margin-top:16px; justify-content:flex-end;}
+  .admin-pass-actions button{
+    font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+    border:none; padding:8px 14px; border-radius:var(--radius); font-weight:600;
+  }
+  .admin-pass-submit{background:var(--org-accent, var(--accent)); color:#fff;}
+  .admin-pass-cancel{background:transparent; color:var(--ink-soft); border:1px solid var(--card-line) !important;}
+
+  /* Visually hidden but still announced by screen readers — used for the
+     cart-update aria-live region, which has no visible presence of its
+     own (the visible total already updates in the ticket panel). */
+  .sr-only{
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+
+  /* ---- toast notifications (replaces alert()) ---- */
+  .toast-region{
+    position:fixed; top:16px; right:16px; z-index:2000;
+    display:flex; flex-direction:column; gap:8px; max-width:340px;
+  }
+  .toast{
+    background:var(--card); color:var(--ink); border-radius:var(--radius);
+    padding:12px 14px; font-size:13px; line-height:1.5; cursor:pointer;
+    box-shadow:0 4px 16px rgba(0,0,0,.35); border-left:3px solid var(--accent);
+    white-space:pre-line;
+  }
+  .toast-error{border-left-color:#b3261e;}
+
+  footer{padding:30px 0 50px 0; color:var(--dim); font-size:12px; font-family:'IBM Plex Mono',monospace;}
+  .payment-instructions{
+    margin-top:16px; background:#0f1012; border:1px solid #3a3a38;
+    border-radius:var(--radius); padding:14px 16px; text-align:left;
+  }
+  .pi-label{font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin-bottom:8px;}
+  .pi-value{font-size:14px; color:#F6F3EC; line-height:1.6; margin-bottom:4px;}
+  .pi-note{font-size:12px; color:var(--dim); margin-top:6px; line-height:1.5;}
+  .pi-discount{font-size:12px; color:#5cb87a; margin-top:8px; font-weight:600;}
+
+  /* ---- order deadline banner ---- */
+  .deadline-banner{
+    display:flex; align-items:center; gap:10px;
+    background:#162619; border-left:3px solid var(--org-accent, #1E7A4C);
+    padding:10px 16px; font-size:13px; color:#b9d6bc;
+    font-family:'IBM Plex Mono', monospace; border-radius:var(--radius);
+    margin:0 0 18px 0;
+  }
+  .deadline-badge{
+    font-size:11px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    background:var(--org-accent, #1E7A4C); color:var(--org-accent-ink,#fff); padding:2px 7px; border-radius:2px;
+    white-space:nowrap; flex-shrink:0;
+  }
+  .deadline-banner.urgent{ background:#2b1717; border-left-color:#b3261e; color:#f5c2c2; }
+  .deadline-banner.urgent .deadline-badge{ background:#b3261e; }
+  .deadline-banner.closed{ background:#1e1e1e; border-left-color:#5a5a55; color:var(--dim); }
+  .deadline-banner.closed .deadline-badge{ background:#5a5a55; }
+
+  /* ---- shipping / delivery section (inside ticket panel) ---- */
+  .shipping-section{margin:14px 0 6px; padding-top:14px; border-top:1px dashed #3a3a38;}
+  .shipping-section-label{font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:#8b8a82; margin-bottom:8px;}
+  .shipping-option{display:flex; align-items:baseline; gap:8px; font-size:13px; padding:4px 0; cursor:pointer; font-family:'IBM Plex Mono',monospace; line-height:1.4;}
+  .shipping-option input[type=radio]{flex-shrink:0; position:relative; top:1px; margin:0; accent-color:var(--org-accent);}
+  .shipping-option small{color:#8b8a82; font-size:11px;}
+  .shipping-zip-row{margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+  .shipping-zip-label{font-size:11px; color:#8b8a82; font-family:'IBM Plex Mono',monospace;}
+  .shipping-zip-input{
+    font-family:'IBM Plex Mono',monospace; font-size:13px; background:#0f1012;
+    border:1px solid #3a3a38; color:#F6F3EC; padding:6px 10px; border-radius:var(--radius);
+    width:88px;
+  }
+  .shipping-zip-input::placeholder{color:#6b6a63;}
+  .shipping-manual-notice{margin:8px 0 4px;padding:8px 12px;background:#2a2506;border:1px solid #856b00;border-radius:4px;font-size:12px;color:#e6cc5a;line-height:1.5;font-family:'IBM Plex Mono',monospace;}
+  .shipping-loading{font-size:11px; color:#8b8a82; font-family:'IBM Plex Mono',monospace;}
+  .ticket-breakdown{padding-top:10px; margin-top:6px; border-top:1px solid #3a3a38;}
+  .ticket-breakdown-line{display:flex; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8b8a82; padding:2px 0;}
+
+  /* ---- shipping address modal ---- */
+  .ship-addr-overlay{position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:1000; padding:20px;}
+  .ship-addr-box{background:var(--card); color:var(--ink); border-radius:var(--radius); padding:24px; max-width:400px; width:100%; max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box;}
+  .ship-addr-box h2{font-size:16px; margin:0 0 16px;}
+  .ship-addr-fields{display:flex; flex-direction:column; gap:10px;}
+  .ship-addr-fields input{font-family:'IBM Plex Mono',monospace; font-size:13px; border:1px solid var(--card-line); background:var(--bg); color:var(--ink); padding:8px 10px; border-radius:var(--radius); width:100%; box-sizing:border-box;}
+  .ship-addr-row{display:flex; gap:8px;}
+  .ship-addr-row .ship-addr-state{flex:0 0 70px; width:70px;}
+  .ship-addr-row .ship-addr-zip{flex:0 0 100px; width:100px;}
+  .ship-addr-row .ship-addr-city{flex:1;}
+  .ship-addr-error{color:#b3261e; font-size:12px; min-height:16px; font-family:'IBM Plex Mono',monospace;}
+  .ship-addr-actions{display:flex; gap:10px; margin-top:20px;}
+  .ship-addr-cancel{flex:1; font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; background:transparent; color:var(--ink-soft); border:1px solid var(--card-line); padding:12px; border-radius:var(--radius); cursor:pointer;}
+  .ship-addr-cancel:hover{background:var(--card-line);}
+  /* The overlay is appended to <body>, outside the .layout that defines --org-accent, so it sets the
+     shop's accent (and a readable text colour for it) on itself — see collectShippingAddress. Without
+     that the background was undefined: white text on the cream box. */
+  .ship-addr-confirm{flex:2; font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; background:var(--org-accent, var(--accent)); color:var(--org-accent-ink, #fff); border:none; padding:12px; border-radius:var(--radius); cursor:pointer;}
+  .ship-addr-confirm:hover{filter:brightness(1.08);}
+
+  @media (prefers-reduced-motion: reduce){
+    .tag{transition:none;}
+  }
+
+  /* Image viewer (storefront "zoom"): near-full-screen, arrows through every picture on the product. */
+  .lb-overlay{position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,.88); display:flex; align-items:center; justify-content:center;}
+  .lb-box{position:relative; width:96vw; height:94vh; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff;}
+  .lb-stage{flex:1; min-height:0; width:100%; display:flex; align-items:center; justify-content:center;}
+  .lb-img{max-width:100%; max-height:100%; object-fit:contain; background:#fff; border-radius:2px; user-select:none; -webkit-user-drag:none;}
+  .lb-cap{padding:10px 56px 0; font-size:14px; text-align:center; min-height:24px;}
+  .lb-count{font-family:'IBM Plex Mono',monospace; font-size:12px; opacity:.75; margin-left:8px;}
+  .lb-btn{position:absolute; background:rgba(255,255,255,.16); color:#fff; border:1px solid rgba(255,255,255,.4); border-radius:50%; width:48px; height:48px; font-size:26px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center;}
+  .lb-btn:hover,.lb-btn:focus-visible{background:rgba(255,255,255,.32); outline:2px solid #fff;}
+  .lb-prev{left:6px; top:50%; transform:translateY(-50%);}
+  .lb-next{right:6px; top:50%; transform:translateY(-50%);}
+  .lb-close{right:6px; top:6px; font-size:22px;}
+  .lb-btn[hidden]{display:none;}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="topbar">
+    <div class="brand"><span id="brandName"></span><small>Order Shops</small></div>
+  </div>
+  <main id="app">
+    <noscript>
+      <h1>Order shop</h1>
+      <p>Custom embroidered and heat-transferred apparel for organizations, teams, and businesses.</p>
+      <p>This page needs JavaScript to show the shop.</p>
+    </noscript>
+    <div id="loadingSkeleton" style="padding:60px 0; text-align:center; color:var(--dim); font-family:'IBM Plex Mono',monospace; font-size:13px;" aria-live="polite" aria-label="Loading…">Loading&hellip;</div>
+  </main>
+  <footer id="siteFooter"></footer>
+</div>
+
+<script>
+/* BACKEND: every order and admin call goes to this site's own API (/api/…). The browser never
+   talks to any other backend and never holds a secret. */
+
+// Who runs this site — name, contact and how to pay by Venmo / Zelle / check. It comes with every
+// /api/catalog answer (Global settings → Business profile in the admin) and is never baked into
+// this page. applyBusiness_ puts it into the header, the footer and the title.
+const BUSINESS_NAME_FALLBACK = "Our shop";
+let business = { name: "", legalName: "", tagline: "", supportEmail: "", mailingAddress: "", venmo: "", zelle: "", footer: "" };
+function bizName_(){ return business.name || BUSINESS_NAME_FALLBACK; }
+// Where the business is, for address formats only (Global settings → Region; comes with every
+// /api/catalog answer). "US": 5-digit ZIP, 2-letter state, the ZIP-vs-state check, carrier rates by
+// ZIP. "OTHER": postal code and state / region are free text, and there are no carrier rates.
+let siteCountry = "US";
+function isUS_(){ return siteCountry !== "OTHER"; }
+function applyCountry_(c){ siteCountry = String(c || "").toUpperCase() === "OTHER" ? "OTHER" : "US"; }
+// Global settings → Features: which optional parts of the site are on. Arrives with /api/catalog;
+// a feature is on unless it was explicitly switched off (so nothing saved = everything on).
+let siteFeatures = {};
+function applyFeatures_(f){ siteFeatures = (f && typeof f === "object") ? f : {}; }
+function featureOn_(key){ return siteFeatures[key] !== false; }
+function applyBusiness_(b){
+  if(b && typeof b === "object") business = Object.assign({}, business, b);
+  VENMO_USERNAME = business.venmo || "";
+  const brand = document.getElementById("brandName"); if(brand) brand.textContent = bizName_();
+  const foot = document.getElementById("siteFooter");
+  if(foot){
+    const mail = business.supportEmail ? `Questions? <a href="mailto:${escapeHtml(business.supportEmail)}" style="color:var(--dim);">${escapeHtml(business.supportEmail)}</a>` : "";
+    foot.innerHTML = [business.footer ? escapeHtml(business.footer) : "", mail].filter(Boolean).join(" &nbsp;&middot;&nbsp; ");
+  }
+  if(/^Order shop$/.test(document.title)) document.title = bizName_();
+}
+
+// The business's Venmo username, without the @ (Business profile). Used to build a pre-filled
+// "Pay with Venmo" link on the confirmation screen when a customer
+// selects Venmo — this is a plain deep link (venmo.com/u/...), not an
+// API call. Venmo retired their programmatic payment-request API for
+// new developers, so nothing can be sent automatically; this just
+// saves the customer from typing the amount/note themselves. Blank
+// until the profile sets one: the customer is then told they'll be contacted.
+let VENMO_USERNAME = "";
+
+// Whether "Credit / Debit Card" shows as a payment option is resolved
+// server-side per request (enabledPayments in /api/catalog — see
+// functions/api/catalog.js), not by a constant here. The page needs no
+// Stripe publishable key: Card checkout redirects to Stripe's hosted
+// page, there's no client-side Stripe.js/Elements. Deriving the flag from
+// the server's own STRIPE_SECRET_KEY also means a test install running on
+// test keys can never create a real charge.
+
+// Set to a number (e.g. 2) to show a note on the checkout screen and
+// confirmation email that a discount of that percentage applies to orders
+// paid by Check or Zelle (avoiding card processing fees). Set to 0 or
+// null to hide the discount mention entirely.
+// NOTE: this is informational only — it tells customers about the discount
+// but does NOT automatically adjust the order total. Price the discount
+// into your catalog pricing, or mention it when collecting payment.
+const CASH_DISCOUNT_PERCENT = 0;
+
+/* =========================================================
+   No org data lives here at all, on purpose. A static table of every
+   org's name/description/accent color would ship in the page source to
+   every visitor on every subdomain, so anyone could "view source", read
+   the entire client list, then guess at the subdomains directly. Instead
+   the client asks functions/api/catalog.js "who am I" on load; the server answers
+   using the Host header, and a customer's browser only ever learns
+   about the ONE org its own subdomain resolves to. See currentOrg below.
+   ========================================================= */
+
+const SIZE_ORDER = ["XS","S","M","L","XL","2XL","3XL","4XL"];   // the standard run
+// Every size in display order: the standard run, then the big sizes some styles come in. A product can
+// also carry a size that's in neither list (LT, "S/M"…) — productSizes_ puts those last, as given.
+const SIZE_ORDER_ALL = SIZE_ORDER.concat(["5XL","6XL"]);
+function productSizes_(sizePricing){
+  const keys = Object.keys(sizePricing || {});
+  const rank = (s) => { const i = SIZE_ORDER_ALL.indexOf(s); return i === -1 ? SIZE_ORDER_ALL.length + keys.indexOf(s) : i; };
+  return keys.sort((a, b) => rank(a) - rank(b));
+}
+const CATEGORY_ORDER = ["shirt","sweatshirt","cap"];
+const CATEGORY_LABELS = {shirt:"Shirts", sweatshirt:"Sweatshirts", cap:"Caps"};
+
+// Escapes any customer-supplied text before it's inserted into innerHTML,
+// so a submitted name/contact/personalization can never execute as HTML/JS
+// in the browser of whoever views it (you, in the Admin panel; or a
+// customer, in their own cart preview).
+// "#fff" or the page ink, whichever has the higher WCAG contrast on a #rgb/#rrggbb background.
+function readableInkOn(hex){
+  let h = String(hex || "").replace("#", "");
+  if (h.length === 3) h = h.split("").map(c => c + c).join("");
+  if (!/^[0-9a-f]{6}$/i.test(h)) return "#fff";
+  const lum = (x) => { const r = [0, 2, 4].map(i => parseInt(x.slice(i, i + 2), 16) / 255)
+    .map(c => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    return 0.2126 * r[0] + 0.7152 * r[1] + 0.0722 * r[2]; };
+  const L = lum(h), white = 1.05 / (L + 0.05), ink = (L + 0.05) / (lum("232323") + 0.05);
+  return white >= ink ? "#fff" : "#232323";
+}
+
+// style="" value for a shop's colour: the colour itself plus a text colour that's readable on it
+// (white on dark green, dark ink on a light orange). Buttons filled with the shop colour use
+// color:var(--org-accent-ink, #fff).
+function orgAccentVars(accent){
+  const a = String(accent || "");
+  return `--org-accent:${escapeHtml(a)};--org-accent-ink:${readableInkOn(a.trim())}`;
+}
+
+function escapeHtml(str){
+  if(str == null) return "";
+  return String(str).replace(/[&<>"']/g, function(ch){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch];
+  });
+}
+
+// Replaces alert() with a dismissible, non-blocking toast tied to an
+// aria-live region — alert() can't be styled, blocks the whole page, and
+// its accessible behavior varies across screen readers/browsers in a way
+// a real aria-live region doesn't. Auto-dismisses after a few seconds;
+// clicking it dismisses immediately too.
+function showToast(message, isError){
+  let region = document.getElementById("toastRegion");
+  if(!region){
+    region = document.createElement("div");
+    region.id = "toastRegion";
+    region.className = "toast-region";
+    region.setAttribute("role", "status");
+    region.setAttribute("aria-live", "assertive");
+    document.body.appendChild(region);
+  }
+  const toast = document.createElement("div");
+  toast.className = "toast" + (isError ? " toast-error" : "");
+  toast.textContent = message;
+  region.appendChild(toast);
+  const dismiss = () => { if(toast.parentNode) toast.parentNode.removeChild(toast); };
+  toast.addEventListener("click", dismiss);
+  setTimeout(dismiss, 6000);
+}
+
+// A quieter, invisible aria-live announcer for routine status changes
+// (cart updates) that don't warrant a visible toast — the visible cart
+// total already updates on screen; this just makes sure a screen reader
+// user hears the same change, not just sighted users.
+function announceStatus(message){
+  let region = document.getElementById("statusRegion");
+  if(!region){
+    region = document.createElement("div");
+    region.id = "statusRegion";
+    region.className = "sr-only";
+    region.setAttribute("role", "status");
+    region.setAttribute("aria-live", "polite");
+    document.body.appendChild(region);
+  }
+  region.textContent = message;
+}
+
+// Maps a full-size LOCAL image path to its small, fast-loading thumbnail —
+// e.g. "images/polo-a-front.jpg" -> "images/thumbs/polo-a-front.jpg".
+// The page always displays the thumbnail; clicking still opens the
+// full-size original (see the <a href> wrapping each thumbnail below).
+// Admin-supplied external URLs (http[s]://...) are returned unchanged —
+// there's no local /thumbs/ variant of an off-site image, so rewriting
+// the path would just produce a dead link.
+function thumbUrl(fullPath){
+  if(!fullPath) return fullPath;
+  // Normalize bare-domain URLs (missing https:// scheme) so they aren't
+  // treated as relative paths by the browser.
+  if(!/^https?:\/\//i.test(fullPath) && !fullPath.startsWith('/')){
+    const firstSlash = fullPath.indexOf('/');
+    const hostPart = firstSlash === -1 ? fullPath : fullPath.slice(0, firstSlash);
+    if(hostPart.includes('.') && !hostPart.startsWith('.')) fullPath = 'https://' + fullPath;
+  }
+  if(/^https?:\/\//i.test(fullPath)){
+    // R2 uploads are stored under /uploads/ with a paired -thumb variant
+    // uploaded at 320px by uploadImage(). External URLs have no thumbnail
+    // and pass through unchanged.
+    if(fullPath.indexOf("/uploads/") !== -1){
+      return fullPath.replace(/(\.[^./?#]+)(\?[^#]*)?(#.*)?$/, "-thumb$1$2$3");
+    }
+    return fullPath;
+  }
+  const parts = fullPath.split("/");
+  const filename = parts.pop();
+  const base = filename.replace(/\.[^.]+$/, "");
+  return parts.join("/") + "/thumbs/" + base + ".jpg";
+}
+
+/* ---------------- routing (pure JS state — no URL/hash navigation,
+   so nothing here is ever mistaken for a real link) ---------------- */
+let route = {view:"generic"};
+let currentOrgId = null;
+
+// The ONE org this browser is entitled to see this session — populated
+// once at boot from /api/catalog, which resolves identity from the
+// request's Host header server-side. null on the root/generic domain
+// or an unrecognized host; this session then never learns any org exists.
+let currentOrg = null;
+
+async function resolveCurrentOrg(){
+  try{
+    const res = await fetch("/api/catalog");
+    if(!res.ok){ try{ const d = await res.json(); applyBusiness_(d.business); applyCountry_(d.country); applyFeatures_(d.features); }catch(e){} return null; }
+    const data = await res.json();
+    applyBusiness_(data.business);
+    applyCountry_(data.country);
+    applyFeatures_(data.features);
+    if(data.status === "admin") return {admin:true};
+    // Global settings → Features → Storefront is off: no shop is served here (see catalog.js).
+    if(data.status === "closed") return {closed:true};
+    if(data.status !== "ok") return null;
+    return Object.assign({orgId: data.orgId}, data.catalog);
+  }catch(e){
+    console.error("Could not resolve current org:", e);
+    return null;
+  }
+}
+
+// Lazily loads admin.js — the admin panel (org/product management, order
+// lookup, image uploads) is a large script used by nobody except the admin
+// subdomain, so it isn't shipped to every storefront visitor. Loaded via
+// a real <script src> tag (not fetch()+eval()) so it never needs
+// 'unsafe-eval' in the CSP (see _headers) — a classic script's top-level
+// let/const/function declarations attach to the same shared global script
+// scope as this file's own, so admin.js's functions (renderAdminPicker,
+// etc.) become callable here exactly as if they'd always been in this
+// file. Cached after the first successful load — every subsequent call
+// (there's only ever one entry point, but this stays safe if that changes)
+// reuses the same promise instead of injecting a second <script> tag.
+let adminScriptPromise = null;
+function loadAdminScript(){
+  if(adminScriptPromise) return adminScriptPromise;
+  adminScriptPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "admin.js?v=" + Date.now();
+    s.onload = resolve;
+    s.onerror = () => { adminScriptPromise = null; reject(new Error("Could not load admin.js")); };
+    document.head.appendChild(s);
+  });
+  return adminScriptPromise;
+}
+
+function go(view, orgId){
+  // This site only ever shows the one org currentOrg resolved to at
+  // boot — there is no other org or hub to navigate to.
+  if(currentOrg){
+    orgId = currentOrg.orgId;
+  }
+  route = orgId ? {view, org:orgId} : {view};
+  render();
+}
+
+/* ---------------- cart state (per org, in-memory) ---------------- */
+let cart = [];
+let activeCatalog = null; // currentOrg's own products/pricing — never contains other orgs' data
+
+// Shipping state — only meaningful when the shop offers shipping (offersShipping_).
+// null shippingQuote = "Local delivery" (free, default). A non-null value is
+// one of the objects returned by /api/shipping and selected by the customer.
+let shippingZip = "";
+let shippingRates = [];    // rates fetched from /api/shipping (up to 3)
+let shippingQuote = null;  // null = local delivery; {provider,service,amount,estimatedDays} = carrier
+let shippingManual = false; // true when order doesn't fit a known box — no rates shown, admin follows up
+// Delivery choice (the shop's list: local pickup, carrier shipping, its own flat-fee options).
+// deliveryOptId = the picked pickup/custom option (null = the first one offered); a carrier rate lives
+// in shippingQuote and wins while set; shippingManualPicked = "ship it, quote to follow" is chosen.
+let deliveryOptId = null;
+let shippingManualPicked = false;
+function deliveryOptions_(org){
+  if(org && Array.isArray(org.deliveryOptions) && org.deliveryOptions.length) return org.deliveryOptions;
+  // A catalog answer without the list: free local pickup, plus shipping when enabled.
+  return [{id:"pickup", type:"pickup", label:"Local pickup", fee:0}].concat(org && org.shippingEnabled ? [{id:"shipping", type:"shipping", label:"Shipping", fee:null}] : []);
+}
+function offersShipping_(org){ return deliveryOptions_(org).some(o => o.type === "shipping"); }
+// What's chosen right now → {kind: "quote"|"manual"|"option"|"none", fee, label, option}.
+function currentDelivery_(org){
+  if(offersShipping_(org) && shippingQuote) return {kind:"quote", fee:shippingQuote.amount, label:shippingQuote.provider + " " + shippingQuote.service};
+  if(offersShipping_(org) && shippingManual && shippingManualPicked) return {kind:"manual", fee:0, label:"Shipping — quote to follow"};
+  const choices = deliveryOptions_(org).filter(o => o.type !== "shipping");
+  const o = choices.find(x => x.id === deliveryOptId) || choices[0];
+  return o ? {kind:"option", option:o, fee:Number(o.fee) || 0, label:o.label} : {kind:"none", fee:0, label:""};
+}
+let shippingLoading = false;
+let shippingDebounce = null;
+
+function priceFor(product, size){
+  if(product.type === "cap") return product.flatPrice;
+  return product.sizePricing[size];
+}
+
+function render(){
+  const app = document.getElementById("app");
+  document.querySelector(".shell").classList.toggle("admin-wide", route.view === "admin");
+
+  // The admin subdomain has no org of its own — handle it before the
+  // "no org resolved" fallback below would otherwise catch it. admin.js
+  // is loaded on demand (see loadAdminScript() above) — show a minimal
+  // loading state immediately, then swap in the real picker once it's
+  // ready. If it were already loaded (adminScriptPromise resolved), this
+  // still resolves on the same tick before the next paint, so there's no
+  // visible flash for a warm reload.
+  if(route.view === "admin"){
+    app.innerHTML = `<div class="admin-summary">Loading&hellip;</div>`;
+    loadAdminScript()
+      .then(() => adminRoute())
+      .catch((err) => {
+        console.error("Could not load admin.js:", err);
+        app.innerHTML = `<div class="admin-empty">Could not load the admin panel. Please refresh and try again.</div>`;
+      });
+    return;
+  }
+
+  // Design verification page — token-gated, works on any subdomain (or even
+  // the root domain); doesn't need currentOrg resolved.
+  if(route.view === "design-verify"){ renderDesignVerify(app, route.token); return; }
+
+  // Storefront switched off: the same short page on every shop address and the main one.
+  if(route.view === "closed"){ currentOrgId = null; renderStorefrontOff(app, route); return; }
+
+  // No org resolved (root/generic domain, or an unrecognized host) —
+  // or route.org somehow doesn't match the one org this session knows
+  // about. Either way, show the generic page; there's nothing else to show.
+  if(route.view === "generic" || !currentOrg || route.org !== currentOrg.orgId){
+    currentOrgId = null;
+    route = {view:"generic"};
+    renderGenericFallback(app);
+    return;
+  }
+
+  if(route.view === "stripe-success"){ renderStripeSuccess(app, currentOrg.orgId, currentOrg, route.orderId); return; }
+
+  // org order page — reset cart and shipping state when switching to a *different* org
+  if(currentOrgId !== currentOrg.orgId){
+    clearCart_();
+    currentOrgId = currentOrg.orgId;
+    shippingZip = ""; shippingRates = []; shippingQuote = null; shippingLoading = false; shippingManual = false; deliveryOptId = null; shippingManualPicked = false;
+    if(shippingDebounce){ clearTimeout(shippingDebounce); shippingDebounce = null; }
+  }
+  renderOrgPage(app, currentOrg.orgId, currentOrg);
+}
+
+function renderStripeSuccess(app, orgId, org, orderId){
+  document.title = org.name + " — Payment confirmed";
+  app.innerHTML = `
+    <div class="confirmation" style="${orgAccentVars(org.accent)}">
+      <div class="stitch"></div>
+      <h2>Payment confirmed!</h2>
+      <div class="order-number">${escapeHtml(orderId || "")}</div>
+      <p>Your card payment was processed successfully. Your order has been recorded for ${escapeHtml(org.name)} and is marked paid.</p>
+      <p>You'll receive a Stripe receipt by email. Reach out if you have any questions about your order.</p>
+      <br>
+      <button class="confirmation-back" data-action="go-org" data-org="${orgId}" style="background:none; border:none; margin-top:12px;">&larr; Back to ${escapeHtml(org.name)}</button>
+    </div>
+  `;
+}
+
+async function renderDesignVerify(app, token){
+  document.title = "Design Verification";
+  app.innerHTML = `<div style="padding:40px;text-align:center;font-family:system-ui,sans-serif;color:#555;">Loading your design…</div>`;
+  let data;
+  try{
+    const res = await fetch("/api/verify?token=" + encodeURIComponent(token));
+    data = await res.json();
+  }catch{
+    app.innerHTML = `<div style="padding:40px;text-align:center;font-family:system-ui,sans-serif;color:#b03a2e;">Could not load design verification. Please check your link or contact us.</div>`;
+    return;
+  }
+  if(data && data.status === "unavailable"){
+    // Design approval is switched off for this site: say so plainly (it isn't a broken link).
+    app.innerHTML = `<div style="padding:40px;text-align:center;font-family:system-ui,sans-serif;color:#555;">${escapeHtml(data.message || "Design approval isn't available right now. Please contact us about your order.")}</div>`;
+    return;
+  }
+  if(!data || data.status !== "ok"){
+    app.innerHTML = `<div style="padding:40px;text-align:center;font-family:system-ui,sans-serif;color:#b03a2e;">This verification link is invalid or has expired.</div>`;
+    return;
+  }
+
+  document.title = "Design Verification — " + data.orderId;
+  const accent = data.orgAccent || "#1d4ed8";
+  const alreadyResponded = data.verificationStatus !== "pending";
+
+  const imagesHtml = (data.imageUrls || []).filter(Boolean).map(
+    u => `<div style="margin:12px 0;"><img src="${escapeHtml(u)}" alt="Design image" style="max-width:100%;border-radius:6px;border:1px solid #e5e7eb;"></div>`
+  ).join("");
+
+  const respondedBanner = alreadyResponded ? `
+    <div style="background:${data.verificationStatus==='approved'?'#dcfce7':'#fef3c7'};border:1px solid ${data.verificationStatus==='approved'?'#86efac':'#fcd34d'};border-radius:6px;padding:14px 18px;margin-bottom:24px;font-size:14px;color:#1a1a1a;">
+      <strong>${data.verificationStatus === 'approved' ? '✓ You approved this design' : '⚠ You requested revisions'}</strong>
+      ${data.respondedAt ? ` on ${new Date(data.respondedAt).toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}` : ""}
+      ${data.customerNote ? `<br><span style="color:#555">Your note: ${escapeHtml(data.customerNote)}</span>` : ""}
+    </div>` : "";
+
+  app.innerHTML = `
+    <div style="max-width:620px;margin:0 auto;padding:32px 20px;font-family:system-ui,sans-serif;color:#1a1a1a;">
+      <div style="font-size:22px;font-weight:700;color:${escapeHtml(accent)};margin-bottom:4px;">${escapeHtml(data.orgName)}</div>
+      <div style="font-size:13px;color:#555;margin-bottom:24px;">Design verification for order <strong>${escapeHtml(data.orderId)}</strong></div>
+      ${respondedBanner}
+      <div style="font-size:15px;line-height:1.6;white-space:pre-wrap;margin-bottom:20px;">${escapeHtml(data.message)}</div>
+      ${imagesHtml}
+      ${alreadyResponded ? "" : `
+        <div id="dvFormArea" style="margin-top:28px;border-top:1px solid #e5e7eb;padding-top:24px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:16px;">Your response</div>
+          <div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;">
+            <button id="dvApproveBtn" onclick="dvSelectAction('approved')" style="flex:1;min-width:140px;padding:14px 20px;border-radius:6px;border:2px solid #e5e7eb;background:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:all .15s;">
+              ✓ Approve design
+            </button>
+            <button id="dvRevisionBtn" onclick="dvSelectAction('revision')" style="flex:1;min-width:140px;padding:14px 20px;border-radius:6px;border:2px solid #e5e7eb;background:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:all .15s;">
+              ✏ Request changes
+            </button>
+          </div>
+          <div id="dvRevisionArea" style="display:none;margin-bottom:16px;">
+            <label style="display:block;font-size:13px;font-weight:600;margin-bottom:4px;">Describe the changes needed <span style="color:#b03a2e">*</span></label>
+            <textarea id="dvNote" rows="4" placeholder="Please be as specific as possible about what needs to change." style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px;font-family:inherit;resize:vertical;"></textarea>
+            <div style="margin-top:12px;font-size:13px;font-weight:600;margin-bottom:6px;">Supporting images (optional)</div>
+            ${[1,2].map(i => `
+              <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                <input type="text" id="dvCustImg${i}" placeholder="https://... or upload below" style="flex:1;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px;">
+                <label style="cursor:pointer;font-size:12px;padding:5px 10px;background:#e5e7eb;border-radius:4px;white-space:nowrap;">
+                  Upload <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none;" data-target="dvCustImg${i}" data-token="${escapeHtml(token)}" onchange="handleCustVerifyUpload(this)">
+                </label>
+                <span id="dvCustImg${i}Status" style="font-size:11px;color:#555;min-width:50px;"></span>
+              </div>`).join("")}
+          </div>
+          <div id="dvError" style="color:#b03a2e;font-size:13px;min-height:18px;margin-bottom:8px;"></div>
+          <button id="dvSubmit" onclick="dvSubmitResponse('${escapeHtml(token)}')" style="display:none;padding:12px 28px;background:${escapeHtml(accent)};color:#fff;border:none;border-radius:5px;font-size:15px;font-weight:600;cursor:pointer;width:100%;">Submit response</button>
+        </div>
+      `}
+    </div>`;
+
+  window._dvAction = null;
+
+  window.dvSelectAction = function(action){
+    window._dvAction = action;
+    const approveBtn = document.getElementById("dvApproveBtn");
+    const revisionBtn = document.getElementById("dvRevisionBtn");
+    const revArea = document.getElementById("dvRevisionArea");
+    const submitBtn = document.getElementById("dvSubmit");
+    const activeStyle = "border-color:" + accent + ";background:" + accent + ";color:#fff;";
+    const inactiveStyle = "border-color:#e5e7eb;background:#fff;color:#1a1a1a;";
+    if(action === "approved"){
+      approveBtn.style.cssText = approveBtn.style.cssText.replace(/border-color[^;]*;background:[^;]*;color:[^;]*;/g,"") + activeStyle;
+      revisionBtn.style.cssText = revisionBtn.style.cssText.replace(/border-color[^;]*;background:[^;]*;color:[^;]*;/g,"") + inactiveStyle;
+      revArea.style.display = "none";
+    } else {
+      revisionBtn.style.cssText = revisionBtn.style.cssText.replace(/border-color[^;]*;background:[^;]*;color:[^;]*;/g,"") + activeStyle;
+      approveBtn.style.cssText = approveBtn.style.cssText.replace(/border-color[^;]*;background:[^;]*;color:[^;]*;/g,"") + inactiveStyle;
+      revArea.style.display = "block";
+    }
+    submitBtn.style.display = "block";
+    document.getElementById("dvError").textContent = "";
+  };
+
+  window.handleCustVerifyUpload = async function(input){
+    const targetId = input.dataset.target;
+    const tok = input.dataset.token;
+    const statusEl = document.getElementById(targetId + "Status");
+    const file = input.files && input.files[0];
+    if(!file) return;
+    statusEl.textContent = "Uploading…";
+    try{
+      const res = await fetch("/api/upload-verify?token=" + encodeURIComponent(tok), {
+        method:"POST", headers:{"Content-Type":file.type}, body:file
+      });
+      const d = await res.json();
+      if(!res.ok || d.status !== "ok") throw new Error(d.message || "Upload failed");
+      document.getElementById(targetId).value = d.url;
+      statusEl.textContent = "✓";
+    }catch(e){
+      statusEl.textContent = "Failed";
+    }
+  };
+
+  window.dvSubmitResponse = async function(tok){
+    const action = window._dvAction;
+    if(!action){ document.getElementById("dvError").textContent = "Please choose Approve or Request changes."; return; }
+    const note = action === "revision" ? (document.getElementById("dvNote")||{}).value?.trim() : "";
+    if(action === "revision" && !note){ document.getElementById("dvError").textContent = "Please describe the changes needed."; return; }
+    const imageUrls = [1,2].map(i => {
+      const el = document.getElementById("dvCustImg"+i);
+      return el ? el.value.trim() : "";
+    }).filter(Boolean);
+
+    const submitBtn = document.getElementById("dvSubmit");
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting…";
+    document.getElementById("dvError").textContent = "";
+
+    try{
+      const res = await fetch("/api/verify", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({token:tok, action, note, imageUrls})
+      });
+      const d = await res.json();
+      if(!res.ok || d.status !== "ok") throw new Error(d.message || "Could not submit response");
+      document.getElementById("dvFormArea").innerHTML = `
+        <div style="background:${action==='approved'?'#dcfce7':'#fef3c7'};border:1px solid ${action==='approved'?'#86efac':'#fcd34d'};border-radius:6px;padding:18px;font-size:15px;color:#1a1a1a;text-align:center;">
+          <div style="font-size:20px;margin-bottom:6px;">${action==='approved'?'✓ Design approved!':'⚠ Revision request sent'}</div>
+          <div style="font-size:14px;color:#555;">${action==='approved'?'Thank you! We\'ll proceed with your order.':'We\'ll review your feedback and be in touch.'}</div>
+        </div>`;
+    }catch(e){
+      document.getElementById("dvError").textContent = e.message || "Could not submit response.";
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Submit response";
+    }
+  };
+}
+
+// Shown for any hostname that isn't a recognized org subdomain (the
+// root domain, a typo, stale DNS, an unconfigured
+// wildcard, etc.). Deliberately generic — no client/org names, so a
+// misrouted visitor doesn't see a list of every business this site
+// hosts. Just enough for them to know whose site this is and how to
+// reach out.
+function renderGenericFallback(app){
+  document.title = bizName_();
+  app.innerHTML = `
+    <div class="org-hero" style="--org-accent:var(--accent);">
+      <div class="org-eyebrow-lg">Custom embroidery &amp; apparel</div>
+      <h1>${escapeHtml(bizName_())}</h1>
+      <div class="stitch stitch-thick"></div>
+      <p class="desc">${escapeHtml(business.tagline || "Custom embroidered and heat-transferred apparel for organizations, teams, and businesses.")}</p>
+    </div>
+    <div class="not-ready" style="--org-accent:var(--accent);">
+      <div class="stitch"></div>
+      <h2>Looking for your organization's order page?</h2>
+      <p>Each client gets their own dedicated ordering link. If you were expecting one here, the link may be mistyped — reach out and we'll get you sorted.</p>
+      ${business.supportEmail ? `<p style="margin-top:14px;"><a href="mailto:${escapeHtml(business.supportEmail)}" style="color:var(--accent); font-weight:600;">${escapeHtml(business.supportEmail)}</a></p>` : ""}
+    </div>
+  `;
+}
+
+// Global settings → Features → Storefront is off: the site is back office only. Every shop address
+// and the main address show this — who runs the site and how to reach them, no shop, no products,
+// no cart. A customer coming back from a card payment the business emailed them a link for
+// (?stripe=success) is told the payment went through.
+function renderStorefrontOff(app, r){
+  const paid = !!(r && r.paid);
+  document.title = bizName_();
+  app.innerHTML = `
+    <div class="not-ready" id="storefrontOff" style="--org-accent:var(--accent);">
+      <div class="stitch"></div>
+      ${paid ? `<h2>Payment confirmed!</h2>
+      ${r.orderId ? `<div class="order-number">${escapeHtml(r.orderId)}</div>` : ""}
+      <p>Your card payment was processed successfully. You'll receive a Stripe receipt by email.</p>`
+      : `<h2>Online ordering isn't available here.</h2>`}
+      ${business.name ? `<p style="margin-top:14px;font-weight:600;">${escapeHtml(business.name)}</p>` : ""}
+      ${business.supportEmail ? `<p style="margin-top:6px;"><a href="mailto:${escapeHtml(business.supportEmail)}" style="color:var(--accent); font-weight:600;">${escapeHtml(business.supportEmail)}</a></p>` : ""}
+    </div>
+  `;
+}
+
+// Returns an HTML string for the order deadline banner, or "" if no deadline.
+// urgency: >7 days = normal, 1-7 days = urgent, 0 = "closes today", past = "closed".
+function deadlineBannerHtml(org){
+  const deadline = org && org.orderDeadline;
+  if(!deadline) return "";
+  const accent = org.accent;
+  const closeDate = new Date(String(deadline).slice(0, 10) + "T23:59:59");
+  const now = new Date();
+  const diffMs = closeDate - now;
+  const diffDays = Math.ceil(diffMs / 86400000);
+  const accentStyle = accent ? ` style="${orgAccentVars(accent)}"` : "";
+  const formatted = closeDate.toLocaleDateString("en-US", {month:"long", day:"numeric", year:"numeric"});
+  if(diffMs < 0){
+    const closedMsg = escapeHtml((org.closedMessage || "").trim() || "Ordering for this period has closed.");
+    if(org.allowOrdersAfterDeadline !== false){
+      return `<div class="deadline-banner closed"${accentStyle}><span class="deadline-badge">Closed ${formatted}</span> ${closedMsg} Orders are still being accepted.</div>`;
+    }
+    return `<div class="deadline-banner closed"${accentStyle}><span class="deadline-badge">Closed ${formatted}</span> ${closedMsg}</div>`;
+  }
+  if(diffDays === 0){
+    return `<div class="deadline-banner urgent"${accentStyle}><span class="deadline-badge">Today</span> Ordering closes today — submit your order now.</div>`;
+  }
+  const urgency = diffDays <= 7 ? " urgent" : "";
+  const label = diffDays === 1 ? "1 day left" : diffDays + " days left";
+  return `<div class="deadline-banner${urgency}"${accentStyle}><span class="deadline-badge">${label}</span> Ordering closes ${formatted}.</div>`;
+}
+
+function renderOrgPage(app, orgId, org){
+  document.title = org.name + " — Order";
+  if(!org.ready){
+    app.innerHTML = `
+      <div class="org-hero" style="${orgAccentVars(org.accent)}">
+        <div class="org-eyebrow-lg">${escapeHtml(org.eyebrow)}</div>
+        <h1>${escapeHtml(org.name)}</h1>
+        <div class="stitch stitch-thick"></div>
+      </div>
+      <div class="not-ready" style="${orgAccentVars(org.accent)}">
+        <div class="stitch"></div>
+        <h2>Catalog coming soon</h2>
+        <p>${escapeHtml(org.desc) || "This shop hasn't been set up yet."} Check back once products and pricing are finalized, or reach out directly if you have an order ready to go.</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Design preview images are optional and per-URL — render only the ones
+  // that actually have a URL, and skip the whole block if none do. Without
+  // this, a shop with empty design-image fields would render three
+  // dead <a href=""><img src=".../thumbs/.jpg"> links (the designImages
+  // object always exists — {shirt:"",cap:"",detail:""} even when unset).
+  const di = org.designImages || {};
+  const previewImgs = [
+    { url: di.detail, alt: "Embroidery detail close-up", w: 156, h: 150 },
+    { url: di.shirt,  alt: "Design on shirt",            w: 130, h: 150 },
+    { url: di.cap,    alt: "Design on cap",              w: 188, h: 150 }
+  ].filter(function(it){ return it.url; });
+  const previewHtml = previewImgs.length ? `
+    <div class="design-preview">
+      <div class="design-preview-imgs">
+        ${previewImgs.map(function(it){
+          return `<a class="zoom-link" href="${escapeHtml(it.url)}"><img src="${escapeHtml(thumbUrl(it.url))}" alt="${escapeHtml(it.alt)} — click to view full size" width="${it.w}" height="${it.h}"></a>`;
+        }).join("")}
+      </div>
+      <div class="design-preview-caption">Actual crest design — placement and size shown are approximate on other fabric options.</div>
+    </div>
+  ` : "";
+
+  // org already carries its own products (came back in the same
+  // /api/catalog response that resolved which org this is) — no
+  // separate fetch or loading state needed here.
+  activeCatalog = org;
+
+  // Group products by type in CATEGORY_ORDER, preserving server-side sort order within each group.
+  const byCategory = {};
+  for(const type of CATEGORY_ORDER) byCategory[type] = [];
+  for(const p of org.products){
+    if(byCategory[p.type]) byCategory[p.type].push(p);
+    else byCategory[p.type] = [p]; // unknown future type — append at end
+  }
+  const activeCategories = CATEGORY_ORDER.filter(t => byCategory[t] && byCategory[t].length > 0);
+
+  // Only show the nav when there are at least 2 categories.
+  const catNavHtml = activeCategories.length > 1
+    ? `<nav class="cat-nav" aria-label="Jump to category">${activeCategories.map(t =>
+        `<a class="cat-nav-link" href="#cat-${t}">${escapeHtml(CATEGORY_LABELS[t] || t)}</a>`
+      ).join("")}</nav>`
+    : "";
+
+  const sectionsHtml = activeCategories.map(t => `
+    <section class="cat-section" id="cat-${t}" aria-label="${escapeHtml(CATEGORY_LABELS[t] || t)}">
+      ${activeCategories.length > 1 ? `<h2 class="cat-heading">${escapeHtml(CATEGORY_LABELS[t] || t)}</h2>` : `<h2 class="cat-heading">Available now</h2>`}
+      ${byCategory[t].map(p => renderProductRow(p, org)).join("")}
+    </section>
+  `).join("");
+
+  const bannerHtml = deadlineBannerHtml(org);
+
+  const deadlinePast = org.orderDeadline &&
+    new Date(String(org.orderDeadline).slice(0, 10) + "T23:59:59") < new Date();
+  const ordersBlocked = deadlinePast && org.allowOrdersAfterDeadline === false;
+
+  app.innerHTML = `
+    <div class="org-hero" style="${orgAccentVars(org.accent)}">
+      <div class="org-eyebrow-lg">${escapeHtml(org.eyebrow)}</div>
+      <h1>${escapeHtml(org.name)}</h1>
+      <div class="stitch stitch-thick"></div>
+      <p class="desc">${escapeHtml(org.desc)}</p>
+    </div>
+    ${previewHtml}
+    ${bannerHtml}
+    ${ordersBlocked ? "" : `
+    <div class="layout" style="${orgAccentVars(org.accent)}">
+      <div class="catalog" id="catalogArea">
+        ${catNavHtml}
+        ${sectionsHtml}
+      </div>
+      <div class="ticket" id="ticketPanel"></div>
+    </div>`}
+  `;
+
+  if(!ordersBlocked){
+    renderTicket(org, orgId);
+    // Populate each configurable product's per-location option menus for the default color.
+    (org.products || []).forEach(p => { if(p.configurable) cfgRefresh_(p.id); });
+  }
+}
+
+// Images to show for a product in a given garment color: the product's OWN images first, in the order
+// set on the product, then the linked blank's photos for that color (migrations/0037) — the exact
+// color, else the classic default (''), else any blank color. (The blank's photos are ADDED, never
+// a replacement: otherwise a product's own pictures would disappear once its blank got photos.)
+// A picture that is in both lists is shown once.
+function productImages_(p, color){
+  const ci = p.colorImages || {};
+  const key = color != null ? color : "";
+  const first = Object.keys(ci)[0];
+  const blank = (ci[key] && ci[key].length) ? ci[key]
+    : (ci[""] && ci[""].length) ? ci[""]
+    : (first && ci[first] && ci[first].length) ? ci[first] : [];
+  const out = [];
+  for(const src of (p.images || []).concat(blank)) if(src && !out.includes(src)) out.push(src);
+  return out;
+}
+function imageRowHtml_(p, imgs){
+  return (imgs && imgs.length)
+    ? `<div class="product-images">${imgs.map(src => `<a class="zoom-link" href="${escapeHtml(src)}"><img src="${escapeHtml(thumbUrl(src))}" alt="${escapeHtml(p.name)}" loading="lazy"></a>`).join("")}</div>`
+    : "";
+}
+// Personalization is opt-in per product. null/absent price = not offered for this item. A product with a
+// preset word list (personalizationOptions, e.g. a cap's closure words) gets a dropdown, otherwise a free
+// text box for the name. Shared by plain and configurable products; the change handler shows/hides the field.
+function personalizeHtml_(p){
+  const persPrice = (p.personalizationPrice != null) ? p.personalizationPrice : null;
+  if(persPrice == null) return "";
+  const persOptions = (p.personalizationOptions && p.personalizationOptions.length) ? p.personalizationOptions : null;
+  const persInput = persOptions
+    ? `<select id="pers-name-${p.id}" aria-label="Personalization option for ${escapeHtml(p.name)}" style="margin-top:8px; width:100%; display:none;">
+        <option value="">— choose an option —</option>
+        ${persOptions.map(o => `<option value="${escapeHtml(o)}">${escapeHtml(o)}</option>`).join("")}
+       </select>`
+    : `<input type="text" id="pers-name-${p.id}" placeholder="Name to embroider" aria-label="Name to embroider on ${escapeHtml(p.name)}" maxlength="60" style="margin-top:8px; width:100%; display:none;" />`;
+  return `
+    <label class="personalize-row">
+      <input type="checkbox" id="pers-${p.id}" data-pid="${p.id}"> Add personalization (+$${persPrice.toFixed(2)})
+    </label>
+    ${persInput}
+  `;
+}
+function renderProductRow(p, org){
+  if(p.configurable) return renderConfigurableProduct(p, org);
+  // Not every garment supports the full XS–4XL range — restrict the dropdown
+  // to whatever sizePricing actually has, in SIZE_ORDER's order, so an
+  // unpriced size can never be selected.
+  const isSized = p.type === "shirt" || p.type === "sweatshirt";
+  const sizeChoices = isSized ? productSizes_(p.sizePricing) : [];
+  const defaultSize = sizeChoices[0];
+  // A design the customer must upload (migrations/0054) is part of the price from the start.
+  const requiredAddOn = p.customDesign && p.customDesign.required ? customDesignAddOnCents_(p) / 100 : 0;
+  const priceLabel = p.type === "cap"
+    ? `$${(p.flatPrice + requiredAddOn).toFixed(2)}`
+    : `$${((priceFor(p, defaultSize) || Math.min(...Object.values(p.sizePricing))) + requiredAddOn).toFixed(2)}`;
+
+  const sizeOptions = isSized
+    ? `<select id="size-${p.id}" aria-label="Size for ${escapeHtml(p.name)}" data-pid="${p.id}">${sizeChoices.map(s=>`<option value="${s}">${s}</option>`).join("")}</select>`
+    : `<span class="mono" style="font-size:13px; color:var(--ink-soft);">One size fits all</span>`;
+
+  // Ready-to-ship stock badge — shows "N in stock" for the current size.
+  // stock is null when no stock data exists for this product (never entered in admin),
+  // or an object keyed by size (flat products use "" as the key).
+  function stockBadgeHtml(stock, size){
+    if(!stock) return "";
+    const qty = stock[size] ?? 0;
+    if(qty <= 0) return "";
+    return `<span class="stock-badge">${qty} in stock</span>`;
+  }
+  const initialSize = isSized ? defaultSize : "";
+  const initialStockBadge = stockBadgeHtml(p.stock, initialSize);
+  const stockEl = (p.stock && (isSized || (p.stock[""] > 0)))
+    ? `<span id="stock-${p.id}" class="stock-badge-wrap">${initialStockBadge}</span>`
+    : "";
+
+  const featureList = (p.features && p.features.length)
+    ? `<ul class="feature-list">${p.features.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul>`
+    : "";
+
+  const imageRow = (productImages_(p).length)
+    ? `<div class="product-images">${productImages_(p).map(src => `<a class="zoom-link" href="${escapeHtml(src)}"><img src="${escapeHtml(thumbUrl(src))}" alt="${escapeHtml(p.name)} blank — click to view full size" loading="lazy"></a>`).join("")}</div>`
+    : "";
+
+  const personalizeRow = personalizeHtml_(p);
+
+  return `
+    <div class="product">
+      <div class="product-head">
+        <h3>${escapeHtml(p.name)}</h3>
+        <div class="product-price" id="price-${p.id}">${priceLabel}</div>
+      </div>
+      <div class="product-desc">${escapeHtml(p.sub)}</div>
+      ${imageRow}
+      ${featureList}
+      <div class="product-controls">
+        ${sizeOptions}
+        <input class="qty-input" type="text" inputmode="numeric" id="qty-${p.id}" value="1" aria-label="Quantity for ${escapeHtml(p.name)}">
+        <button class="add-btn" data-action="add" data-pid="${p.id}">Add</button>
+      </div>
+      ${stockEl}
+      ${personalizeRow}
+      ${plainCustomDesignHtml_(p)}
+    </div>
+  `;
+}
+
+// Configurable products (migrations/0036): per-location graphic options, tier add-ons, live preview.
+function cfgGraphics_(org){ return (org && org.graphics) || (activeCatalog && activeCatalog.graphics) || []; }
+function cfgOptionsForLocation_(p, org, loc, color){
+  const byId = {}; cfgGraphics_(org).forEach(g => { byId[g.id] = g; });
+  return (loc.graphicIds || []).map(id => byId[id]).filter(Boolean)
+    .filter(g => (!g.allowedLocations || !g.allowedLocations.length || g.allowedLocations.includes(loc.key)))
+    .filter(g => (!g.allowedGarmentColors || !g.allowedGarmentColors.length || !color || g.allowedGarmentColors.includes(color)))
+    .filter(g => !(color && (p.blockedGraphicColors || []).some(b => Number(b.graphicId) === g.id && b.color === color)));   // this product doesn't offer it on this color
+}
+function renderConfigurableProduct(p, org){
+  const isSized = p.type === "shirt" || p.type === "sweatshirt";
+  const sizeChoices = isSized ? productSizes_(p.sizePricing) : [];
+  const colors = p.garmentColors || [];
+  const base = isSized ? (sizeChoices.length ? (p.sizePricing[sizeChoices[0]] || 0) : 0) : (p.flatPrice || 0);
+  const swatches = colors.length
+    ? `<div class="cfg-swatches" id="gcolorwrap-${p.id}">${colors.map((c, i) => `<button type="button" class="cfg-swatch${i === 0 ? " sel" : ""}" data-pid="${p.id}" data-color="${escapeHtml(c)}" onclick="cfgPickColor_('${p.id}', this)">${escapeHtml(c)}</button>`).join("")}</div><input type="hidden" id="gcolor-${p.id}" value="${escapeHtml(colors[0] || "")}">`
+    : `<input type="hidden" id="gcolor-${p.id}" value="">`;
+  const sizeOptions = isSized
+    ? `<select id="size-${p.id}" aria-label="Size for ${escapeHtml(p.name)}" data-pid="${p.id}">${sizeChoices.map(s => `<option value="${s}">${s}</option>`).join("")}</select>`
+    : `<span class="mono" style="font-size:13px;color:var(--ink-soft);">One size fits all</span>`;
+  const locBlocks = (p.locations || []).map(loc => `
+    <div class="cfg-loc" data-key="${escapeHtml(loc.key)}">
+      <label class="cfg-loc-label">${escapeHtml(loc.label || loc.key)}
+        <select id="loc-${p.id}-${escapeHtml(loc.key)}" data-pid="${p.id}" class="cfg-loc-select"></select>
+      </label>
+      <select id="ink-${p.id}-${escapeHtml(loc.key)}" data-pid="${p.id}" class="cfg-ink-select" style="display:none;margin-top:4px;"></select>
+      ${p.customDesign ? customDesignHtml_(p, loc.key, true) : ""}
+    </div>`).join("");
+  // Swapped per garment color by cfgImages_ (migrations/0037): the selected color's blank images.
+  const imageRow = `<div id="cfgimg-${p.id}">${imageRowHtml_(p, productImages_(p, colors[0] || ""))}</div>`;
+  const featureList = (p.features && p.features.length)
+    ? `<ul class="feature-list">${p.features.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul>`
+    : "";
+  return `
+    <div class="product">
+      <div class="product-head">
+        <h3>${escapeHtml(p.name)}</h3>
+        <div class="product-price" id="price-${p.id}">$${base.toFixed(2)}</div>
+      </div>
+      <div class="product-desc">${escapeHtml(p.sub)}</div>
+      ${imageRow}
+      ${featureList}
+      ${colors.length ? `<div class="cfg-field-label">Garment color</div>${swatches}` : swatches}
+      <div class="cfg-field-label" style="margin-top:8px;">Graphics</div>
+      <div class="cfg-locs">${locBlocks}</div>
+      ${personalizeHtml_(p)}
+      <div class="cfg-preview" id="cpreview-${p.id}"></div>
+      <div class="cfg-breakdown" id="cbd-${p.id}"></div>
+      <div class="product-controls" style="margin-top:8px;">
+        ${sizeOptions}
+        <input class="qty-input" type="text" inputmode="numeric" id="qty-${p.id}" value="1" aria-label="Quantity for ${escapeHtml(p.name)}">
+        <button class="add-btn" id="cadd-${p.id}" data-action="add" data-pid="${p.id}" disabled>Add</button>
+      </div>
+      <div class="cfg-hint" id="chint-${p.id}" style="font-size:12px;color:var(--ink-soft);margin-top:6px;">Choose a graphic for at least one location.</div>
+    </div>`;
+}
+// (Re)builds a configurable product's option menus for the current color, then updates preview/price.
+function cfgRefresh_(pid){
+  const p = activeCatalog.products.find(x => x.id === pid); if (!p || !p.configurable) return;
+  const org = currentOrg;
+  const color = (document.getElementById("gcolor-" + pid) || {}).value || "";
+  for (const loc of (p.locations || [])) {
+    const sel = document.getElementById("loc-" + pid + "-" + loc.key); if (!sel) continue;
+    const prev = sel.value;
+    const opts = cfgOptionsForLocation_(p, org, loc, color);
+    // The customer's own design is one more choice at every location (migrations/0054).
+    const custom = !!p.customDesign;
+    // A product with a single graphic location has nothing to leave blank (a blank garment can't be ordered),
+    // so there's no "None" and the first option is preselected; with several locations "None" stays.
+    const onlyLoc = (p.locations || []).length === 1 && (opts.length > 0 || custom);
+    sel.innerHTML = (onlyLoc ? "" : `<option value="">None</option>`) + opts.map(g => `<option value="${g.id}">${escapeHtml(g.name)}${g.addOnCents ? " (+$" + (g.addOnCents / 100).toFixed(2) + ")" : ""}</option>`).join("") +
+      (custom ? `<option value="custom">${escapeHtml(customDesignOptionLabel_(p, loc))}</option>` : "");
+    if (prev && (opts.some(g => String(g.id) === prev) || (prev === "custom" && custom))) sel.value = prev; // keep a still-valid pick
+    else if (onlyLoc) sel.value = opts.length ? String(opts[0].id) : "custom";
+    // Ink select for the chosen graphic (shown only when >1 ink).
+    const ink = document.getElementById("ink-" + pid + "-" + loc.key);
+    const g = opts.find(x => String(x.id) === sel.value);
+    if (ink) {
+      if (g && g.inkColors && g.inkColors.length > 1) { ink.innerHTML = g.inkColors.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join(""); ink.style.display = ""; }
+      else { ink.innerHTML = ""; ink.style.display = "none"; }
+    }
+  }
+  cfgImages_(pid, color);
+  cfgUpdate_(pid);
+}
+// Swaps a configurable product's photos to the selected garment color's blank images.
+function cfgImages_(pid, color){
+  const p = activeCatalog.products.find(x => x.id === pid); if (!p) return;
+  const box = document.getElementById("cfgimg-" + pid); if (!box) return;
+  box.innerHTML = imageRowHtml_(p, productImages_(p, color || ""));
+}
+function cfgPickColor_(pid, btn){
+  document.querySelectorAll("#gcolorwrap-" + pid + " .cfg-swatch").forEach(b => b.classList.remove("sel"));
+  btn.classList.add("sel");
+  const h = document.getElementById("gcolor-" + pid); if (h) h.value = btn.dataset.color;
+  cfgRefresh_(pid);
+}
+// Reads the current picks → live preview (thumbnails badged by location) + price breakdown + Add state.
+function cfgPicks_(pid){
+  const p = activeCatalog.products.find(x => x.id === pid); const org = currentOrg;
+  const byId = {}; cfgGraphics_(org).forEach(g => { byId[g.id] = g; });
+  const color = (document.getElementById("gcolor-" + pid) || {}).value || "";
+  const picks = [];
+  for (const loc of (p.locations || [])) {
+    const sel = document.getElementById("loc-" + pid + "-" + loc.key); if (!sel || !sel.value) continue;
+    if (sel.value === "custom" && p.customDesign) {
+      // The customer's own design: a stand-in graphic, so the price and preview code treat it like any other.
+      const up = customDesignUploads_[pid + "|" + loc.key] || null;
+      const preview = up && up.status === "done" ? up.previewUrl : "";
+      picks.push({ location: loc.key, locationId: loc.locationId || null, label: loc.label || loc.key, custom: true, upload: up,
+        graphic: { id: "custom", name: "Your own design", addOnCents: customDesignAddOnCents_(p, loc), imageUrl: preview, thumbUrl: preview }, ink: "" });
+      continue;
+    }
+    const g = byId[Number(sel.value)]; if (!g) continue;
+    const inkEl = document.getElementById("ink-" + pid + "-" + loc.key);
+    const ink = inkEl && inkEl.style.display !== "none" ? inkEl.value : (g.inkColors && g.inkColors.length === 1 ? g.inkColors[0] : "");
+    picks.push({ location: loc.key, locationId: loc.locationId || null, label: loc.label || loc.key, graphic: g, ink });
+  }
+  return { color, picks };
+}
+function cfgUpdate_(pid){
+  const p = activeCatalog.products.find(x => x.id === pid); if (!p) return;
+  const isSized = p.type === "shirt" || p.type === "sweatshirt";
+  const sizeEl = document.getElementById("size-" + pid);
+  const base = isSized ? ((p.sizePricing || {})[sizeEl ? sizeEl.value : ""] || 0) : (p.flatPrice || 0);
+  const { color, picks } = cfgPicks_(pid);
+  const addOns = picks.reduce((s, x) => s + (x.graphic.addOnCents || 0), 0) / 100;
+  const persEl = document.getElementById("pers-" + pid);
+  const persFee = (persEl && persEl.checked && p.personalizationPrice != null) ? p.personalizationPrice : 0;
+  const total = base + addOns + persFee;
+  const priceEl = document.getElementById("price-" + pid); if (priceEl) priceEl.textContent = "$" + total.toFixed(2);
+  const bd = document.getElementById("cbd-" + pid);
+  if (bd) bd.innerHTML = `<div class="cfg-bd-row"><span>Base</span><span>$${base.toFixed(2)}</span></div>` +
+    picks.map(x => `<div class="cfg-bd-row"><span>${escapeHtml(x.label)}: ${escapeHtml(x.graphic.name)}${x.ink ? " (" + escapeHtml(x.ink) + ")" : ""}</span><span>${x.graphic.addOnCents ? "+$" + (x.graphic.addOnCents / 100).toFixed(2) : "incl."}</span></div>`).join("") +
+    (persFee ? `<div class="cfg-bd-row"><span>Personalization</span><span>+$${persFee.toFixed(2)}</span></div>` : "");
+  // One preview image per location: the composed mockup (the graphic ON the garment in this color,
+  // migrations/0042) when one exists for this color+location+graphic, else the graphic's own image.
+  const mockups = p.graphicImages || {};
+  const prev = document.getElementById("cpreview-" + pid);
+  if (prev) prev.innerHTML = picks.map(x => {
+    const mockup = x.locationId ? mockups[x.locationId + "|" + x.graphic.id + "|" + color] : null;
+    // full = the image opened full-size on click; thumb = the small preview (the thumbnail variant).
+    const full = mockup || x.graphic.imageUrl || x.graphic.thumbUrl;
+    const thumb = mockup ? thumbUrl(mockup) : (x.graphic.thumbUrl || x.graphic.imageUrl);
+    if (!full) return "";
+    return `<div class="cfg-prev-item${mockup ? " cfg-prev-mockup" : ""}"><a class="zoom-link" href="${escapeHtml(full)}" title="View full size"><img src="${escapeHtml(thumb)}" alt="${escapeHtml(x.graphic.name)}" loading="lazy"></a><span class="cfg-prev-badge">${escapeHtml(x.label)}</span></div>`;
+  }).filter(Boolean).join("");
+  // The upload box shows under each location set to Custom; Add waits until every one has finished.
+  for (const loc of (p.locations || [])) {
+    const box = document.getElementById(customDesignBoxId_(pid, loc.key));
+    if (box) box.hidden = !picks.some(x => x.custom && x.location === loc.key);
+  }
+  const waiting = picks.filter(x => x.custom && !(x.upload && x.upload.status === "done"));
+  const add = document.getElementById("cadd-" + pid), hint = document.getElementById("chint-" + pid);
+  if (add) add.disabled = picks.length === 0 || waiting.length > 0;
+  if (hint) {
+    hint.textContent = picks.length === 0 ? "Choose a graphic for at least one location."
+      : waiting.some(x => x.upload && x.upload.status === "uploading") ? "Your design is uploading…" : "Upload your design to add this to your cart.";
+    hint.style.display = picks.length === 0 || waiting.length ? "" : "none";
+  }
+}
+
+// ---- The customer's own design (migrations/0054) ----------------------------------------------
+// A product set to take it shows an upload box: under an ordinary product (required when the product
+// has no design of its own, else "Use my own design instead"), or under each location of a
+// configurable product when "Custom — upload your own" is picked. The image is checked here, then
+// uploaded to /api/customer-design, which checks it again and returns an id the cart line carries.
+// Uploads are kept per product + location (pid|loc) while the page is open, so the same image can go
+// on another size; the preview is an object URL of the chosen file.
+const CUSTOM_DESIGN_LIMITS = { types: ["image/png", "image/jpeg", "image/webp"], maxBytes: 10 * 1024 * 1024, minLongSide: 500, maxSide: 10000, softTransferSide: 1500 };
+const customDesignUploads_ = {};   // "pid|loc" → {status: "uploading"|"done"|"error", uploadId, file, fileName, previewUrl, width, height, message, warning}
+const CUSTOM_PLAIN_LOC = "customdesign";
+// The add-on: a configurable location's own (customDesignPriceCents), else the product's (null = free).
+function customDesignAddOnCents_(p, loc){
+  if(loc && loc.customDesignPriceCents != null && Number.isFinite(Number(loc.customDesignPriceCents))) return Math.max(0, Number(loc.customDesignPriceCents));
+  const c = p && p.customDesign; return c && c.price != null ? Math.round(Number(c.price) * 100) || 0 : 0;
+}
+function customDesignPriceText_(p, loc){ const c = customDesignAddOnCents_(p, loc); return c ? "+$" + (c / 100).toFixed(2) : ""; }
+function customDesignOptionLabel_(p, loc){ const t = customDesignPriceText_(p, loc); return "Custom — upload your own" + (t ? " (" + t + ")" : ""); }
+function customDesignBoxId_(pid, loc){ return "cd-" + pid + "-" + loc; }
+// The upload box. `hidden` = drawn hidden (a configurable location until Custom is picked).
+function customDesignHtml_(p, locKey, hidden){
+  const st = customDesignUploads_[p.id + "|" + locKey] || null;
+  const transfer = p.customDesign && p.customDesign.kind === "transfer";
+  const hint = transfer ? "Printed from your image — a sharp image about 3000 px across prints best at 10 inches."
+    : "A clear logo with solid colors works best — we'll email you a proof.";
+  const head = locKey === CUSTOM_PLAIN_LOC ? "" : `<div class="cd-head">Your design</div>`;
+  return `<div class="cd-box" id="${customDesignBoxId_(p.id, locKey)}" data-cd-pid="${escapeHtml(p.id)}" data-cd-loc="${escapeHtml(locKey)}"${hidden ? " hidden" : ""}>
+      ${head}
+      <input type="file" class="cd-file" accept="image/png,image/jpeg,image/webp" aria-label="Upload your design for ${escapeHtml(p.name)}">
+      <div class="cd-rules">PNG, JPG or WebP · up to 10 MB · at least 500 px on the long side.</div>
+      <div class="cd-hint">${escapeHtml(hint)}</div>
+      <div class="cd-status${st && st.status === "error" ? " cd-err" : st && st.warning ? " cd-warn" : ""}" role="alert">${escapeHtml(customDesignStatusText_(st))}</div>
+      <div class="cd-preview">${st && st.status === "done" && st.previewUrl ? `<a class="zoom-link" href="${escapeHtml(st.previewUrl)}" title="View full size"><img src="${escapeHtml(st.previewUrl)}" alt="Your design — click to view full size"></a>` : ""}</div>
+      <div class="cd-ts"></div>
+    </div>`;
+}
+function customDesignStatusText_(st){
+  if(!st) return "";
+  if(st.status === "uploading") return "Uploading " + st.fileName + "…";
+  if(st.status === "error") return st.message || "That upload didn't work — please try again.";
+  return "Uploaded: " + st.fileName + " (" + st.width + " × " + st.height + " px)" + (st.warning ? " — " + st.warning : "");
+}
+// An ordinary product: the required box, or the "Use my own design instead" switch and its box.
+function plainCustomDesignHtml_(p){
+  const c = p.customDesign; if(!c) return "";
+  const price = customDesignPriceText_(p);
+  if(c.required) return `<div class="cd-head" style="margin-top:12px;">Your design (required)${price ? " " + price : ""}</div>${customDesignHtml_(p, CUSTOM_PLAIN_LOC, false)}`;
+  const on = !!customDesignUploads_[p.id + "|" + CUSTOM_PLAIN_LOC];
+  return `<label class="personalize-row"><input type="checkbox" id="cdon-${escapeHtml(p.id)}" data-pid="${escapeHtml(p.id)}"${on ? " checked" : ""}> Use my own design instead${price ? " (" + price + ")" : ""}</label>
+    ${customDesignHtml_(p, CUSTOM_PLAIN_LOC, !on)}`;
+}
+// Is an ordinary product's own-design box in use? (Required, or the switch is on.)
+function plainCustomOn_(p){
+  if(!p || !p.customDesign || p.configurable) return false;
+  if(p.customDesign.required) return true;
+  const el = document.getElementById("cdon-" + p.id);
+  return !!(el && el.checked);
+}
+// Redraws a box from its upload's state (the page may have been redrawn while it uploaded).
+function customDesignRedraw_(pid, loc){
+  const p = activeCatalog && activeCatalog.products.find(x => x.id === pid);
+  const box = document.getElementById(customDesignBoxId_(pid, loc));
+  if(!p || !box) return;
+  const st = customDesignUploads_[pid + "|" + loc] || null;
+  const status = box.querySelector(".cd-status");
+  status.textContent = customDesignStatusText_(st);
+  status.className = "cd-status" + (st && st.status === "error" ? " cd-err" : st && st.warning ? " cd-warn" : "");
+  box.querySelector(".cd-preview").innerHTML = st && st.status === "done" && st.previewUrl
+    ? `<a class="zoom-link" href="${escapeHtml(st.previewUrl)}" title="View full size"><img src="${escapeHtml(st.previewUrl)}" alt="Your design — click to view full size"></a>` : "";
+  if(p.configurable) cfgUpdate_(pid); else updateProductPrice(pid);
+}
+async function handleCustomDesignFile_(input){
+  const box = input.closest(".cd-box"); if(!box) return;
+  const pid = box.dataset.cdPid, loc = box.dataset.cdLoc, key = pid + "|" + loc;
+  const p = activeCatalog && activeCatalog.products.find(x => x.id === pid);
+  const file = input.files && input.files[0];
+  if(!p || !p.customDesign || !file) return;
+  const old = customDesignUploads_[key];
+  const fail = (message) => {
+    if(old && old.previewUrl) URL.revokeObjectURL(old.previewUrl);
+    customDesignUploads_[key] = { status: "error", message, fileName: file.name };
+    input.value = "";
+    customDesignRedraw_(pid, loc);
+  };
+  const L = CUSTOM_DESIGN_LIMITS;
+  if(!L.types.includes(file.type)) return fail("Please choose a PNG, JPG or WebP image.");
+  if(file.size > L.maxBytes) return fail("That image is too large — the limit is 10 MB.");
+  if(!file.size) return fail("That file is empty.");
+  let width = 0, height = 0;
+  if(typeof window.createImageBitmap === "function"){
+    try{ const bmp = await createImageBitmap(file); width = bmp.width; height = bmp.height; if(bmp.close) bmp.close(); }
+    catch(e){ return fail("We couldn't read that image — please save it as a PNG or JPG and try again."); }
+    if(Math.max(width, height) < L.minLongSide) return fail(`That image is too small to reproduce (${width} × ${height} px) — please use one at least ${L.minLongSide} px on the long side.`);
+    if(width > L.maxSide || height > L.maxSide) return fail(`That image is too large (${width} × ${height} px) — please use one at most 10,000 px on each side.`);
+  }
+  if(old && old.previewUrl) URL.revokeObjectURL(old.previewUrl);
+  const st = { status: "uploading", file, fileName: file.name, previewUrl: "" };
+  customDesignUploads_[key] = st;
+  customDesignRedraw_(pid, loc);
+  try{
+    const token = await getTurnstileToken(box.querySelector(".cd-ts"));
+    const headers = { "Content-Type": file.type, "X-File-Name": encodeURIComponent(file.name.slice(0, 200)) };
+    if(token) headers["X-Turnstile-Token"] = token;
+    const res = await fetch("/api/customer-design?product=" + encodeURIComponent(pid), { method: "POST", headers, body: file });
+    const data = await res.json().catch(() => null);
+    if(customDesignUploads_[key] !== st) return;   // another file was chosen meanwhile
+    if(!res.ok || !data || data.status !== "ok") return fail((data && data.message) || "That upload didn't work — please try again.");
+    Object.assign(st, { status: "done", uploadId: data.uploadId, width: data.width, height: data.height, previewUrl: URL.createObjectURL(file),
+      warning: p.customDesign.kind === "transfer" && Math.max(data.width, data.height) < L.softTransferSide ? "it may print soft — about 3000 px is best for a 10-inch print." : "" });
+    const box2 = document.getElementById(customDesignBoxId_(pid, loc)); const ts = box2 && box2.querySelector(".cd-ts"); if(ts) ts.innerHTML = "";
+    customDesignRedraw_(pid, loc);
+  }catch(e){
+    if(customDesignUploads_[key] === st) fail((e && e.message) || "That upload didn't work — please try again.");
+  }
+}
+// A cart line's own copies of its design previews (object URLs), so removing the line can free them
+// without touching the product card's preview.
+function cartDesignPreviews_(pid, locs, labelOf){
+  return locs.map(loc => { const st = customDesignUploads_[pid + "|" + loc];
+    return st && st.file ? { label: labelOf(loc), fileName: st.fileName, url: URL.createObjectURL(st.file) } : null; }).filter(Boolean);
+}
+function revokeCartPreviews_(lines){
+  for(const c of lines || []) for(const d of (c.cdPreviews || [])) if(d.url) URL.revokeObjectURL(d.url);
+}
+function clearCart_(){ revokeCartPreviews_(cart); cart = []; }
+
+// Delegated handlers for product controls and cart/order actions — uses
+// data-* attributes instead of splicing server IDs into inline onclick strings.
+
+// ---- Image viewer ("zoom") -------------------------------------------------
+// Clicking a product/option/design picture opens it in a near-full-screen viewer instead of a new tab.
+// The pictures are every a.zoom-link inside the same product card (or the org's design-preview strip),
+// so the arrows walk the blank photos AND the configured option previews currently shown. It closes only
+// from the Close button or Escape (never a stray click outside — same rule as every other pop-up).
+function openImageViewer_(links, startIdx){
+  const items = links.map(a => { const img = a.querySelector("img"); const badge = a.parentElement && a.parentElement.querySelector(".cfg-prev-badge");
+    return { src: a.getAttribute("href"), alt: (img && img.alt || "").replace(/\s*[—-]\s*click to view full size$/, ""), label: badge ? badge.textContent : "" }; }).filter(it => it.src);
+  if (!items.length) return;
+  let i = Math.max(0, Math.min(items.length - 1, startIdx || 0));
+  const opener = document.activeElement;
+  const ov = document.createElement("div");
+  ov.className = "lb-overlay"; ov.setAttribute("role", "dialog"); ov.setAttribute("aria-modal", "true"); ov.setAttribute("aria-label", "Image viewer");
+  ov.innerHTML = `<div class="lb-box"><div class="lb-stage"><img class="lb-img" alt=""></div><div class="lb-cap"><span class="lb-text"></span><span class="lb-count"></span></div>
+    <button type="button" class="lb-btn lb-prev" aria-label="Previous image">&#8249;</button>
+    <button type="button" class="lb-btn lb-next" aria-label="Next image">&#8250;</button>
+    <button type="button" class="lb-btn lb-close" aria-label="Close">&#10005;</button></div>`;
+  const imgEl = ov.querySelector(".lb-img"), textEl = ov.querySelector(".lb-text"), countEl = ov.querySelector(".lb-count");
+  const prev = ov.querySelector(".lb-prev"), next = ov.querySelector(".lb-next"), closeBtn = ov.querySelector(".lb-close");
+  const show = (n) => { i = (n + items.length) % items.length; const it = items[i];
+    imgEl.src = it.src; imgEl.alt = it.alt || it.label || "Product image";
+    textEl.textContent = [it.label, it.alt].filter(Boolean).filter((v, k, a) => a.indexOf(v) === k).join(" — ");
+    countEl.textContent = items.length > 1 ? (i + 1) + " / " + items.length : ""; };
+  prev.hidden = next.hidden = items.length < 2;
+  const close = () => { document.removeEventListener("keydown", onKey, true); ov.remove(); document.body.style.overflow = prevOverflow; if (opener && opener.focus) try { opener.focus(); } catch (e) {} };
+  const onKey = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (e.key === "ArrowLeft" && items.length > 1) { e.preventDefault(); show(i - 1); }
+    else if (e.key === "ArrowRight" && items.length > 1) { e.preventDefault(); show(i + 1); }
+    else if (e.key === "Tab") { const f = [closeBtn].concat(items.length > 1 ? [prev, next] : []); const k = f.indexOf(document.activeElement);
+      e.preventDefault(); f[(k + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus(); }
+  };
+  prev.onclick = () => show(i - 1); next.onclick = () => show(i + 1); closeBtn.onclick = close;
+  // Swipe on a touch screen.
+  let tx = null;
+  ov.addEventListener("touchstart", (e) => { tx = e.touches.length === 1 ? e.touches[0].clientX : null; }, { passive: true });
+  ov.addEventListener("touchend", (e) => { if (tx == null || items.length < 2) return; const dx = (e.changedTouches[0].clientX - tx); tx = null; if (Math.abs(dx) > 50) show(i + (dx < 0 ? 1 : -1)); }, { passive: true });
+  const prevOverflow = document.body.style.overflow; document.body.style.overflow = "hidden";
+  document.addEventListener("keydown", onKey, true);
+  document.body.appendChild(ov); show(i); closeBtn.focus();
+  return { ov, close, show };
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a.zoom-link"); if (!a) return;
+  if (e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1) return;   // let "open in new tab" shortcuts work
+  e.preventDefault();
+  const scope = a.closest(".product, .design-preview") || a.parentElement;
+  const links = Array.from(scope.querySelectorAll("a.zoom-link"));
+  openImageViewer_(links, links.indexOf(a));
+});
+
+document.addEventListener("click", (e)=>{
+  const btn = e.target.closest("[data-action]");
+  if(!btn) return;
+  const a = btn.dataset.action;
+  if(a === "add") addToCart(btn.dataset.pid);
+  else if(a === "remove") removeFromCart(Number(btn.dataset.idx), btn.dataset.org);
+  else if(a === "place-order") placeOrder(btn.dataset.org);
+  else if(a === "go-org") go("org", btn.dataset.org);
+});
+
+document.addEventListener("change", (e)=>{
+  // The customer's own design: a file was chosen.
+  if(e.target.classList && e.target.classList.contains("cd-file")){ handleCustomDesignFile_(e.target); return; }
+  // "Use my own design instead": show/hide its box.
+  if(e.target.id && e.target.id.startsWith("cdon-")){
+    const box = document.getElementById(customDesignBoxId_(e.target.id.slice(5), CUSTOM_PLAIN_LOC));
+    if(box) box.hidden = !e.target.checked;
+  }
+  // Size select / personalization checkbox: update the displayed price.
+  if(e.target.dataset.pid){
+    const cp = activeCatalog && activeCatalog.products && activeCatalog.products.find(x => x.id === e.target.dataset.pid);
+    if(cp && cp.configurable) cfgRefresh_(e.target.dataset.pid);
+    else updateProductPrice(e.target.dataset.pid);
+  }
+  // Personalization checkbox: show/hide the name field.
+  if(e.target.id && e.target.id.startsWith("pers-") && !e.target.id.startsWith("pers-name-")){
+    const pid = e.target.id.replace("pers-","");
+    const nameField = document.getElementById("pers-name-"+pid);
+    if(nameField) nameField.style.display = e.target.checked ? "block" : "none";
+  }
+  // Shipping delivery option: update selected quote and re-render totals.
+  if(e.target.name === "shippingChoice"){
+    const val = e.target.value;
+    if(val.startsWith("o:")){            // local pickup or one of the shop's own options
+      deliveryOptId = val.slice(2); shippingQuote = null; shippingManualPicked = false;
+    }else if(val === "manual"){          // ship it — the quote follows by email
+      shippingQuote = null; shippingManualPicked = true;
+    }else{
+      const idx = parseInt(val, 10);
+      shippingQuote = (Number.isFinite(idx) && shippingRates[idx]) ? shippingRates[idx] : null;
+      shippingManualPicked = false;
+    }
+    if(currentOrg && currentOrgId) renderTicket(currentOrg, currentOrgId);
+  }
+});
+
+document.addEventListener("input", (e)=>{
+  if(e.target.id === "shippingZipInput"){
+    shippingZip = isUS_() ? e.target.value.replace(/\D/g,"").slice(0,5) : e.target.value.slice(0,20);
+    e.target.value = shippingZip; // normalize in-place (US: strip non-digits)
+    scheduleShippingUpdate();
+  }
+});
+
+// Renders the delivery/shipping section inside the ticket panel.
+// The Delivery choices: the shop's list in its own order — local pickup and its custom options as
+// radios with their fee, and (when the shop ships) a ZIP box that brings up carrier rates to pick
+// from. A shop that only offers free local pickup shows nothing.
+function renderShippingSection(org){
+  if(!org) return "";
+  const options = deliveryOptions_(org);
+  if(options.length === 1 && options[0].type === "pickup") return "";
+  const ships = offersShipping_(org);
+  const cur = currentDelivery_(org);
+  const fee = (f) => Number(f) > 0 ? `$${Number(f).toFixed(2)}` : "Free";
+
+  const rateOptions = shippingRates.map((r, i) => {
+    const sel = cur.kind === "quote" && shippingQuote.provider === r.provider && shippingQuote.service === r.service;
+    const days = r.estimatedDays ? ` <small>(~${r.estimatedDays} day${r.estimatedDays !== 1 ? "s" : ""})</small>` : "";
+    return `<label class="shipping-option">
+      <input type="radio" name="shippingChoice" value="${i}"${sel ? " checked" : ""}>
+      <span>${escapeHtml(r.provider)} ${escapeHtml(r.service)} &mdash; <strong>$${r.amount.toFixed(2)}</strong>${days}</span>
+    </label>`;
+  }).join("");
+  const manualOption = shippingManual
+    ? `<label class="shipping-option">
+        <input type="radio" name="shippingChoice" value="manual"${cur.kind === "manual" ? " checked" : ""}>
+        <span>Ship to ${escapeHtml(shippingZip)} &mdash; <strong>quote to follow</strong></span>
+      </label>
+      <div class="shipping-manual-notice" role="status">
+        <strong>Shipping quote pending</strong> — your order requires a custom shipping quote.
+        We'll follow up via email with the shipping cost, updated total, and payment options.
+        You can still place your order now.
+       </div>`
+    : "";
+  const shippingBlock = !ships ? "" : `
+      ${rateOptions}
+      ${manualOption}
+      <div class="shipping-zip-row">
+        <label class="shipping-zip-label" for="shippingZipInput">${options.length === 1 ? `${isUS_() ? "ZIP" : "Postal code"} for shipping rates` : `Ship it instead? ${isUS_() ? "ZIP" : "Postal code"} for carrier rates`}</label>
+        <input type="text" id="shippingZipInput" ${isUS_() ? 'inputmode="numeric" maxlength="5" placeholder="12345"' : 'maxlength="20" placeholder="Postal code"'}
+          value="${escapeHtml(shippingZip)}"
+          class="shipping-zip-input" aria-label="${isUS_() ? "ZIP code" : "Postal code"} for carrier shipping rates">
+        ${shippingLoading ? '<span class="shipping-loading" role="status" aria-live="polite">Calculating&hellip;</span>' : ""}
+      </div>`;
+
+  // In the shop's order; the shipping entry is where the ZIP box and the carrier rates go.
+  const rows = options.map(o => o.type === "shipping" ? shippingBlock : `
+      <label class="shipping-option">
+        <input type="radio" name="shippingChoice" value="o:${escapeHtml(o.id)}"${cur.kind === "option" && cur.option.id === o.id ? " checked" : ""}>
+        <span>${escapeHtml(o.label)} &mdash; <strong>${fee(o.fee)}</strong></span>
+      </label>`).join("");
+
+  return `
+    <div class="shipping-section">
+      <div class="shipping-section-label">Delivery</div>
+      ${rows}
+    </div>`;
+}
+
+// Debounces shipping quote fetches — called whenever the zip changes or
+// the cart changes while a zip is already set. Cancels if zip is not yet
+// 5 digits; resets to local delivery if it was previously a carrier rate.
+function scheduleShippingUpdate(){
+  if(!currentOrg || !offersShipping_(currentOrg)) return;
+  if(shippingDebounce) clearTimeout(shippingDebounce);
+  if(isUS_() ? !/^\d{5}$/.test(shippingZip) : !shippingZip.trim()){
+    const had = shippingQuote !== null || shippingManual;
+    shippingRates = []; shippingManual = false; shippingManualPicked = false; shippingQuote = null;
+    if(had) renderTicket(currentOrg, currentOrgId);
+    return;
+  }
+  shippingDebounce = setTimeout(fetchShippingQuote, 1000);
+}
+
+async function fetchShippingQuote(){
+  if(!currentOrg || !offersShipping_(currentOrg) || cart.length === 0) return;
+  shippingLoading = true;
+  renderTicket(currentOrg, currentOrgId);
+
+  const items = cart.map(c => {
+    const prod = (currentOrg.products || []).find(p => p.id === c.productId) || {};
+    return { productId: c.productId, qty: c.qty, weightOz: prod.weightOz || 0, type: prod.type || "" };
+  });
+
+  try{
+    const res = await fetch("/api/shipping", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({zip: shippingZip, items, org: currentOrgId})
+    });
+    const data = await res.json();
+    if(data.status === "ok"){
+      shippingManual = !!data.manualShipping;
+      // An order that needs a custom quote ships by default once a ZIP is typed; the
+      // customer can still switch back to pickup or another option.
+      shippingManualPicked = shippingManual;
+      shippingRates = data.rates || [];
+      shippingQuote = null; // clear selection whenever rates refresh
+      // If the previously selected carrier is no longer in the returned set,
+      // fall back to local delivery so there's never a stale/hidden selection.
+      if(!shippingManual && shippingQuote !== null){
+        const stillPresent = shippingRates.find(
+          r => r.provider === shippingQuote.provider && r.service === shippingQuote.service
+        );
+        if(!stillPresent) shippingQuote = null;
+      }
+    }else{
+      shippingRates = [];
+      shippingManual = false; shippingManualPicked = false;
+      showToast(isUS_() ? "Could not get shipping rates — check the ZIP and try again." : (data.message || "Could not get shipping rates."), true);
+    }
+  }catch(e){
+    shippingRates = [];
+    shippingManual = false; shippingManualPicked = false;
+    showToast("Could not reach the shipping service.", true);
+  }
+
+  shippingLoading = false;
+  renderTicket(currentOrg, currentOrgId);
+}
+
+// Collects a full shipping address via a modal overlay before the order is
+// submitted. Resolves to the address object on confirm, or null on cancel.
+// Which state(s) a ZIP is in, from its first three digits — the same table as zipStates in
+// functions/_lib/db.js — both are written by scripts/zip-prefix-table.py from USPS's ZIP list, so
+// regenerate them together. Many prefixes straddle a state line, hence a list; one not in use gives [].
+const ZIP3_STATES_ = "005:NY 006-007:PR 008:VI 009:PR 010-027:MA 028-029:RI 029:MA 030-038:NH 036:VT 039-049:ME 039:NH 050-054:VT 055:MA "
+  + "056-059:VT 060-069:CT 063:NY 070-099:NJ 090:AE 091:AE 092:AE 093:AE 094:AE 095:AE 096:AE 097:AE 098:AE 099:AE "
+  + "100-149:NY 150-196:PA 197-199:DE 199:MD 200:DC 200:MD 200:VA 201:VA 201:DC 202-205:DC 205:MD 205:VA 206-212:MD "
+  + "214-219:MD 218:DE 220-246:VA 241:WV 246:WV 247-268:WV 270-289:NC 290-299:SC 300-319:GA 307:TN 320-342:FL 340:AA 344:FL "
+  + "346-347:FL 349:FL 350-352:AL 354-369:AL 357:TN 370-385:TN 373:GA 376:VA 382:KY 386-397:MS 398-399:GA 400-418:KY 410:OH "
+  + "411:WV 415:WV 420-427:KY 430-459:OH 452:KY 453:IN 460-479:IN 470:OH 471:KY 480-499:MI 500-516:IA 515:NE 520-528:IA "
+  + "530-532:WI 534-535:WI 537-549:WI 550-551:MN 553-567:MN 565:ND 567:ND 570-577:SD 576:ND 580-588:ND 585:SD 590-599:MT "
+  + "593:SD 600-620:IL 612:IA 622-629:IL 630-631:MO 633-641:MO 644-658:MO 660-662:KS 664-679:KS 666:MO 680-681:NE "
+  + "683-693:NE 700-701:LA 703-708:LA 710-714:LA 716-729:AR 718:TX 730-731:OK 733:TX 734-741:OK 739:TX 743-749:OK "
+  + "750-770:TX 755:AR 772-799:TX 798:NM 800-816:CO 820-831:WY 832-838:ID 834:WY 838:WA 840-847:UT 847:AZ 850-853:AZ "
+  + "855-857:AZ 859-860:AZ 860:UT 863-865:AZ 870-871:NM 873-884:NM 885:TX 890-891:NV 893-895:NV 897-898:NV 900-908:CA "
+  + "910-928:CA 930-966:CA 962:AP 963:AP 964:AP 965:AP 966:AP 966:NJ 967-968:HI 967:AS 969:GU 969:FM 969:MH 969:MP 969:PW "
+  + "970-979:OR 979:ID 980-986:WA 988-994:WA 994:ID 995-999:AK";
+function zipStates_(zip){
+  const m = /^(\d{3})\d{2}/.exec(String(zip || "").trim());
+  if(!m) return [];
+  const n = Number(m[1]), out = [];
+  for(const part of ZIP3_STATES_.split(" ")){
+    const [range, st] = part.split(":"), [a, b] = range.split("-").map(Number);
+    if(n >= a && n <= (b === undefined ? a : b) && !out.includes(st)) out.push(st);
+  }
+  return out;
+}
+function collectShippingAddress(){
+  return new Promise(resolve => {
+    const overlay = document.createElement("div");
+    overlay.className = "ship-addr-overlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Shipping address");
+    // Carry the shop's accent onto the overlay (it lives outside .layout), with a text colour that's
+    // readable on it — a light accent (e.g. orange) gets dark text instead of white.
+    const acc = String((currentOrg && currentOrg.accent) || "").trim();
+    if (/^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(acc)) {
+      overlay.style.setProperty("--org-accent", acc);
+      overlay.style.setProperty("--org-accent-ink", readableInkOn(acc));
+    }
+
+    const prefillName = (document.getElementById("custName") || {}).value || "";
+
+    overlay.innerHTML = `
+      <div class="ship-addr-box">
+        <h2>Shipping address</h2>
+        <div class="ship-addr-fields">
+          <input type="text" id="shipName" placeholder="Full name" aria-label="Full name" autocomplete="name" value="${escapeHtml(prefillName)}">
+          <input type="text" id="shipLine1" placeholder="Address line 1" aria-label="Address line 1" autocomplete="address-line1">
+          <input type="text" id="shipLine2" placeholder="Apt, suite, etc. (optional)" aria-label="Address line 2" autocomplete="address-line2">
+          <div class="ship-addr-row">
+            <input type="text" id="shipCity" placeholder="City" aria-label="City" autocomplete="address-level2" class="ship-addr-city">
+            ${isUS_()
+              ? `<input type="text" id="shipState" placeholder="ST" aria-label="State (2 letters)" autocomplete="address-level1" maxlength="2" class="ship-addr-state">
+            <input type="text" id="shipZip" placeholder="ZIP" aria-label="ZIP code" inputmode="numeric" maxlength="5" autocomplete="postal-code" class="ship-addr-zip" value="${escapeHtml(shippingZip)}">`
+              : `<input type="text" id="shipState" placeholder="State / region" aria-label="State / region" autocomplete="address-level1" maxlength="50" class="ship-addr-city">
+            <input type="text" id="shipZip" placeholder="Postal code" aria-label="Postal code" maxlength="20" autocomplete="postal-code" class="ship-addr-zip" style="flex:0 0 130px;width:130px;" value="${escapeHtml(shippingZip)}">`}
+          </div>
+          <div class="ship-addr-error" id="shipAddrError" role="alert"></div>
+        </div>
+        <div class="ship-addr-actions">
+          <button class="ship-addr-cancel" id="shipCancelBtn">Cancel</button>
+          <button class="ship-addr-confirm" id="shipConfirmBtn">Confirm address</button>
+        </div>
+      </div>`;
+
+    document.body.appendChild(overlay);
+    overlay.querySelector("#shipName").focus();
+
+    function close(result){ overlay.remove(); resolve(result); }
+
+    overlay.querySelector("#shipCancelBtn").addEventListener("click", () => close(null));
+    overlay.addEventListener("keydown", e => { if(e.key === "Escape") close(null); });
+
+
+    function confirm(){
+      const errEl = overlay.querySelector("#shipAddrError");
+      const name  = overlay.querySelector("#shipName").value.trim();
+      const line1 = overlay.querySelector("#shipLine1").value.trim();
+      const line2 = overlay.querySelector("#shipLine2").value.trim();
+      const city  = overlay.querySelector("#shipCity").value.trim();
+      const us = isUS_();
+      const state = us ? overlay.querySelector("#shipState").value.trim().toUpperCase() : overlay.querySelector("#shipState").value.trim();
+      const zip   = overlay.querySelector("#shipZip").value.trim();
+      errEl.textContent = "";
+      // Outside the US the region is optional (not every country has one) and neither it nor the
+      // postal code has a fixed format.
+      if(!name || !line1 || !city || (us && !state) || !zip){
+        errEl.textContent = "Please fill in all required fields.";
+        return;
+      }
+      if(!us){ close({ name, line1, line2: line2 || null, city, state, zip }); return; }
+      if(!/^[A-Z]{2}$/.test(state)){
+        errEl.textContent = "State must be a 2-letter abbreviation (e.g. NY).";
+        return;
+      }
+      if(!/^\d{5}$/.test(zip)){
+        errEl.textContent = "ZIP must be 5 digits.";
+        return;
+      }
+      // The server refuses a state that contradicts the ZIP (the state decides sales tax), so catch
+      // it here first.
+      const zipSt = zipStates_(zip);
+      if(zipSt.length && !zipSt.includes(state)){
+        errEl.textContent = `ZIP ${zip} is in ${zipSt.join(" or ")}, but the state says ${state}. Please check the address.`;
+        return;
+      }
+      close({ name, line1, line2: line2 || null, city, state, zip });
+    }
+
+    overlay.querySelector("#shipConfirmBtn").addEventListener("click", confirm);
+    overlay.querySelector("#shipZip").addEventListener("keydown", e => {
+      if(e.key === "Enter") confirm();
+    });
+  });
+}
+
+function addToCart(productId){
+  const catalog = activeCatalog;
+  const product = catalog.products.find(p=>p.id===productId);
+  const qtyEl = document.getElementById("qty-"+productId);
+  const qty = Math.max(1, parseInt(qtyEl.value,10) || 1);
+  // The server takes up to 20 lines of 1 to 50 each (and refuses, rather than trims, anything else).
+  if(qty > 50){ alert("You can add up to 50 of an item at a time. For a larger order, please contact the shop."); return; }
+  if(cart.length >= 20){ alert("Your cart is full (20 lines). To order more, please place this order first or contact the shop."); return; }
+  const sizeEl = document.getElementById("size-"+productId);
+  const size = sizeEl ? sizeEl.value : "OSFA";
+
+  // Configurable product: build the per-location config; the server reprices + rebuilds the snapshot.
+  if(product.configurable){
+    const { color, picks } = cfgPicks_(productId);
+    if(!picks.length){ alert("Choose a graphic for at least one location."); return; }
+    const pending = picks.filter(x => x.custom && !(x.upload && x.upload.status === "done"));
+    if(pending.length){ alert(pending.some(x => x.upload && x.upload.status === "uploading") ? "Your design is still uploading — please wait a moment." : "Upload your design to add this to your cart."); return; }
+    const isSized = product.type === "shirt" || product.type === "sweatshirt";
+    const base = isSized ? ((product.sizePricing || {})[size] || 0) : (product.flatPrice || 0);
+    const unitPrice = base + picks.reduce((s, x) => s + (x.graphic.addOnCents || 0), 0) / 100;
+    const config = { garmentColor: color, locations: picks.map(x => x.custom ? { location: x.location, custom: true, uploadId: x.upload.uploadId }
+      : ({ location: x.location, graphicId: x.graphic.id, ink: x.ink || "" })) };
+    const cdPreviews = cartDesignPreviews_(productId, picks.filter(x => x.custom).map(x => x.location), loc => (picks.find(x => x.location === loc) || {}).label || loc);
+    const summary = (color ? color + " · " : "") + picks.map(x => `${x.label}: ${x.graphic.name}${x.ink ? " (" + x.ink + ")" : ""}`).join(" · ");
+    // Optional personalization (typed name, or one of the product's preset words) on top of the graphics.
+    const cPersEl = document.getElementById("pers-"+productId), cPersNameEl = document.getElementById("pers-name-"+productId);
+    const cPersonalized = !!(cPersEl && cPersEl.checked);
+    const cPersName = cPersonalized && cPersNameEl ? (cPersNameEl.value || "").trim() : "";
+    if(cPersonalized && !cPersName){ alert(cPersNameEl && cPersNameEl.tagName === "SELECT" ? "Choose a personalization option, or untick personalization." : "Type the name to embroider, or untick personalization."); return; }
+    const cPersFee = cPersonalized ? (product.personalizationPrice || 0) : 0;
+    cart.push({ productId, name: product.name, type: product.type, size: isSized ? size : "OSFA",
+      qty, unitPrice, personalized: cPersonalized, persName: cPersName, cfgText: summary, personalizationFee: cPersFee, lineTotal: (unitPrice + cPersFee) * qty, config,
+      ...(cdPreviews.length ? { cdPreviews } : {}) });
+    if(cPersEl){ cPersEl.checked = false; }
+    if(cPersNameEl){ cPersNameEl.value = ""; cPersNameEl.style.display = "none"; }
+    qtyEl.value = 1;
+    renderTicket(currentOrg, route.org);
+    scheduleShippingUpdate();
+    announceStatus("Added " + product.name + " to cart. " + cartSummaryText());
+    return;
+  }
+
+  const persEl = document.getElementById("pers-"+productId);
+  const persNameEl = document.getElementById("pers-name-"+productId);
+  const personalized = persEl && persEl.checked;
+  const persName = personalized ? (persNameEl.value || "").trim() : "";
+
+  // The customer's own design: required, or chosen with "Use my own design instead". The upload stays
+  // picked after adding, so the same image can go on another size.
+  const customOn = plainCustomOn_(product);
+  const up = customOn ? customDesignUploads_[productId + "|" + CUSTOM_PLAIN_LOC] : null;
+  if(customOn && !(up && up.status === "done")){
+    alert(up && up.status === "uploading" ? "Your design is still uploading — please wait a moment."
+      : product.customDesign.required ? "Upload your design to order this item." : "Upload your design, or untick “Use my own design instead”.");
+    return;
+  }
+
+  const unitPrice = priceFor(product, size) + (customOn ? customDesignAddOnCents_(product) / 100 : 0);
+  const persPrice = (product.personalizationPrice != null) ? product.personalizationPrice : 0;
+  const total = unitPrice*qty + (personalized ? persPrice*qty : 0);
+  const cdPreviews = customOn ? cartDesignPreviews_(productId, [CUSTOM_PLAIN_LOC], () => "Your design") : [];
+
+  cart.push({
+    productId, name: product.name, type: product.type,
+    size: (product.type === "shirt" || product.type === "sweatshirt") ? size : "OSFA",
+    qty, unitPrice, personalized, persName,
+    personalizationFee: personalized ? (product.personalizationPrice || 0) : 0,
+    lineTotal: total,
+    ...(customOn ? { customUploadId: up.uploadId, cdPreviews } : {})
+  });
+
+  qtyEl.value = 1;
+  if(persEl){ persEl.checked = false; }
+  if(persNameEl){ persNameEl.value=""; persNameEl.style.display="none"; }
+
+  renderTicket(currentOrg, route.org);
+  scheduleShippingUpdate();
+  announceStatus("Added " + product.name + " to cart. " + cartSummaryText());
+}
+
+function removeFromCart(idx, orgId){
+  revokeCartPreviews_(cart.splice(idx,1));
+  renderTicket(currentOrg, orgId);
+  scheduleShippingUpdate();
+  announceStatus("Removed item from cart. " + cartSummaryText());
+}
+
+// Screen-reader-only summary announced via announceStatus() whenever the
+// cart changes — the visible total already updates in the ticket panel,
+// this just makes sure a screen reader user hears the same change.
+function cartSummaryText(){
+  if(cart.length === 0) return "Cart is empty.";
+  const total = cart.reduce((s,c)=>s+c.lineTotal,0);
+  return cart.length + (cart.length === 1 ? " item" : " items") + " in cart, total $" + total.toFixed(2) + ".";
+}
+
+// Sales tax the cart ADDS to the listed prices — only when the shop's prices don't include it
+// (org.salesTaxMode "exclusive"; with tax-included prices there is nothing to add). Worked out the
+// way the server does when the order is placed: per line, on taxable products, at the shop's rate,
+// and not at all when the order ships to another state than the shop's (known here from the ZIP
+// typed for shipping rates; pickup and the shop's own delivery options are in state). An estimate
+// for display — the order's real figure is the server's (saveOrder returns it).
+function cartTax_(org, delivery){
+  const rate = Number(org && org.salesTaxRate) || 0;
+  if(!org || org.salesTaxMode !== "exclusive" || !rate) return { added: false, tax: 0, outOfState: false };
+  const home = org.salesTaxJurisdiction || "";
+  const shipping = delivery && (delivery.kind === "quote" || delivery.kind === "manual");
+  const zipSt = shipping && isUS_() ? zipStates_(shippingZip) : [];
+  if(home && zipSt.length && !zipSt.includes(home)) return { added: true, tax: 0, outOfState: true };
+  const bps = Math.round(rate * 100);
+  const cents = cart.reduce((sum, c) => {
+    const p = (org.products || []).find(x => x.id === c.productId);
+    return sum + (p && p.taxable === false ? 0 : Math.round(Math.round(c.lineTotal * 100) * bps / 10000));
+  }, 0);
+  return { added: true, tax: cents / 100, outOfState: false };
+}
+
+function renderTicket(org, orgId){
+  const panel = document.getElementById("ticketPanel");
+  if(!panel) return;
+
+  const lines = cart.map((c,idx)=>`
+    <div class="cart-line">
+      <div class="l-desc">
+        ${escapeHtml(c.name)}${(c.type==="shirt"||c.type==="sweatshirt") ? " · size "+escapeHtml(c.size) : ""} &times; ${c.qty}
+        ${c.personalized ? `<small>+ personalization: "${escapeHtml(c.persName) || "—"}"</small>` : ""}
+        ${c.config ? `<small>${escapeHtml(c.cfgText || "")}</small>` : ""}
+        ${(c.cdPreviews || []).map(d => `<small class="cd-cart"><img src="${escapeHtml(d.url)}" alt="" width="32" height="32">${escapeHtml(d.label)}: ${escapeHtml(d.fileName)}</small>`).join("")}
+      </div>
+      <div class="l-price">$${c.lineTotal.toFixed(2)}<button class="remove-x" data-action="remove" data-idx="${idx}" data-org="${orgId}">&times;</button></div>
+    </div>
+  `).join("");
+
+  const cartSubtotal = cart.reduce((s,c) => s+c.lineTotal, 0);
+  const delivery = currentDelivery_(org);
+  const shippingCost = delivery.fee;
+  const cartTax = cartTax_(org, delivery);
+  const grandTotal   = cartSubtotal + shippingCost + cartTax.tax;
+
+  // Check the currently-selected payment method to decide whether to
+  // show the discounted total. Reading from the DOM directly here since
+  // renderTicket is called on every cart change, including before the
+  // checkout fields are rendered (when cart is empty).
+  const paymentEl = document.getElementById("custPaymentMethod");
+  const paymentMethod = paymentEl ? paymentEl.value : "";
+  const discountEligible = CASH_DISCOUNT_PERCENT && (paymentMethod === "Zelle" || paymentMethod === "Check");
+  const discountedTotal = discountEligible ? grandTotal * (1 - CASH_DISCOUNT_PERCENT / 100) : null;
+
+  const totalHtml = discountedTotal !== null
+    ? `<div class="t-label">Total<br><small style="font-size:10px; letter-spacing:.04em;">${CASH_DISCOUNT_PERCENT}% discount applied</small></div>
+       <div class="t-amount">
+         <span style="font-size:14px; text-decoration:line-through; opacity:.45; margin-right:6px;">$${grandTotal.toFixed(2)}</span>$${discountedTotal.toFixed(2)}
+       </div>`
+    : `<div class="t-label">Total</div><div class="t-amount">$${grandTotal.toFixed(2)}</div>`;
+  // Tax-included pricing must be disclosed to the buyer; tax added on top gets its own row in the
+  // breakdown below, and a line saying so.
+  const taxWhat = `${escapeHtml(String(org.salesTaxRate))}% ${escapeHtml(org.salesTaxJurisdiction || "")}`.trim() + " sales tax";
+  const taxNote = cart.length > 0 && org.salesTaxRate && cartTax.added
+    ? `<div class="ticket-tax-note" style="font-size:12px;opacity:.7;margin-top:4px;">${cartTax.outOfState
+        ? `No ${escapeHtml(org.salesTaxJurisdiction || "")} sales tax on orders shipped to another state.`
+        : `${taxWhat} is added to the listed prices${offersShipping_(org) ? "; shipping is not taxed" : (shippingCost > 0 ? "; the delivery fee is not taxed" : "")}.`}</div>`
+    : cart.length > 0 && org.salesTaxRate
+    ? `<div class="ticket-tax-note" style="font-size:12px;opacity:.7;margin-top:4px;">Prices include ${escapeHtml(String(org.salesTaxRate))}% ${escapeHtml(org.salesTaxJurisdiction || "")} sales tax${offersShipping_(org) ? "; shipping is not taxed" : (shippingCost > 0 ? "; the delivery fee is not taxed" : "")}.</div>`
+    : "";
+
+  // When shipping is active, show a breakdown above the total line so the
+  // customer can see merchandise vs. shipping separately.
+  const breakdownHtml = (shippingCost > 0 || cartTax.tax > 0) ? `
+    <div class="ticket-breakdown">
+      <div class="ticket-breakdown-line"><span>Merchandise</span><span>$${cartSubtotal.toFixed(2)}</span></div>
+      ${shippingCost > 0 ? `<div class="ticket-breakdown-line">
+        <span>${escapeHtml(delivery.label)}</span>
+        <span>$${shippingCost.toFixed(2)}</span>
+      </div>` : ""}
+      ${cartTax.tax > 0 ? `<div class="ticket-breakdown-line ticket-tax-line"><span>Sales tax (${escapeHtml(String(org.salesTaxRate))}%)</span><span>$${cartTax.tax.toFixed(2)}</span></div>` : ""}
+    </div>` : "";
+
+  // Save the current payment selection and whatever the customer has
+  // already typed before re-rendering — innerHTML replaces these
+  // elements entirely, which would otherwise wipe them on every cart
+  // change or payment-method switch.
+  const savedPayment = paymentEl ? paymentEl.value : "";
+  const nameEl = document.getElementById("custName");
+  const contactEl = document.getElementById("custContact");
+  const savedName = nameEl ? nameEl.value : "";
+  const savedContact = contactEl ? contactEl.value : "";
+
+  panel.innerHTML = `
+    <h2>Your order</h2>
+    ${cart.length===0 ? '<div class="cart-empty">Nothing added yet.</div>' : lines}
+    ${renderShippingSection(org)}
+    ${breakdownHtml}
+    <div class="ticket-total">
+      ${totalHtml}
+    </div>
+    ${taxNote}
+    <div class="checkout-fields">
+      <input type="text" id="custName" placeholder="Your name" aria-label="Your name" value="${escapeHtml(savedName)}">
+      <input type="email" id="custContact" required placeholder="Email address" aria-label="Email address" value="${escapeHtml(savedContact)}">
+      ${(function(){
+        const methods = currentOrg.enabledPayments || [];
+        if(methods.length === 0) return '<div class="form-hint">Payment is handled separately — your order will be recorded and we\'ll follow up with payment details.</div>';
+        const labels = {"Card":"Credit / Debit Card","Venmo":"Venmo","Zelle":"Zelle","Check":"Check"};
+        const opts = methods.map(m => `<option value="${m}">${labels[m] || m}</option>`).join("");
+        return `<select id="custPaymentMethod" aria-label="Payment method" onchange="updatePaymentHint(this.value)">
+        <option value="">How will you pay?</option>
+        ${opts}
+      </select>
+      <div class="form-hint" id="paymentHint">Payment collected separately — this just places your order.</div>`;
+      })()}
+      <button class="place-order-btn" id="placeOrderBtn" ${cart.length===0 ? "disabled":""} data-action="place-order" data-org="${orgId}">Place order</button>
+    </div>
+  `;
+
+  // Restore the payment method selection (if the select exists — it's omitted
+  // when no payment methods are enabled) and update the hint.
+  if(savedPayment){
+    const newSelect = document.getElementById("custPaymentMethod");
+    if(newSelect){
+      newSelect.value = savedPayment;
+      updatePaymentHint(savedPayment, true); // skipTicketRender=true to avoid recursion
+    }
+  }
+}
+
+/* ---------------- backend (/api) ---------------- */
+// ---- Turnstile (bot check on order submission) ----
+// Only active when /api/catalog hands us a site key (i.e. the server has
+// TURNSTILE_SECRET_KEY set). The script loads lazily at submit time, so
+// visitors who never place an order never fetch it.
+let _turnstileLoad = null;
+function loadTurnstile(){
+  if(_turnstileLoad) return _turnstileLoad;
+  _turnstileLoad = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    s.async = true;
+    s.onload = () => resolve(window.turnstile);
+    s.onerror = () => { _turnstileLoad = null; reject(new Error("Could not load the bot check")); };
+    document.head.appendChild(s);
+  });
+  return _turnstileLoad;
+}
+// `container`: where the challenge shows, when it isn't the order button's (a design upload's box).
+async function getTurnstileToken(container){
+  const siteKey = currentOrg && currentOrg.turnstileSiteKey;
+  if(!siteKey) return null;
+  const ts = await loadTurnstile();
+  let box = container || document.getElementById("turnstileBox");
+  if(!box){
+    box = document.createElement("div");
+    box.id = "turnstileBox";
+    box.style.marginTop = "10px";
+    const btn = document.getElementById("placeOrderBtn");
+    (btn && btn.parentNode ? btn.parentNode : document.body).appendChild(box);
+  }
+  box.innerHTML = "";
+  return new Promise((resolve, reject) => {
+    ts.render(box, {
+      sitekey: siteKey,
+      appearance: "interaction-only",
+      callback: (t) => resolve(t),
+      "error-callback": () => reject(new Error("Bot check failed — please try again")),
+      "expired-callback": () => reject(new Error("Bot check expired — please try again")),
+    });
+  });
+}
+
+async function saveOrder(order){
+  const turnstileToken = await getTurnstileToken();
+  if(turnstileToken) order = Object.assign({}, order, { turnstileToken });
+  const res = await fetch("/api/orders", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(order)
+  });
+  // Throw on ANY failure — an HTTP error or a {status:"error"} body sent
+  // with HTTP 200. placeOrder() treats a throw as "order NOT recorded": it
+  // keeps the cart and never shows the confirmation page, instead of
+  // silently pretending the order went through.
+  if(!res.ok){
+    const errText = await res.text().catch(()=>"");
+    console.error("Order submission failed — HTTP " + res.status, errText);
+    // Surface the server's own message (e.g. "Shipping quote expired —
+    // please refresh shipping rates") rather than a bare status code.
+    let serverMsg = "";
+    try{ serverMsg = (JSON.parse(errText) || {}).message || ""; }catch(_){}
+    throw new Error(serverMsg || ("Order submission failed (HTTP " + res.status + ")"));
+  }
+  const data = await res.json().catch(() => null);
+  if(data && data.status === "error"){
+    throw new Error(data.message || "Order submission failed");
+  }
+  return data || {};   // when sales tax is added on top: the order's real {total, salesTax}
+}
+
+async function placeOrder(orgId){
+  const name = document.getElementById("custName").value.trim();
+  const contact = document.getElementById("custContact").value.trim();
+  const paymentEl = document.getElementById("custPaymentMethod");
+  const paymentMethod = paymentEl ? paymentEl.value : "";
+  if(!name){ showToast("Please add your name before placing the order.", true); return; }
+  if(!contact || !contact.includes("@") || !contact.includes(".")){
+    showToast("Please add a valid email address before placing the order.", true);
+    return;
+  }
+  const enabledPayments = (currentOrg && currentOrg.enabledPayments) || [];
+  if(enabledPayments.length > 0 && !paymentMethod){
+    showToast("Please select a payment method before placing the order.", true);
+    return;
+  }
+  if(cart.length===0) return;
+
+  // When the customer chose carrier shipping OR manual shipping is pending,
+  // collect their full address before submission so the admin knows where to ship.
+  let shippingAddress = null;
+  let orderShippingCost = 0;
+  const delivery = currentDelivery_(currentOrg);
+  if(delivery.kind === "none"){
+    // The shop only ships (no pickup, no options of its own) and no rate is chosen yet.
+    showToast(offersShipping_(currentOrg) ? `Enter your ${isUS_() ? "ZIP" : "postal code"} under Delivery and choose a shipping rate.` : "Please choose a delivery option.", true);
+    return;
+  }
+  if(delivery.kind === "quote" || delivery.kind === "manual"){
+    shippingAddress = await collectShippingAddress();
+    if(!shippingAddress) return; // user cancelled the address modal
+  }
+  orderShippingCost = delivery.fee;
+  const manualNow = delivery.kind === "manual";
+
+  const cartSubtotal = cart.reduce((s,c) => s+c.lineTotal, 0);
+  const _orderPrefix = ((orgId || "ORD").replace(/[^A-Za-z0-9]/g, "").slice(0, 4).toUpperCase()) || "ORD";
+  const order = {
+    orderId: _orderPrefix + "-" + Date.now().toString(36).toUpperCase() + "-" + crypto.getRandomValues(new Uint32Array(1))[0].toString(36).toUpperCase(),
+    orgId, customerName: name, contact, paymentMethod,
+    // The design previews are this page's own object URLs — never sent.
+    items: cart.map(({ cdPreviews, ...line }) => line),
+    subtotal: cartSubtotal,
+    shippingCost: orderShippingCost,
+    shippingAddress,
+    shippingMethod: delivery.kind === "quote" ? delivery.label : (delivery.kind === "option" && delivery.option.type === "custom" ? delivery.label : ""),
+    // Local pickup or one of the shop's own options; the server looks the fee up from the shop's list.
+    deliveryOptionId: delivery.kind === "option" ? delivery.option.id : null,
+    // The server ignores shippingCost above and charges only what this
+    // signed quote (from /api/shipping) says — see functions/_lib/quoteToken.js.
+    shippingQuoteToken: delivery.kind === "quote" ? (shippingQuote.quoteToken || null) : null,
+    manualShipping: manualNow,
+    totalWeightOz: cart.reduce((s, it) => {
+      const p = currentOrg && (currentOrg.products || []).find(p => p.id === it.productId);
+      return s + ((p && p.weightOz) ? p.weightOz * it.qty : 8 * it.qty);
+    }, 0),
+    // What the cart showed (the server prices the order itself and ignores this).
+    total: cartSubtotal + orderShippingCost + cartTax_(currentOrg, delivery).tax,
+    placedAt: new Date().toISOString(),
+    paid: false
+  };
+
+  // Disable button to prevent double-submission
+  const btn = document.getElementById("placeOrderBtn");
+  if(btn){ btn.disabled = true; btn.textContent = "Processing…"; }
+
+  try{
+    const saved = await saveOrder(order);
+    // Tax added on top: the confirmation (and the Venmo/Zelle amount) uses the recorded total.
+    if(saved && typeof saved.total === "number"){ order.total = saved.total; order.salesTax = saved.salesTax; }
+  }catch(err){
+    // The order was NOT recorded — stop here. Showing the confirmation
+    // page (or handing off to Stripe, whose order lookup would fail
+    // anyway) would tell the customer an order exists when nothing was
+    // recorded. Cart is left intact for a retry.
+    console.error("Could not save order", err);
+    showToast("Sorry — your order could not be submitted" +
+      (err && err.message ? " (" + err.message + ")" : "") +
+      ". Nothing was recorded; your cart is unchanged. Please try again in a moment.", true);
+    if(btn){ btn.disabled = false; btn.textContent = "Place order"; }
+    return;
+  }
+
+  // Card payment: create a Stripe Checkout Session server-side and
+  // redirect the customer to Stripe's hosted payment page. On success
+  // Stripe sends a webhook that records the payment on the order.
+  // No `total` sent here — /api/checkout looks up the real, server-
+  // calculated balance from the database itself (the saveOrder()
+  // call above just wrote it), never trusting a client-supplied amount.
+  if(paymentMethod === "Card" && enabledPayments.includes("Card") && !manualNow){
+    try{
+      const res = await fetch("/api/checkout", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          orderId: order.orderId, orgId,
+          customerName: name, contact
+        })
+      });
+      const data = await res.json();
+      if(data.url){
+        window.location.href = data.url; // hand off to Stripe's hosted payment page
+        return;
+      }
+      console.error("Stripe checkout session failed:", data);
+      showToast("Could not start card payment — please try Venmo or another method.", true);
+      if(btn){ btn.disabled = false; btn.textContent = "Place order"; }
+      return;
+    }catch(err){
+      console.error("Stripe checkout error:", err);
+      showToast("Could not start card payment — please try Venmo or another method.", true);
+      if(btn){ btn.disabled = false; btn.textContent = "Place order"; }
+      return;
+    }
+  }
+
+  clearCart_();
+  showConfirmation(orgId, order);
+}
+
+// Updates the displayed price for a product when the size or personalization
+// changes — shows the true per-unit price (base + personalization if checked).
+function updateProductPrice(productId){
+  const priceEl = document.getElementById("price-" + productId);
+  const sizeEl  = document.getElementById("size-" + productId);
+  const persEl  = document.getElementById("pers-" + productId);
+  if(!priceEl || !activeCatalog) return;
+  const product = activeCatalog.products.find(p => p.id === productId);
+  if(!product) return;
+  const base = product.type === "cap"
+    ? product.flatPrice
+    : (sizeEl ? priceFor(product, sizeEl.value) : null);
+  if(base == null) return;
+  const personalized = persEl && persEl.checked;
+  const persFee = (personalized && product.personalizationPrice != null) ? product.personalizationPrice : 0;
+  const customFee = plainCustomOn_(product) ? customDesignAddOnCents_(product) / 100 : 0;
+  priceEl.textContent = "$" + (base + persFee + customFee).toFixed(2);
+
+  // Update in-stock badge for the newly selected size.
+  const stockWrap = document.getElementById("stock-" + productId);
+  if(stockWrap && product.stock){
+    const size = sizeEl ? sizeEl.value : "";
+    const qty = (product.stock[size] ?? 0);
+    stockWrap.innerHTML = qty > 0 ? `<span class="stock-badge">${qty} in stock</span>` : "";
+  }
+}
+
+// Updates the payment hint text dynamically when the customer changes
+// their payment method selection, showing relevant instructions inline.
+function updatePaymentHint(method, skipTicketRender){
+  const hint = document.getElementById("paymentHint");
+  if(!hint) return;
+
+  const hints = {
+    "Card": "You’ll be redirected to Stripe’s secure checkout to enter your card details.",
+    "Venmo": "After placing your order, you’ll get a pre-filled Venmo link to send payment.",
+    "Zelle": business.zelle ? `Send payment to ${business.zelle} — include your order number in the memo.` : "After placing your order, you’ll be contacted with Zelle details.",
+    "Check": `Make check payable to “${business.legalName || bizName_()}”` + (business.mailingAddress ? ` and mail to ${business.mailingAddress}.` : " — you’ll be told where to send it.")
+  };
+  const baseHint = hints[method] || "Payment collected separately — this just places your order.";
+  const discountNote = (CASH_DISCOUNT_PERCENT && (method === "Zelle" || method === "Check"))
+    ? " A " + CASH_DISCOUNT_PERCENT + "% discount applies — mention this when sending payment."
+    : "";
+  hint.textContent = baseHint + discountNote;
+
+  // Re-render the ticket total so the discount (if any) appears/disappears
+  // immediately when the payment method changes, without waiting for an add.
+  // Skip when called from renderTicket itself to avoid infinite recursion.
+  if(!skipTicketRender){
+    if(currentOrg && currentOrgId) renderTicket(currentOrg, currentOrgId);
+  }
+}
+
+// Builds a Venmo deep link with the amount and a short note pre-filled.
+// This is just a link (venmo.com/u/...), not an API call — the customer
+// still has to open it and tap confirm themselves. Returns null if
+// VENMO_USERNAME isn't configured.
+function venmoPayLink(order){
+  if(!VENMO_USERNAME) return null;
+  const note = `${order.orgId} order ${order.orderId}`;
+  return `https://venmo.com/u/${encodeURIComponent(VENMO_USERNAME)}` +
+    `?txn=pay&amount=${order.total.toFixed(2)}&note=${encodeURIComponent(note)}`;
+}
+
+function showConfirmation(orgId, order){
+  const org = currentOrg;
+  const app = document.getElementById("app");
+
+  let paymentHtml = "";
+  if(order.paymentMethod === "Venmo"){
+    const link = venmoPayLink(order);
+    paymentHtml = link
+      ? `<a class="confirmation-back" href="${link}" target="_blank" rel="noopener" style="display:inline-block; margin-top:16px; text-decoration:none;">Pay $${order.total.toFixed(2)} with Venmo &rarr;</a>`
+      : `<p style="margin-top:16px;"><em>Venmo isn't set up yet — you'll be contacted with payment instructions.</em></p>`;
+  } else if(order.paymentMethod === "Zelle"){
+    const zelleDiscount = CASH_DISCOUNT_PERCENT ? `<div class="pi-discount">✓ ${CASH_DISCOUNT_PERCENT}% discount applied — mention this when sending payment.</div>` : "";
+    paymentHtml = `<div class="payment-instructions">
+      <div class="pi-label">Zelle payment</div>
+      <div class="pi-value">${business.zelle ? `Send $${order.total.toFixed(2)} to <strong>${escapeHtml(business.zelle)}</strong>` : `Amount due: <strong>$${order.total.toFixed(2)}</strong> — you'll be contacted with Zelle details.`}</div>
+      <div class="pi-note">Include <strong>${order.orderId}</strong> in the memo so we can match it to your order.</div>
+      ${zelleDiscount}
+    </div>`;
+  } else if(order.paymentMethod === "Check"){
+    const checkDiscount = CASH_DISCOUNT_PERCENT ? `<div class="pi-discount">✓ ${CASH_DISCOUNT_PERCENT}% discount applied — note this on your check or in a note.</div>` : "";
+    paymentHtml = `<div class="payment-instructions">
+      <div class="pi-label">Check payment</div>
+      <div class="pi-value">Make check payable to <strong>${escapeHtml(business.legalName || bizName_())}</strong></div>
+      <div class="pi-value">${business.mailingAddress ? `Mail to <strong>${escapeHtml(business.mailingAddress)}</strong>` : "You'll be told where to send it."}</div>
+      <div class="pi-note">Write <strong>${order.orderId}</strong> in the memo line.</div>
+      ${checkDiscount}
+    </div>`;
+  }
+
+  app.innerHTML = `
+    <div class="confirmation" style="${orgAccentVars(org.accent)}">
+      <div class="stitch"></div>
+      <h2>Order received, ${escapeHtml(order.customerName.split(" ")[0])}.</h2>
+      <div class="order-number">${order.orderId} &middot; $${order.total.toFixed(2)}</div>
+      <p>Your order's been recorded for ${escapeHtml(org.name)}. Payment is handled separately — you'll be contacted at ${escapeHtml(order.contact) || "the info you provided"} to arrange it if that hasn't happened already.</p>
+      ${paymentHtml}
+      <br>
+      <button class="confirmation-back" data-action="go-org" data-org="${orgId}" style="background:none; border:none; margin-top:12px;">&larr; Back to ${escapeHtml(org.name)}</button>
+    </div>
+  `;
+}
+
+(async function boot(){
+  // Ask the server who we are (Host header-based) before rendering
+  // anything — there's no static subdomain table left client-side to
+  // decide this synchronously. currentOrg stays null on the root/generic
+  // domain or an unrecognized host, and route falls back to "generic".
+  const resolved = await resolveCurrentOrg();
+
+  // Check for ?verify=TOKEN first — works on any subdomain including admin.
+  const params = new URLSearchParams(window.location.search);
+  const verifyToken = params.get("verify");
+  if(verifyToken){
+    history.replaceState({}, "", window.location.pathname);
+    route = {view:"design-verify", token:verifyToken};
+    render();
+    return;
+  }
+
+  if(resolved && resolved.admin){
+    route = {view:"admin"};
+    render();
+    return;
+  }
+  if(resolved && resolved.closed){
+    const paid = params.get("stripe") === "success";
+    const paidOrderId = params.get("orderId");
+    if(params.get("stripe")) history.replaceState({}, "", window.location.pathname);
+    route = {view:"closed", paid, orderId: paid ? paidOrderId : null};
+    render();
+    return;
+  }
+  currentOrg = resolved;
+  route = currentOrg ? {view:"org", org:currentOrg.orgId} : {view:"generic"};
+
+  // Stripe Checkout returns here with ?stripe=success&orderId=...&org=...
+  // (success) or ?stripe=cancel&org=... (customer hit back/cancel on Stripe).
+  // Detect this before the normal render so we can show the right screen.
+  const stripeResult = params.get("stripe");
+  const returnOrg = params.get("org") || (currentOrg ? currentOrg.orgId : null);
+  const returnOrderId = params.get("orderId");
+  if(stripeResult && returnOrg){
+    // Clean the query string from the URL bar without causing a reload
+    history.replaceState({}, "", window.location.pathname);
+
+    if(stripeResult === "success"){
+      // Order already saved + paid via webhook — show a clean paid confirmation
+      route = {view:"stripe-success", org:returnOrg, orderId:returnOrderId};
+    } else if(stripeResult === "cancel"){
+      // Customer abandoned Stripe Checkout — drop back to their org's order page
+      route = {view:"org", org:returnOrg};
+    }
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>
