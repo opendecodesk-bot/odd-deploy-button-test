@@ -15,6 +15,11 @@
 // documentation domain, so an unconfigured install serves no real hostname by accident.
 export const DEFAULT_ROOT_DOMAIN = "example.com";
 
+// Web addresses a shop can't have: the site's own (www, the images host, the default admin label) and ones a mail or
+// API host would want. The admin label(s) actually configured (ADMIN_SUBDOMAIN) are refused too — see adminSubdomains.
+// One list, for New shop (catalogValidation.js) and for attaching a shop's hostname (customDomain.js).
+export const RESERVED_SUBDOMAINS = ["www", "api", "images", "mail", "admin", "all"];
+
 export function rootDomain(env){
   return String((env && env.ROOT_DOMAIN) || DEFAULT_ROOT_DOMAIN).trim().toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
 }

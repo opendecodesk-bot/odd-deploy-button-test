@@ -16,6 +16,9 @@
 //   http://localhost:8790/?shop=demo      → the "demo" SHOP page instead (as on demo.<domain>): the
 //                                           real catalog and order handlers on the live database (no
 //                                           Publish needed here), Turnstile off.
+//   http://localhost:8790/?invoice=<token>  → a customer's invoice page (the token from the link the
+//                                           Send invoice window shows): the real /api/invoice; its
+//                                           shipping rates are SAMPLE numbers and card checkout isn't wired.
 //
 //   node scripts/admin-local.js --sign-in  → the REAL sign-in, users and roles as well
 // With --sign-in nothing is stubbed on the way in: the page asks for an email and password, the
@@ -36,16 +39,22 @@ const strip = (src) => src
   .replace(/import\s*\{[\s\S]*?\}\s*from\s*["'][^"']+["'];?\n?/g, "")
   .replace(/export (async function|function|const)/g, "$1");
 const SHOP_MAP = "{ demo: 'demo' }";   // demo.example.com is the demo shop
-const buildHandler = () => new Function(
+// Communications → Send a test email runs the real one (with no provider set locally, it says so).
+const buildTestEmail = () => new Function(strip(read("functions/_lib/db.js")) + "\n" + strip(read("functions/_lib/email.js")) + "\nreturn sendTestEmail;")();
+const buildHandler = () => new Function("sendTestEmail",
   strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/catalogValidation.js")) + "\n" +
   "const requireAdmin = async () => null; const adminActor = () => 'local';\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   "const verifyQuote = async () => ({ ok: false }); const canonicalItems = () => ''; const verifyTurnstile = async () => ({ ok: true });\n" +
   "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async (env) => ({ subdomainMap: " + SHOP_MAP + ", orgs: {}, features: await getFeatures(env.DB) });\n" +
+  "const sendInvoiceEmail = async () => false;\n" +
   "const sendOrderReceivedEmail = async () => false, sendOrderNotificationEmail = async () => false, sendPaymentConfirmedEmail = async () => false, sendCancellationEmail = async () => false, sendDesignVerificationEmail = async () => false, sendShippingPaymentEmail = async () => false, sendShippedEmail = async () => false;\n" +
   "const ensureOrgDomain = async () => ({}), getOrgDomainStatus = async () => ({ configured: false });\n" +
+  // Vendor blanks / connections: the image-fallback copy, the PromoStandards adapter, encrypted logins.
+  strip(read("functions/_lib/fileUpload.js")) + "\n" + strip(read("functions/_lib/vendorImages.js")) + "\n" + strip(read("functions/_lib/orphanImages.js")) + "\n" +
+  strip(read("functions/_lib/promostandards.js")) + "\n" + strip(read("functions/_lib/vendorCredentials.js")) + "\n" + strip(read("functions/_lib/supplierOrders.js")) + "\n" +
   strip(read("functions/_lib/setupStatus.js")) + "\n" +
-  strip(read("functions/_lib/db.js")) + "\n" + strip(read("functions/api/orders.js")) + "\nreturn onRequestPost;")();
+  strip(read("functions/_lib/db.js")) + "\n" + strip(read("functions/api/orders.js")) + "\nreturn onRequestPost;")(buildTestEmail());
 // The shop page's catalog (functions/api/catalog.js) on the published catalog, as demo.example.com sees it.
 const buildCatalog = () => new Function(
   strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/db.js")) + "\n" +
@@ -63,6 +72,13 @@ const buildDesign = () => new Function(
   strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/fileUpload.js")) + "\n" +
   "const requireAdmin = async () => null; const timingSafeEqual = (a, b) => a === b;\n" +
   strip(read("functions/api/design.js")) + "\nreturn { post: onRequestPost, get: onRequestGet };")();
+// The customer's invoice page (functions/api/invoice.js), with the real db.js, email.js and quote signing.
+const buildInvoice = () => new Function(
+  strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/db.js")) + "\n" +
+  strip(read("functions/_lib/email.js")) + "\n" + strip(read("functions/_lib/quoteToken.js")) + "\n" + strip(read("functions/_lib/boxSize.js")) + "\n" +
+  "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
+  "const invoice = (function(){\n" + strip(read("functions/api/invoice.js")) + "\nreturn { onRequestGet, onRequestPost }; })();\n" +
+  "return { invoice, signQuote, canonicalItems };")();
 // An in-memory stand-in for the private DESIGNS bucket.
 const memoryBucket = () => {
   const m = new Map();
@@ -84,7 +100,7 @@ const SESSION = `<script>try{localStorage.setItem("oddAdminSession",JSON.stringi
   for (const f of fs.readdirSync(path.join(ROOT, "migrations")).filter(f => /^\d{4}_/.test(f) && f >= "0006").sort()) d1.execFile(read("migrations/" + f));
   const now = new Date().toISOString();
   await d1.prepare("INSERT INTO orgs (orgId, subdomain, name, createdAt, updatedAt, ready) VALUES ('demo', 'demo', 'Demo Shop', ?, ?, 1)").bind(now, now).run();
-  const api = buildHandler(), catalogApi = buildCatalog(), customerDesignApi = buildCustomerDesign(), designApi = buildDesign();
+  const api = buildHandler(), catalogApi = buildCatalog(), customerDesignApi = buildCustomerDesign(), designApi = buildDesign(), invoiceApi = buildInvoice();
   const DESIGNS = memoryBucket(), SIGNING_SECRET = require("crypto").randomBytes(24).toString("hex");
   // A request made from the shop page (?shop=…) is answered as demo.example.com; anything else as the admin.
   const shopMode = (req) => /[?&]shop=/.test(String(req.headers.referer || ""));
@@ -116,6 +132,19 @@ const SESSION = `<script>try{localStorage.setItem("oddAdminSession",JSON.stringi
         const out = await designApi[req.method === "POST" ? "post" : "get"]({ request: fakeRequest(req, url, "admin.example.com", buf), env: { DB: d1, DESIGNS, SIGNING_SECRET } });
         return reply(res, out);
       }
+      if (url.pathname === "/api/invoice") {
+        const buf = await readBody(req);
+        const ctx = { env: { DB: d1, SIGNING_SECRET }, waitUntil: (p) => { Promise.resolve(p).catch(() => {}); }, request: fakeRequest(req, url, "demo.example.com", buf) };
+        return reply(res, await (req.method === "POST" ? invoiceApi.invoice.onRequestPost(ctx) : invoiceApi.invoice.onRequestGet(ctx)));
+      }
+      // Shipping rates for the invoice page: SAMPLE numbers, signed with this process's key so a
+      // choice can be saved. (Shippo isn't wired here.)
+      if (url.pathname === "/api/shipping" && req.method === "POST") {
+        const b = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+        const rate = async (provider, service, amount, days) => ({ provider, service, amount, estimatedDays: days, quoteToken: await invoiceApi.signQuote({ SIGNING_SECRET },
+          { orgId: b.org || "demo", zip: String(b.zip || ""), items: invoiceApi.canonicalItems(b.items), amountCents: Math.round(amount * 100), method: provider + " " + service }) });
+        return send(res, 200, JSON.stringify({ status: "ok", manualShipping: false, rates: [await rate("USPS", "Ground Advantage (sample)", 8.42, 3), await rate("UPS", "Ground (sample)", 11.10, 2)] }));
+      }
       if (url.pathname === "/api/catalog") {
         // The switches under Global settings → Features, as the real /api/catalog sends them.
         const row = await d1.prepare("SELECT value FROM global_settings WHERE key='features'").first();
@@ -139,7 +168,8 @@ const SESSION = `<script>try{localStorage.setItem("oddAdminSession",JSON.stringi
       if (url.pathname === "/api/orders" && req.method === "POST") {
         let raw = ""; for await (const chunk of req) raw += chunk;
         const body = JSON.parse(raw || "{}");
-        const out = await api({ env: { DB: d1, DESIGNS }, waitUntil: (p) => { Promise.resolve(p).catch(() => {}); },
+        // VENDOR_CREDENTIALS_KEY: a throwaway key so Vendor integrations can save a (test) login on this computer.
+        const out = await api({ env: { DB: d1, DESIGNS, VENDOR_CREDENTIALS_KEY: "local-preview-only-vendor-key" }, waitUntil: (p) => { Promise.resolve(p).catch(() => {}); },
           request: { url: "https://" + (shopMode(req) ? "demo" : "admin") + ".example.com/api/orders", json: async () => body, headers: { get: () => null } } });
         return send(res, out.status, await out.text());
       }

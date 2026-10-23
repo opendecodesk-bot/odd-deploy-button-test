@@ -16,7 +16,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   "const requireAdmin = async () => null; const adminActor = () => 'test';\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   "const verifyQuote = async () => ({ ok: false }); const canonicalItems = () => ''; const verifyTurnstile = async () => ({ ok: true });\n" +
-  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: {}, orgs: {} });\n" +
+  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: { prime: 'prime' }, orgs: {} });\n" +
   emailMocks + dbSrc + "\n" + strip(read("functions/api/orders.js")) + "\nreturn onRequestPost;")();
 
 (async () => {
@@ -56,7 +56,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   await ins(d1, { orderId: "TEST-NEW", orgId: "prime", customerName: "Admin Test Transaction", contact: "t@x", placedAt: "2026-08-08T00:00:00Z", isTest: true },
     [{ productId: "", name: "Test", type: "cap", qty: 1, unitPrice: 1 }]);
   const r0 = await call({ action: undefined, orderId: "TEST-SNEAKY", orgId: "prime", customerName: "Eve", contact: "e@x.com", paymentMethod: "Venmo",
-    items: [{ productId: "cap", qty: 1 }] }, "https://example.com/api/orders");
+    items: [{ productId: "cap", qty: 1 }] }, "https://prime.example.com/api/orders");
   console.log("a storefront order can't claim the reserved TEST- prefix:", r0.status === 400 && r0.body.message === "Invalid order ID" && d1.q("SELECT count(*) n FROM orders WHERE orderId='TEST-SNEAKY'")[0].n === 0);
   console.log("a new admin test transaction is flagged isTest on insert:", d1.q("SELECT isTest FROM orders WHERE orderId='TEST-NEW'")[0].isTest === 1);
 

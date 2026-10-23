@@ -40,6 +40,8 @@ global.getCatalogData = async () => ({
 global.getAllOrgs = async () => [];
 // Order submission requires the org to exist and be ready (server-side).
 global.getOrgById = async (db, orgId) => ({ orgId, name: orgId, subdomain: "", ready: true, orderDeadline: null, allowOrdersAfterDeadline: true });
+// Order submission reads the PUBLISHED shop (migrations/0076); here it is whatever getOrgById says.
+global.getPublishedOrg = (db, orgId) => global.getOrgById(db, orgId);
 // The REAL address check from db.js (whitelist + state-vs-ZIP), not a mock.
 // Region (Global settings): the default install — US address formats, no saved time zone.
 global.getLocaleSettings = async () => ({ timeZone: "", country: "US" });
@@ -365,7 +367,7 @@ function reqWithIp(ip, extra){
     };
     const ip = "8.8.8.8";
     const mkReq = () => reqWithIp(ip, {
-      json: async () => ({orderId:"ORD-RL1", orgId:"league-101", customerName:"X", contact:"x@example.com"}),
+      json: async () => ({checkoutToken: await require("./testlib/order-token").orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-RL1"), orderId:"ORD-RL1", orgId:"league-101", customerName:"X", contact:"x@example.com"}),
       url: "https://example.com/api/checkout"
     });
     let last;

@@ -118,8 +118,11 @@ async function boot(width){
     const sheet = nav.querySelector(".admin-nav-mobile .admin-nav-sheet");
     const sheetLabels = [...sheet.querySelectorAll(".admin-nav-btn")].map(b => b.textContent);
     console.log("a ☰ Menu bar whose sheet lists every page (top buttons + every group's items):",
-      !!nav.querySelector(".admin-nav-menu-btn") && ["Orders", "Run Order", "Manage catalog", "Machines", "Global settings", "Blanks", "Expenses", "Audit Log", "Sign out"].every(l => sheetLabels.includes(l)));
+      !!nav.querySelector(".admin-nav-menu-btn") && ["Orders", "Run Order", "Manage catalog", "Machines", "Global settings", "Blanks", "Expenses", "Audit log", "Sign out"].every(l => sheetLabels.includes(l)));
     console.log("it names the current page:", nav.querySelector(".admin-nav-current").textContent === "Orders");
+    // Every button of the desktop row is in the sheet too (Run Transfer Sheets used to be missing on phones).
+    const rowLabels = [...nav.querySelectorAll(".admin-nav-row > .admin-nav-btn")].map(b => b.textContent);
+    console.log("every top-level desktop button is in the phone menu, Run Transfer Sheets included:", sheetLabels.includes("Run Transfer Sheets") && rowLabels.every(l => sheetLabels.includes(l)));
     nav.querySelector(".admin-nav-menu-btn").click();
     console.log("tapping Menu opens the sheet:", nav.querySelector(".admin-nav-mobile").classList.contains("open"));
     console.log("CSS swaps the button row for the Menu bar under 760px:", /#adminNav \.admin-nav-row\{display:none;\}/.test(css) && /\.admin-nav-mobile\{display:none;\}/.test(css));

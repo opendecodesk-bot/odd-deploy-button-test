@@ -76,7 +76,21 @@ To you:
 
 ## Checking it works
 
-Place a test order on a shop with your own email address. If nothing arrives:
+The quickest check is Tools → **Communications** → **Send a test email** (admins only). It sends
+one short message the same way order emails go, and shows what happened:
+
+- which provider was used, and the From, Reply-to and BCC addresses;
+- what the provider answered: its HTTP status and its own message (and, from Resend, the email's id
+  to look up on its Logs page);
+- whether `RESEND_API_KEY` looks right: its length, that it starts with `re_`, and no stray space or
+  line break (the key itself is never shown);
+- what to do about the usual problems: the sending domain not verified in Resend, Resend's testing
+  mode (it only sends to your own address until a domain is verified), a refused key, or a From
+  address still on `example.com` because `ROOT_DOMAIN` isn't set.
+
+A test send is not recorded as a failed email. Up to 10 a minute.
+
+Or place a test order on a shop with your own email address. If nothing arrives:
 
 1. Tools → Global settings → **Setup status**: is Email "Ready", and which provider does it name?
 2. Tools → **Communications**: is there a problem listed for that email?

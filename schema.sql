@@ -78,6 +78,27 @@ CREATE TABLE IF NOT EXISTS products (
   -- for this add-on per piece (NULL = free).
   customDesign              TEXT NOT NULL DEFAULT '' CHECK (customDesign IN ('', 'embroidery', 'transfer')),
   customDesignPriceCents    INTEGER CHECK (customDesignPriceCents IS NULL OR customDesignPriceCents >= 0),
+  -- migrations/0057: 1 = made with no blank at all (a patch: twill and thread are shop supplies), so
+  -- its order lines skip the blank steps and nothing is ordered, received or counted for it.
+  noBlankNeeded             INTEGER NOT NULL DEFAULT 0 CHECK (noBlankNeeded IN (0, 1)),
+  -- migrations/0059: versions of a product (short / long sleeve…) — products of one shop sharing a
+  -- non-empty versionGroup are shown as one card with a toggle; versionLabel names this one.
+  versionGroup              TEXT NOT NULL DEFAULT '',
+  versionLabel              TEXT NOT NULL DEFAULT '',
+  -- migrations/0062: when its prices were last set or confirmed against its blanks' vendor prices.
+  pricesReviewedAt          TEXT,
+  -- migrations/0064: color price groups — [{key, label, colors, sizePricingCents | flatPriceCents}]; a color in
+  -- no group takes the product's own prices (the Standard group).
+  colorGroupsJson           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(colorGroupsJson)),
+  -- migrations/0067: pricing awareness — minutes to make one item, extra DTF / transfer cost per item, and an
+  -- override of the global shop-supplies cost per item (all optional).
+  runMinutes                REAL,
+  transferCostCents         INTEGER,
+  suppliesCostCents         INTEGER,
+  -- migrations/0068: printed transfers (DTF) that are part of the product, in its price — [{locationId, graphicId, ink}].
+  fixedTransfersJson        TEXT NOT NULL DEFAULT '[]',
+  -- migrations/0069: embroidered graphics shown on mockups only — [{locationId, graphicId}].
+  mockupGraphicsJson        TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (orgId, productId)
 );
 
@@ -246,7 +267,9 @@ CREATE TABLE IF NOT EXISTS order_items (
   blankVendorOrderId      TEXT NOT NULL DEFAULT '',
   blankEstDelivery        TEXT,
   -- migrations/0048: when this line's transfers were pressed, for a line that is also embroidered.
-  transfersAppliedAt  TEXT
+  transfersAppliedAt  TEXT,
+  -- migrations/0060: filled from the shop's finished stock (no blank / design / making steps).
+  fromStock           INTEGER NOT NULL DEFAULT 0 CHECK (fromStock IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS design_verifications (
@@ -263,6 +286,22 @@ CREATE TABLE IF NOT EXISTS design_verifications (
   sentAt             TEXT NOT NULL,
   respondedAt        TEXT,
   uploadCount        INTEGER NOT NULL DEFAULT 0 CHECK (uploadCount >= 0)
+);
+
+-- Invoices the customer can open, choose delivery on and pay online (migrations/0053): one per
+-- order; the emailed link is /?invoice=<token> on the shop's own address. Sending again keeps the token.
+CREATE TABLE IF NOT EXISTS order_invoices (
+  token            TEXT PRIMARY KEY,
+  orderId          TEXT NOT NULL UNIQUE REFERENCES orders(orderId) ON DELETE CASCADE,
+  orgId            TEXT NOT NULL,
+  sentTo           TEXT NOT NULL DEFAULT '',
+  message          TEXT NOT NULL DEFAULT '',
+  allowDelivery    INTEGER NOT NULL DEFAULT 1 CHECK (allowDelivery IN (0, 1)),
+  sentAt           TEXT NOT NULL,
+  sendCount        INTEGER NOT NULL DEFAULT 1 CHECK (sendCount >= 1),
+  viewedAt         TEXT,
+  deliveryChosenAt TEXT,
+  deliveryChoice   TEXT NOT NULL DEFAULT ''
 );
 
 -- Legacy inventory table (superseded by blanks/blank_sizes — kept for existing data)
@@ -293,7 +332,17 @@ CREATE TABLE IF NOT EXISTS blanks (
   notes        TEXT NOT NULL DEFAULT '',
   createdAt    TEXT NOT NULL,
   updatedAt    TEXT NOT NULL,
-  needleTypeId INTEGER REFERENCES needle_types(id)  -- migrations/0044; NULL = not set
+  needleTypeId INTEGER REFERENCES needle_types(id),  -- migrations/0044; NULL = not set
+  -- migrations/0060: a blank TYPE bought for testing / shop use (still inventory — it could be sold).
+  forTesting   INTEGER NOT NULL DEFAULT 0 CHECK (forTesting IN (0, 1)),
+  -- migrations/0062: when its vendor prices were last checked (the 30-day reminder).
+  pricesCheckedAt TEXT,
+  -- migrations/0063: content from its vendor — description, bullet points, and where it came from.
+  description  TEXT NOT NULL DEFAULT '',
+  featuresJson TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(featuresJson)),
+  sourceJson   TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(sourceJson)),
+  -- migrations/0065: the vendor connection its prices and content come from.
+  vendorConnectionId INTEGER
 );
 
 -- A blank's colors (migrations/0037): authoritative per-color record — name,
@@ -319,8 +368,33 @@ CREATE TABLE IF NOT EXISTS blank_sizes (
   size               TEXT NOT NULL DEFAULT '',
   purchasePriceCents INTEGER NOT NULL DEFAULT 0 CHECK (purchasePriceCents >= 0),
   quantity           INTEGER NOT NULL DEFAULT 0,
+  -- migrations/0062: the vendor's price, entered by hand (NULL = not entered) — purchasePriceCents
+  -- above is the average cost of the pieces on hand. History in blank_vendor_prices.
+  vendorPriceCents   INTEGER CHECK (vendorPriceCents IS NULL OR vendorPriceCents >= 0),
+  vendorPriceAt      TEXT,
+  -- migrations/0070: the vendor's minimum advertised price (NULL = none) — a product's price for a linked size can't
+  -- be below it.
+  mapPriceCents      INTEGER CHECK (mapPriceCents IS NULL OR mapPriceCents >= 0),
+  -- migrations/0074: keep at least this many free (NULL = no reorder point).
+  reorderPoint       INTEGER CHECK (reorderPoint IS NULL OR reorderPoint >= 0),
+  -- migrations/0077: one piece's weight in ounces (NULL = not known); products.weightOz overrides it.
+  weightOz           REAL CHECK (weightOz IS NULL OR weightOz >= 0),
   UNIQUE (blankId, color, size)
 );
+
+-- Every vendor price entered (migrations/0062), append-only; priceCents NULL = cleared.
+CREATE TABLE IF NOT EXISTS blank_vendor_prices (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  blankId       INTEGER NOT NULL,
+  color         TEXT    NOT NULL DEFAULT '',
+  size          TEXT    NOT NULL DEFAULT '',
+  priceCents    INTEGER CHECK (priceCents IS NULL OR priceCents >= 0),
+  previousCents INTEGER,
+  enteredAt     TEXT    NOT NULL,
+  actor         TEXT    NOT NULL DEFAULT '',
+  note          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bvp_size ON blank_vendor_prices (blankId, color, size, enteredAt);
 
 -- Links a product's color+size to a specific blank color+size (for inventory
 -- tracking). productColor '' = a classic (single-color) product. migrations/0037
@@ -417,6 +491,31 @@ INSERT OR IGNORE INTO needle_types (name, sortOrder, createdAt, updatedAt) VALUE
   ('Sharp',     1, '2026-10-09T00:00:00.000Z', '2026-10-09T00:00:00.000Z'),
   ('Ballpoint', 2, '2026-10-09T00:00:00.000Z', '2026-10-09T00:00:00.000Z');
 
+-- Product categories (migrations/0051): the managed list a product's `type` and a blank's
+-- `productType` are picked from. `key` is the stored value; `plural` is the storefront heading;
+-- `packAs` is the package-size limit the category counts against when a box is chosen.
+CREATE TABLE IF NOT EXISTS product_categories (
+  key        TEXT PRIMARY KEY CHECK (length(key) BETWEEN 1 AND 40),
+  name       TEXT NOT NULL,
+  plural     TEXT NOT NULL DEFAULT '',
+  packAs     TEXT NOT NULL DEFAULT 'other' CHECK (packAs IN ('shirt', 'sweatshirt', 'cap', 'other')),
+  sortOrder  INTEGER NOT NULL DEFAULT 0,
+  createdAt  TEXT NOT NULL,
+  updatedAt  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_product_categories_name ON product_categories(name COLLATE NOCASE);
+
+-- The three that existed (same keys, so every product, blank and order line keeps its category),
+-- plus Patch, T Shirt, Hoodie and Other.
+INSERT OR IGNORE INTO product_categories (key, name, plural, packAs, sortOrder, createdAt, updatedAt) VALUES
+  ('shirt',      'Shirt',      'Shirts',      'shirt',      1, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('t-shirt',    'T Shirt',    'T Shirts',    'shirt',      2, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('sweatshirt', 'Sweatshirt', 'Sweatshirts', 'sweatshirt', 3, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('hoodie',     'Hoodie',     'Hoodies',     'sweatshirt', 4, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('cap',        'Cap',        'Caps',        'cap',        5, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('patch',      'Patch',      'Patches',     'other',      6, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z'),
+  ('other',      'Other',      'Other',       'other',      7, '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z');
+
 -- Global garment-location lookup (Front/Back/Left Chest/Right Chest, admin-editable). migrations/0041.
 -- Referenced by id from products.locationsJson[].locationId and blank_colors.imagesJson[].locationId.
 CREATE TABLE IF NOT EXISTS locations (
@@ -483,7 +582,9 @@ CREATE TABLE IF NOT EXISTS design_versions (
   threadColorsJson TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(threadColorsJson)),
   notes            TEXT NOT NULL DEFAULT '',
   uploadedAt       TEXT NOT NULL,
-  createdAt        TEXT NOT NULL
+  createdAt        TEXT NOT NULL,
+  -- migrations/0071: stitches in the machine file (NULL = not known yet)
+  stitchCount      INTEGER CHECK (stitchCount IS NULL OR stitchCount >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_design_versions_design ON design_versions(designId, uploadedAt);
 
@@ -534,7 +635,11 @@ CREATE TABLE IF NOT EXISTS machines (
   macAddress     TEXT NOT NULL DEFAULT '',  -- stable identity; IP is populated by the scanner (migrations/0027)
   verifiedAt     TEXT,                      -- when discovery last confirmed this MAC present (migrations/0027)
   createdAt      TEXT NOT NULL,
-  updatedAt      TEXT NOT NULL
+  updatedAt      TEXT NOT NULL,
+  -- migrations/0071: the machine's stitch counter and cumulative run time (cache of machine_counter_events)
+  stitchCount    INTEGER NOT NULL DEFAULT 0,
+  runSeconds     INTEGER NOT NULL DEFAULT 0,
+  counterUpdatedAt TEXT
 );
 
 -- Which hoops a machine supports — the Run Order screen only offers a machine a job whose
@@ -594,7 +699,12 @@ CREATE TABLE IF NOT EXISTS production_runs (
   timed            INTEGER NOT NULL DEFAULT 1 CHECK (timed IN (0, 1)),
   -- migrations/0046: what went wrong during the run, noted when it's finished ({"threadBreak":3,…}) + the "other" note.
   issuesJson       TEXT NOT NULL DEFAULT '{}',
-  issueNote        TEXT NOT NULL DEFAULT ''
+  issueNote        TEXT NOT NULL DEFAULT '',
+  -- migrations/0071: the hooping's design stitches, and what the run added to its machine's counters.
+  stitchCount      INTEGER,
+  stitchesCounted  INTEGER,
+  secondsCounted   INTEGER,
+  estimated        INTEGER NOT NULL DEFAULT 0 CHECK (estimated IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status  ON production_runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_machine ON production_runs(machineId, status);
@@ -647,7 +757,9 @@ CREATE TABLE IF NOT EXISTS order_item_designs (
   uploadedAt       TEXT NOT NULL,
   createdAt        TEXT NOT NULL,
   -- migrations/0055: which location of the line this design is for ('' = the line's one design).
-  location         TEXT NOT NULL DEFAULT ''
+  location         TEXT NOT NULL DEFAULT '',
+  -- migrations/0071: stitches in the machine file (NULL = not known yet)
+  stitchCount      INTEGER CHECK (stitchCount IS NULL OR stitchCount >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_order_item_designs_item ON order_item_designs(itemId, uploadedAt);
 
@@ -663,6 +775,8 @@ END;
 -- Payment records — one row per actual payment received (supports partial payments)
 CREATE TABLE IF NOT EXISTS order_payments (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptKey    TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptName   TEXT NOT NULL DEFAULT '',  -- 0061
   orderId     TEXT NOT NULL REFERENCES orders(orderId) ON DELETE CASCADE,
   amountCents INTEGER NOT NULL CHECK (amountCents <> 0),
   note        TEXT NOT NULL DEFAULT '',
@@ -714,8 +828,31 @@ CREATE TABLE IF NOT EXISTS ready_to_ship (
   size      TEXT NOT NULL DEFAULT '',
   quantity  INTEGER NOT NULL DEFAULT 0,
   updatedAt TEXT NOT NULL,
+  avgCostCents INTEGER NOT NULL DEFAULT 0 CHECK (avgCostCents >= 0),   -- migrations/0060: finished stock's running average cost
   UNIQUE (orgId, productId, size)
 );
+-- migrations/0060: every change to finished stock (ready_to_ship.quantity is the cache of their sum).
+CREATE TABLE IF NOT EXISTS finished_goods_movements (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  orgId           TEXT    NOT NULL,
+  productId       TEXT    NOT NULL,
+  productName     TEXT    NOT NULL DEFAULT '',
+  color           TEXT    NOT NULL DEFAULT '',
+  size            TEXT    NOT NULL DEFAULT '',
+  qtyDelta        INTEGER NOT NULL CHECK (qtyDelta <> 0),
+  unitCostCents   INTEGER NOT NULL DEFAULT 0 CHECK (unitCostCents >= 0),
+  kind            TEXT    NOT NULL CHECK (kind IN ('opening', 'make', 'sell', 'return', 'adjust')),
+  blankMovementId INTEGER,
+  orderId         TEXT,
+  itemId          INTEGER,
+  note            TEXT    NOT NULL DEFAULT '',
+  occurredAt      TEXT    NOT NULL,
+  createdAt       TEXT    NOT NULL,
+  voidedAt        TEXT,
+  voidReason      TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_fgm_item ON finished_goods_movements (orgId, productId, size, occurredAt);
+CREATE INDEX IF NOT EXISTS idx_fgm_occurred ON finished_goods_movements (occurredAt);
 
 
 CREATE INDEX IF NOT EXISTS idx_orders_org            ON orders(orgId, placedAt DESC);
@@ -735,6 +872,7 @@ CREATE INDEX IF NOT EXISTS idx_inventory_type  ON inventory(productType, size);
 CREATE INDEX IF NOT EXISTS idx_blanks_type     ON blanks(productType);
 CREATE INDEX IF NOT EXISTS idx_prod_blank_link ON product_blank_links(orgId, productId);
 CREATE INDEX IF NOT EXISTS idx_rts_org         ON ready_to_ship(orgId, productId);
+CREATE INDEX IF NOT EXISTS idx_items_from_stock ON order_items (orgId, productId, size) WHERE fromStock = 1;
 
 -- Default global settings
 INSERT OR IGNORE INTO global_settings (key, value)
@@ -747,6 +885,8 @@ CREATE INDEX IF NOT EXISTS idx_payments_kind_received ON order_payments(kind, re
 -- Postage bought through Shippo: an expense against shipping income (migrations/0008).
 CREATE TABLE IF NOT EXISTS shipping_labels (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptKey    TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptName   TEXT NOT NULL DEFAULT '',  -- 0061
   orderId             TEXT NOT NULL REFERENCES orders(orderId) ON DELETE CASCADE,
   shippoTransactionId TEXT NOT NULL UNIQUE,
   carrier             TEXT NOT NULL DEFAULT '',
@@ -775,7 +915,8 @@ CREATE TABLE IF NOT EXISTS blank_shipments (
   deliveredAt    TEXT,
   lastCheckedAt  TEXT,
   createdAt      TEXT NOT NULL,
-  updatedAt      TEXT NOT NULL
+  updatedAt      TEXT NOT NULL,
+  supplierPoNumber TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_blank_shipments_tracking ON blank_shipments(trackingNumber);
 CREATE INDEX IF NOT EXISTS idx_blank_shipments_active   ON blank_shipments(deliveredAt, lastCheckedAt);
@@ -804,6 +945,7 @@ CREATE INDEX IF NOT EXISTS idx_blank_tracking_events_shipment ON blank_tracking_
 -- purpose: deleting a blank must keep its cost history.
 CREATE TABLE IF NOT EXISTS inventory_movements (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptGroup  TEXT,  -- 0061: ties the records one receive wrote together
   blankId       INTEGER NOT NULL,
   blankName     TEXT NOT NULL DEFAULT '',
   size          TEXT NOT NULL DEFAULT '',
@@ -824,7 +966,8 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
   receiptName   TEXT NOT NULL DEFAULT '',                                          -- 0019
   voidedAt      TEXT,                                                              -- 0020
   voidReason    TEXT NOT NULL DEFAULT '',                                          -- 0020
-  color         TEXT NOT NULL DEFAULT ''                                           -- 0037 (stock dimension)
+  color         TEXT NOT NULL DEFAULT '',                                          -- 0037 (stock dimension)
+  reason        TEXT NOT NULL DEFAULT ''                                           -- 0060: writeoff testing|damaged|lost|other; consume ''|finished
 );
 CREATE INDEX IF NOT EXISTS idx_movements_blank    ON inventory_movements(blankId, size, occurredAt);
 CREATE INDEX IF NOT EXISTS idx_movements_blank_color ON inventory_movements(blankId, color, size, occurredAt);
@@ -842,7 +985,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_reportable ON orders(isTest, voidedAt, pla
 -- Owner notices queued for the 6 AM daily roll-up (migrations/0011; 'delivered' added in 0016).
 CREATE TABLE IF NOT EXISTS owner_notices (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind      TEXT NOT NULL CHECK (kind IN ('payment', 'refund', 'dispute', 'design', 'delivered')),
+  kind      TEXT NOT NULL CHECK (kind IN ('payment', 'refund', 'dispute', 'design', 'delivered', 'invoice')),
   orderId   TEXT NOT NULL DEFAULT '',
   orgId     TEXT NOT NULL DEFAULT '',
   summary   TEXT NOT NULL,
@@ -868,6 +1011,7 @@ CREATE TABLE IF NOT EXISTS expense_categories (
 
 CREATE TABLE IF NOT EXISTS expenses (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptGroup  TEXT,  -- 0061: ties the records one receive wrote together
   expenseDate     TEXT NOT NULL CHECK (expenseDate GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]'),
   description     TEXT NOT NULL CHECK (length(trim(description)) > 0),
   categoryId      INTEGER NOT NULL REFERENCES expense_categories(id) ON DELETE RESTRICT,
@@ -940,6 +1084,8 @@ WHERE name IN ('Equipment & machines', 'Supplies (thread, stabilizer, needles)',
 -- Other income, owner contributions/draws, transfers between accounts (migrations/0014).
 CREATE TABLE IF NOT EXISTS other_income (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptKey    TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptName   TEXT NOT NULL DEFAULT '',  -- 0061
   incomeDate  TEXT NOT NULL CHECK (incomeDate GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]'),
   description TEXT NOT NULL CHECK (length(trim(description)) > 0),
   type        TEXT NOT NULL CHECK (type IN ('service', 'other', 'interest')),
@@ -954,6 +1100,9 @@ CREATE INDEX IF NOT EXISTS idx_other_income_date ON other_income(deletedAt, inco
 
 CREATE TABLE IF NOT EXISTS owner_transactions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptKey    TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptName   TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptGroup  TEXT,  -- 0061: ties the records one receive wrote together
   txDate      TEXT NOT NULL CHECK (txDate GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]'),
   kind        TEXT NOT NULL CHECK (kind IN ('contribution', 'draw')),
   amountCents INTEGER NOT NULL CHECK (amountCents > 0),
@@ -967,6 +1116,8 @@ CREATE INDEX IF NOT EXISTS idx_owner_tx_date ON owner_transactions(deletedAt, tx
 
 CREATE TABLE IF NOT EXISTS account_transfers (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptKey    TEXT NOT NULL DEFAULT '',  -- 0061
+  receiptName   TEXT NOT NULL DEFAULT '',  -- 0061
   transferDate  TEXT NOT NULL CHECK (transferDate GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]'),
   fromAccountId INTEGER NOT NULL REFERENCES accounts(id),
   toAccountId   INTEGER NOT NULL REFERENCES accounts(id),
@@ -1033,6 +1184,7 @@ CREATE TABLE IF NOT EXISTS transfers (
 
 CREATE TABLE IF NOT EXISTS transfer_movements (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiptGroup  TEXT,  -- 0061: ties the records one receive wrote together
   transferId    INTEGER NOT NULL,
   transferName  TEXT NOT NULL DEFAULT '',
   qtyDelta      INTEGER NOT NULL CHECK (qtyDelta <> 0),
@@ -1073,6 +1225,149 @@ CREATE TABLE IF NOT EXISTS graphics (
   visible                  INTEGER NOT NULL DEFAULT 1 CHECK (visible IN (0, 1)),
   sortOrder                INTEGER NOT NULL DEFAULT 0,
   createdAt                TEXT NOT NULL,
-  updatedAt                TEXT NOT NULL
+  updatedAt                TEXT NOT NULL,
+  -- migrations/0078: every shop can use it (its design must be global too).
+  isGlobal                 INTEGER NOT NULL DEFAULT 0 CHECK (isGlobal IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_graphics_org ON graphics(orgId);
+
+-- Receipt links (migrations/0061): the records one receive wrote share a receiptGroup.
+CREATE INDEX IF NOT EXISTS idx_inventory_movements_receiptGroup ON inventory_movements(receiptGroup) WHERE receiptGroup IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_transfer_movements_receiptGroup  ON transfer_movements(receiptGroup)  WHERE receiptGroup IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_expenses_receiptGroup            ON expenses(receiptGroup)            WHERE receiptGroup IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_owner_transactions_receiptGroup  ON owner_transactions(receiptGroup)  WHERE receiptGroup IS NOT NULL;
+
+-- Vendor connections through PromoStandards (migrations/0065); credentials AES-GCM encrypted.
+CREATE TABLE IF NOT EXISTS vendor_connections (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  companyCode    TEXT    NOT NULL,
+  name           TEXT    NOT NULL,
+  endpointsJson  TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(endpointsJson)),
+  credentialsEnc TEXT    NOT NULL DEFAULT '',
+  overridesJson  TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(overridesJson)),
+  status         TEXT    NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'ok', 'error')),
+  lastTestedAt   TEXT,
+  lastRefreshAt  TEXT,
+  lastError      TEXT    NOT NULL DEFAULT '',
+  createdAt      TEXT    NOT NULL,
+  updatedAt      TEXT    NOT NULL
+);
+
+-- migrations/0071: machine counters and maintenance.
+-- Every change to a machine's counters: a run (done / untimed), an aborted run, or a reading typed from the machine.
+-- No FK on machineId, like production_runs: the history outlives a deleted machine.
+CREATE TABLE IF NOT EXISTS machine_counter_events (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  machineId         INTEGER NOT NULL,
+  kind              TEXT NOT NULL CHECK (kind IN ('run', 'abort', 'reading')),
+  runId             INTEGER,
+  stitchesDelta     INTEGER NOT NULL DEFAULT 0,
+  secondsDelta      INTEGER NOT NULL DEFAULT 0,
+  stitchTotalAfter  INTEGER NOT NULL DEFAULT 0,
+  secondsTotalAfter INTEGER NOT NULL DEFAULT 0,
+  estimated         INTEGER NOT NULL DEFAULT 0 CHECK (estimated IN (0, 1)),
+  note              TEXT NOT NULL DEFAULT '',
+  actor             TEXT NOT NULL DEFAULT '',
+  at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_counter_events_machine ON machine_counter_events(machineId, at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_counter_events_one_per_run ON machine_counter_events(runId) WHERE runId IS NOT NULL;
+
+-- Per-machine maintenance tasks: due every N seconds of run time and/or every N stitches (whichever comes first),
+-- counted from when it was last done (seeded with the counters when the task is created).
+CREATE TABLE IF NOT EXISTS machine_maintenance_tasks (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  machineId        INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+  name             TEXT NOT NULL,
+  everySeconds     INTEGER CHECK (everySeconds IS NULL OR everySeconds > 0),
+  everyStitches    INTEGER CHECK (everyStitches IS NULL OR everyStitches > 0),
+  notes            TEXT NOT NULL DEFAULT '',
+  active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  sortOrder        INTEGER NOT NULL DEFAULT 0,
+  lastDoneAt       TEXT,
+  lastDoneStitches INTEGER NOT NULL DEFAULT 0,
+  lastDoneSeconds  INTEGER NOT NULL DEFAULT 0,
+  createdAt        TEXT NOT NULL,
+  updatedAt        TEXT NOT NULL,
+  CHECK (everySeconds IS NOT NULL OR everyStitches IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_maint_tasks_machine ON machine_maintenance_tasks(machineId, sortOrder);
+
+-- What was done and when, with the counters at that moment. taskId NULL = other work, not a listed task.
+CREATE TABLE IF NOT EXISTS machine_maintenance_log (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  machineId     INTEGER NOT NULL,
+  machineName   TEXT NOT NULL DEFAULT '',
+  taskId        INTEGER,
+  taskName      TEXT NOT NULL DEFAULT '',
+  doneAt        TEXT NOT NULL,
+  stitchCountAt INTEGER NOT NULL DEFAULT 0,
+  runSecondsAt  INTEGER NOT NULL DEFAULT 0,
+  note          TEXT NOT NULL DEFAULT '',
+  actor         TEXT NOT NULL DEFAULT '',
+  createdAt     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_maint_log_machine ON machine_maintenance_log(machineId, doneAt);
+
+-- Orders placed with a supplier through PromoStandards sendPO (migrations/0072).
+CREATE TABLE IF NOT EXISTS supplier_orders (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  connectionId        INTEGER NOT NULL,
+  vendor              TEXT    NOT NULL DEFAULT '',
+  environment         TEXT    NOT NULL DEFAULT 'production' CHECK (environment IN ('production', 'test')),
+  poNumber            TEXT    NOT NULL UNIQUE,
+  status              TEXT    NOT NULL DEFAULT 'sending' CHECK (status IN ('sending', 'placed', 'failed', 'unknown')),
+  transactionId       TEXT    NOT NULL DEFAULT '',
+  error               TEXT    NOT NULL DEFAULT '',
+  carrier             TEXT    NOT NULL DEFAULT '',
+  service             TEXT    NOT NULL DEFAULT '',
+  shipToJson          TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(shipToJson)),
+  totalCents          INTEGER NOT NULL DEFAULT 0 CHECK (totalCents >= 0),
+  linesJson           TEXT    NOT NULL DEFAULT '[]' CHECK (json_valid(linesJson)),
+  itemIdsJson         TEXT    NOT NULL DEFAULT '[]' CHECK (json_valid(itemIdsJson)),
+  createdAt           TEXT    NOT NULL,
+  createdBy           TEXT    NOT NULL DEFAULT '',
+  placedAt            TEXT,
+  lastShipmentCheckAt TEXT,
+  cancelledAt         TEXT,
+  cancelNote          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_supplier_orders_created ON supplier_orders(createdAt);
+
+-- Restock orders placed by hand, recorded so the restock isn't suggested again while on its way (migrations/0074).
+CREATE TABLE IF NOT EXISTS blank_restock_orders (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  vendor     TEXT NOT NULL DEFAULT '',
+  reference  TEXT NOT NULL DEFAULT '',
+  linesJson  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(linesJson)),
+  createdAt  TEXT NOT NULL,
+  createdBy  TEXT NOT NULL DEFAULT '',
+  voidedAt   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blank_restock_orders_created ON blank_restock_orders(createdAt);
+
+-- Brand approvals: a supplier's logo approval per product + brand, with its file (migrations/0075).
+CREATE TABLE IF NOT EXISTS brand_approvals (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  orgId       TEXT    NOT NULL,
+  productId   TEXT    NOT NULL,
+  brand       TEXT    NOT NULL,
+  approvedOn  TEXT    NOT NULL,
+  maxQty      INTEGER CHECK (maxQty IS NULL OR maxQty > 0),
+  note        TEXT    NOT NULL DEFAULT '',
+  fileKey     TEXT    NOT NULL,
+  fileName    TEXT    NOT NULL DEFAULT '',
+  createdBy   TEXT    NOT NULL DEFAULT '',
+  createdAt   TEXT    NOT NULL,
+  revokedAt   TEXT,
+  revokeNote  TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_brand_approvals_product ON brand_approvals(orgId, productId);
+
+-- A shop's published catalog (its orgs + products rows), what shoppers see and orders are priced from (migrations/0076).
+CREATE TABLE IF NOT EXISTS catalog_snapshots (
+  orgId        TEXT    PRIMARY KEY,
+  json         TEXT    NOT NULL CHECK (json_valid(json)),
+  publishedAt  TEXT    NOT NULL,
+  publishedBy  TEXT    NOT NULL DEFAULT ''
+);

@@ -51,7 +51,7 @@ global.getCatalogData = async () => ({
 let catalogSrc = fs.readFileSync(__dirname + "/functions/api/catalog.js", "utf8")
   .replace(/import \{ classifyHost \} from ["'].*["'];\n?/, "")
   .replace(/import \{ getCatalogData \} from ["'].*["'];\n?/, "")
-  .replace(/import \{ getReadyToShipByOrg \} from ["'].*["'];\n?/, "")
+  .replace(/import \{ getReadyToShipByOrg[^}]*\} from ["'].*["'];\n?/, "")
   .replace(/export const CATALOGS/, "var CATALOGS")
   .replace(/import \{ jsonResponse \} from ["'].*["'];\n?/, "")
   .replace(/export async function/g, "async function");
@@ -86,7 +86,8 @@ let html = fs.readFileSync(__dirname + "/public/index.html", "utf8")
   const priceA = window.document.getElementById("price-A");
 
   // Default size (XS = $23)
-  console.log("Default XS price shown as $23.00:", priceA.textContent === "$23.00");
+  // Sizes priced differently: "from" the lowest until a size is picked.
+  console.log("Default price shown as 'from $23.00' (sizes priced differently):", priceA.textContent === "from $23.00");
 
   // Change to 2XL ($24)
   sizeSelectA.value = "2XL";

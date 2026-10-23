@@ -64,7 +64,7 @@ LEAGUE-MUG,Mugs,A mug,,,10,,,,,,,,,,TRUE
   ok("size summary: short lists spelled out, long runs as a range", w.csvSizeSummary_(["S", "M"]) === "S, M" && w.csvSizeSummary_(["XS", "S", "M", "L", "6XL"]) === "XS–6XL (5)");
 
   console.log("\n=== Blanks → Import CSV ===");
-  ok("the Blanks page has an Import CSV button", /id="blankImportCsvBtn"/.test(adminJs) && /showBlankCsvImportModal_\(file, \(\) => renderAdminBlanks\(app\)\)/.test(adminJs));
+  ok("the Blanks page has an Import CSV button", /id="blankImportCsvBtn"/.test(adminJs) && /showBlankCsvImportModal_\(file, refresh\)/.test(adminJs));
   let done = null;
   w.showBlankCsvImportModal_(file(BLANKS_CSV, "blanks.csv"), (r) => { done = r; });
   await until(() => d.querySelector("#csvImpGo"));
@@ -127,7 +127,7 @@ LEAGUE-MUG,Mugs,A mug,,,10,,,,,,,,,,TRUE
   done = null; w.showProductCsvImportModal_("league", file(PRODUCTS_CSV, "products.csv"), (r) => { done = r; });
   await until(() => d.querySelector("#csvImpGo"));
   ok("preview: two New with price ranges and the blank link, one that can't be imported", rows().length === 3 && /\$27\.00–\$33\.00/.test(rows()[0].textContent) && /Linked to blank ST650/.test(rows()[0].textContent) &&
-    /isn't a shirt, hoodie/.test(rows()[2].textContent) && (await count("SELECT count(*) n FROM products")) === 0);
+    /isn't one of this site's categories/.test(rows()[2].textContent) && (await count("SELECT count(*) n FROM products")) === 0);
   ok("the shop's graphics are offered for the new locations, unticked", d.querySelectorAll(".csvImpGraphic").length === 1 && !d.querySelector(".csvImpGraphic").checked && !!gr.id);
   d.querySelector(".csvImpGraphic").click();
   d.querySelector("#csvImpGo").click(); await until(() => done);

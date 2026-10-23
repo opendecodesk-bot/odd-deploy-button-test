@@ -31,13 +31,14 @@
 
 import { classifyHost }       from "../_lib/hostConfig.js";
 import { getCatalogData }     from "../_lib/catalogCache.js";
-import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
+import { rateLimited, rateLimitResponse, rateLimitCheckGlobal, rateLimitHitGlobal } from "../_lib/rateLimit.js";
 import { jsonResponse }       from "../_lib/http.js";
 import {
   timingSafeEqual, issueSession, revokeSession, readCookie, isSameOrigin,
   sessionCookieHeader, clearSessionCookieHeader, SESSION_COOKIE, SESSION_TTL_SEC,
   bootstrapState, rememberSecret, verifyUserPassword, pendingFor, revokeAllSessions, weakSetupPassword,
-  looksLikeRecoveryCode, spendRecoveryCode,
+  looksLikeRecoveryCode, spendRecoveryCode, revokeUserSessionsFor,
+  ADMIN_AUTH_GLOBAL_BUCKET, ADMIN_AUTH_GLOBAL_WINDOW, adminAuthGlobalLimit,
 } from "../_lib/adminAuth.js";
 import { accessEnabled, verifyAccess } from "../_lib/access.js";
 import { verifyTOTP }         from "../_lib/totp.js";
@@ -63,13 +64,17 @@ export async function onRequestPost(context){
     return jsonResponse({status:"error", message:"Not available here."}, 403);
   }
 
-  const rl = await rateLimited(env, "admin_auth", request, 10);
-  if(rl.blocked) return rateLimitResponse(rl.retryAfter);
-
-  // Login CSRF guard: only the admin page itself may start a session.
+  // Login CSRF guard: only the admin page itself may start a session. Checked BEFORE counting, so a
+  // page elsewhere can't spend this address's sign-in budget (and lock its owner out).
   if(!isSameOrigin(request)){
     return jsonResponse({status:"error", message:"Cross-origin login refused."}, 403);
   }
+
+  const rl = await rateLimited(env, "admin_auth", request, 10);
+  if(rl.blocked) return rateLimitResponse(rl.retryAfter);
+  // …and the install-wide budget of FAILED sign-ins (adminAuth.js), whoever is asking.
+  const all = await rateLimitCheckGlobal(env, ADMIN_AUTH_GLOBAL_BUCKET, adminAuthGlobalLimit(env), ADMIN_AUTH_GLOBAL_WINDOW);
+  if(all.blocked) return rateLimitResponse(all.retryAfter);
   if(accessEnabled(env)){
     const acc = await verifyAccess(env, request);
     if(!acc.ok) return jsonResponse({status:"error", message:acc.reason}, 403);
@@ -89,6 +94,7 @@ export async function onRequestPost(context){
   };
   const refuse = async (reason, message) => {
     await noteFailure(env, reason, request);
+    await rateLimitHitGlobal(env, ADMIN_AUTH_GLOBAL_BUCKET, ADMIN_AUTH_GLOBAL_WINDOW);
     return jsonResponse({status:"error", message: message || "Unauthorized"}, 401);
   };
 
@@ -189,7 +195,8 @@ export async function onRequestGet(){
   return jsonResponse({status:"error", message:"Use POST."}, 405);
 }
 
-// Revokes the cookie's session server-side and clears the cookie (sign-out).
+// Revokes the cookie's session server-side and clears the cookie (sign-out). With ?all=1, every
+// session of that user — "Sign out everywhere" on the Security page.
 export async function onRequestDelete(context){
   const { request, env } = context;
 
@@ -201,14 +208,21 @@ export async function onRequestDelete(context){
     return jsonResponse({status:"error", message:"Not available here."}, 403);
   }
 
-  const rl = await rateLimited(env, "admin_auth", request, 10);
-  if(rl.blocked) return rateLimitResponse(rl.retryAfter);
-
   if(!isSameOrigin(request)){
     return jsonResponse({status:"error", message:"Cross-origin request refused."}, 403);
   }
 
-  try{ await revokeSession(env, readCookie(request, SESSION_COOKIE)); }
+  const rl = await rateLimited(env, "admin_auth", request, 10);
+  if(rl.blocked) return rateLimitResponse(rl.retryAfter);
+
+  const everywhere = new URL(request.url).searchParams.get("all") === "1";
+  try{
+    if(everywhere){
+      const userId = await revokeUserSessionsFor(env, readCookie(request, SESSION_COOKIE));
+      if(userId != null) await insertAuditLog(env.DB, { orgId: null, orderId: null, action: "security.signed_out_everywhere", detail: {},
+        actor: "user:" + userId, ip: request.headers.get("CF-Connecting-IP") || null, actorUserId: userId, targetUserId: userId }).catch(() => {});
+    } else await revokeSession(env, readCookie(request, SESSION_COOKIE));
+  }
   catch(e){ console.error("admin-session DELETE: session delete error:", e); }
 
   const res = jsonResponse({status:"ok"});

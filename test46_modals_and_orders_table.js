@@ -7,16 +7,14 @@
   console.log("a cancelled order's Action cell includes the Payments button:", !!m && /paymentsBtn/.test(m[0]));
 }
 
-// The Ready-to-Ship Stock window is white; the page's default text is cream, so it must set its own dark text.
+// The Stock window is white; the page's default text is cream, so it must set its own dark text. Since
+// finished stock (migrations/0060) it's built on inventoryModal_, which sets both.
 {
   const src = require("fs").readFileSync(__dirname + "/public/admin.js", "utf8");
-  const m = src.match(/modal\.style\.cssText = "background:#fff;color:[^;]+;[^"]*"/);
-  console.log("the stock window sets dark text on its white background:", !!m && /color:var\(--ink/.test(m[0]));
-}
-
-{
-  const src = require("fs").readFileSync(__dirname + "/public/admin.js", "utf8");
-  console.log("the stock window's Cancel button has its own visible colours:", /id="stockModalCancel" style="background:#fff;color:#232323/.test(src));
+  const stock = src.slice(src.indexOf("async function showStockModal("), src.indexOf("function renderCreateProductForm("));
+  const shared = src.match(/function inventoryModal_\(title, bodyHtml, width, opts\)\{[\s\S]*?ov\.innerHTML = `<div style="background:#fff;color:#1a1a1a;/);
+  console.log("the stock window sets dark text on its white background:", /inventoryModal_\("Finished stock/.test(stock) && !!shared);
+  console.log("the stock window's button has its own visible colours:", /id="fsClose"/.test(stock) && /class="admin-btn fsCorrect" style="[^"]*background:#fff;color:#333/.test(stock));
 }
 
 // Persistent admin header: every tool page appears in one of the ADMIN_NAV_GROUPS dropdowns.
@@ -25,16 +23,16 @@
   const src = require("fs").readFileSync(__dirname + "/public/admin.js", "utf8");
   const groups = (src.match(/const ADMIN_NAV_GROUPS = \[([\s\S]*?)\];/) || [])[1] || "";
   console.log("the header groups list every tool page:", ["settings", "packages", "inventory", "threads", "machines", "machinefiles", "hoops", "comms", "expenses", "money", "reconcile", "audit", "revenue", "salestax", "cogs", "books", "security"].every(h => groups.includes('["' + h + '"')));
-  console.log("Global settings is in the Tools menu, not a button on Manage catalog:",
-    /label: "Tools"[^\]]*[\s\S]*?\["settings", "Global settings"\]/.test(groups) && !/location\.hash='#catalog\/settings'/.test(src)
+  console.log("Global settings is in the Settings menu, not a button on Manage catalog:",
+    /label: "Settings", items: \[\s*\["settings", "Global settings"\]/.test(groups) && !/location\.hash='#catalog\/settings'/.test(src)
     && /raw === "settings" \|\| raw === "catalog\/settings"/.test(src));
   console.log("Manage catalog is a top-level button (after Run Transfer Sheets), not in Tools:",
     /navGo\('runtransfer'\)">Run Transfer Sheets<\/button>\s*<button[^>]*navGo\('catalog'\)">Manage catalog</.test(src) && !groups.includes('["catalog"'));
   console.log("Run Order is a standalone top-level button, not in a dropdown:",
     /navGo\('runorder'\)">Run Order</.test(src) && !groups.includes('["runorder"'));
-  console.log("the menu groups are Tools / Inventory / Finance / Reports / Security:",
-    ["Tools", "Inventory", "Finance", "Reports", "Security"].every(l => groups.includes('label: "' + l + '"')));
-  console.log("Sign out lives in the Security dropdown, not a top-level shops row:", /label: "Security"[\s\S]*adminSignOut\(\)/.test(groups));
+  console.log("the menu groups are Catalog / Production / Inventory / Finance / Reports / Settings, in that order:",
+    groups.indexOf('label: "Catalog"') >= 0 && ["Catalog", "Production", "Inventory", "Finance", "Reports", "Settings"].every((l, i, a) => groups.includes('label: "' + l + '"') && (i === 0 || groups.indexOf('label: "' + a[i - 1] + '"') < groups.indexOf('label: "' + l + '"'))));
+  console.log("Sign out lives in the Settings dropdown, not a top-level shops row:", /label: "Settings"[\s\S]*adminSignOut\(\)/.test(groups));
 }
 
 // Edit items: personalization (customization text) can actually be changed, not just displayed.

@@ -54,7 +54,7 @@ global.getCatalogData = async () => ({
 let catalogSrc = fs.readFileSync(__dirname + "/functions/api/catalog.js", "utf8")
   .replace(/import \{ classifyHost \} from ["'].*["'];\n?/, "")
   .replace(/import \{ getCatalogData \} from ["'].*["'];\n?/, "")
-  .replace(/import \{ getReadyToShipByOrg \} from ["'].*["'];\n?/, "")
+  .replace(/import \{ getReadyToShipByOrg[^}]*\} from ["'].*["'];\n?/, "")
   .replace(/export const CATALOGS/, "var CATALOGS")
   .replace(/import \{ jsonResponse \} from ["'].*["'];\n?/, "")
   .replace(/export async function/g, "async function");

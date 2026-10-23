@@ -87,8 +87,8 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
 
   console.log("\n=== Screen wiring ===");
   const adminJs = read("public/admin.js");
-  ok("Locations is in the admin nav and routed",
-    /\["locations", "Locations"\]/.test(adminJs) && /renderLocationsCatalog\(app\)/.test(adminJs));
+  ok("Decoration locations is in the admin nav and routed",
+    /\["locations", "Decoration locations"\]/.test(adminJs) && /renderLocationsCatalog\(app\)/.test(adminJs));
   class L extends ResourceLoader { fetch(url, o){ if (url.includes("/admin.js")) return Promise.resolve(Buffer.from(adminJs)); return super.fetch(url, o); } }
   const dom = new JSDOM(read("public/index.html"), { runScripts: "dangerously", resources: new L(), url: "https://admin.example.com/", pretendToBeVisual: true,
     beforeParse(win){ win.fetch = async () => ({ ok: true, status: 200, json: async () => ({ status: "error", message: "n/a" }) }); } });

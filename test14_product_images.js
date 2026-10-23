@@ -51,7 +51,7 @@ global.getCatalogData = async () => ({
 let catalogSrc = fs.readFileSync(__dirname + "/functions/api/catalog.js", "utf8")
   .replace(/import \{ classifyHost \} from ["'].*["'];\n?/, "")
   .replace(/import \{ getCatalogData \} from ["'].*["'];\n?/, "")
-  .replace(/import \{ getReadyToShipByOrg \} from ["'].*["'];\n?/, "")
+  .replace(/import \{ getReadyToShipByOrg[^}]*\} from ["'].*["'];\n?/, "")
   .replace(/export const CATALOGS/, "var CATALOGS")
   .replace(/import \{ jsonResponse \} from ["'].*["'];\n?/, "")
   .replace(/export async function/g, "async function");
@@ -145,4 +145,45 @@ function makeStorageMock(){
   const lb2 = window.document.querySelector(".lb-overlay");
   console.log("The design-preview strip opens the viewer too, cycling its 3 pictures:", !!lb2 && lb2.querySelector(".lb-count").textContent === "1 / 3");
   lb2.querySelector(".lb-close").click();
+
+  console.log("\n=== The viewer zooms in and out ===");
+  capCard.querySelector(".product-images a").dispatchEvent(new window.MouseEvent("click", { bubbles: true, cancelable: true }));
+  const lz = window.document.querySelector(".lb-overlay");
+  const zin = lz.querySelector(".lb-zoom-in"), zout = lz.querySelector(".lb-zoom-out"), zimg = lz.querySelector(".lb-img"), zlabel = lz.querySelector(".lb-zoom");
+  // jsdom doesn't lay anything out: give the picture a fitted size of 400 x 300 whenever it has no inline size.
+  zimg.getBoundingClientRect = () => (zimg.style.width ? { width: parseFloat(zimg.style.width), height: parseFloat(zimg.style.height) } : { width: 400, height: 300 });
+  const key = (k) => window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
+  console.log("Zoom in and Zoom out buttons, labelled for screen readers:", zin.getAttribute("aria-label") === "Zoom in" && zout.getAttribute("aria-label") === "Zoom out");
+  console.log("Opens fitted to the screen — nothing to zoom out of yet:", zout.disabled && !zin.disabled && zlabel.textContent === "" && !lz.classList.contains("lb-zoomed") && !zimg.style.width);
+  click(zin);
+  console.log("Zoom in draws the picture 1.5x its fitted size and says 150%:", zimg.style.width === "600px" && zimg.style.height === "450px" && zlabel.textContent === "150%" && lz.classList.contains("lb-zoomed") && !zout.disabled);
+  click(zin);
+  console.log("Each step is measured from the fitted size, not the last zoom (2x = 800px, not 900):", zimg.style.width === "800px" && zlabel.textContent === "200%");
+  click(zin); click(zin);
+  console.log("It stops at 400% and the + button turns off:", zimg.style.width === "1600px" && zlabel.textContent === "400%" && zin.disabled);
+  click(zin);
+  console.log("...and clicking past the limit does nothing:", zimg.style.width === "1600px");
+  click(zout);
+  console.log("Zoom out steps back down (300%):", zimg.style.width === "1200px" && zlabel.textContent === "300%" && !zin.disabled);
+  key("0");
+  console.log("The 0 key returns to fit:", !zimg.style.width && !zimg.style.maxWidth && zlabel.textContent === "" && !lz.classList.contains("lb-zoomed") && zout.disabled);
+  key("+");
+  console.log("The + key zooms in:", zlabel.textContent === "150%");
+  key("="); key("-");
+  console.log("= (unshifted +) zooms in and - zooms out:", zlabel.textContent === "150%");
+  const cur = zimg.src;
+  const touch = (type, x) => { const e = new window.Event(type, { bubbles: true }); e.touches = type === "touchstart" ? [{ clientX: x }] : []; e.changedTouches = [{ clientX: x }]; lz.dispatchEvent(e); };
+  touch("touchstart", 300); touch("touchend", 100);
+  console.log("While zoomed, a finger moves the picture — a swipe does NOT change picture:", zimg.src === cur && zlabel.textContent === "150%");
+  click(lz.querySelector(".lb-next"));
+  console.log("Going to the next picture returns to fit:", zimg.src !== cur && zlabel.textContent === "" && !zimg.style.width && zout.disabled);
+  const cur2 = zimg.src;
+  touch("touchstart", 300); touch("touchend", 100);
+  console.log("At fit, a swipe still changes picture:", zimg.src !== cur2);
+  zin.focus(); click(zin); click(zin); click(zin); click(zin);
+  console.log("When + reaches its limit while focused, focus moves to - (not lost):", zin.disabled && window.document.activeElement === zout);
+  key("Tab"); key("Tab"); key("Tab"); key("Tab");
+  console.log("Tab stays inside the viewer and skips the turned-off button:", lz.contains(window.document.activeElement) && window.document.activeElement !== zin);
+  click(lz.querySelector(".lb-close"));
+  console.log("Still closes from the Close button:", !lz.isConnected);
 })();

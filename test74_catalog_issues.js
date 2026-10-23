@@ -68,8 +68,9 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
     console.log("no blank link → a warning, not an error:", prod.noweight.find(x => x.code === "noBlankLink").level === "warn");
     console.log("“No embroidery design needed” products aren't flagged for a design…", !prod.dtf.some(x => x.code === "noDesign"));
     console.log("…but unlinked sizes still are (a DTF tee is still a blank to track):", codes("dtf") === "noBlankLink" && prod.dtf[0].level === "warn");
-    console.log("hidden products are skipped… unless they're on an open order (and say so):", !prod.hidden && /hidden, but on an open order/.test(prod.hiddenopen[0].text));
-    console.log("the shop's product count:", issues.orgs.league.productCount === 6);
+    console.log("hidden products are checked too, as warnings until shown — unless on an open order (and they say so):",
+      prod.hidden && prod.hidden.every(x => x.level === "warn" && /hidden — fix before showing it/.test(x.text)) && /hidden, but on an open order/.test(prod.hiddenopen[0].text));
+    console.log("the shop's product count:", issues.orgs.league.productCount === 7);
 
     console.log("\n=== Designs ===");
     const des = issues.orgs.league.designs;
@@ -83,7 +84,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
 
     console.log("\n=== API + the No-design-needed flag ===");
     let r = await call({ action: "getCatalogIssues", org: "league" });
-    console.log("getCatalogIssues action:", r.status === 200 && r.body.issues.orgs.league.productCount === 6);
+    console.log("getCatalogIssues action:", r.status === 200 && r.body.issues.orgs.league.productCount === 7);
     r = await call({ action: "updateProduct", org: "league", productId: "nodesign", type: "cap", name: "nodesign", pricingMode: "flat", flatPrice: 25, weightOz: 4, visible: true, images: [], noDesignNeeded: true });
     console.log("ticking “No embroidery design needed” clears the design error (blank links still flagged):", r.status === 200 &&
       (await lib.getCatalogIssues(d1, "league")).orgs.league.products.nodesign.map(x => x.code).join() === "noBlankLink" &&
@@ -119,7 +120,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
     await tick();
     const btn = (org, kind) => app.querySelector(`button[data-org="${org}"][data-issues="${kind}"]`);
     console.log("Manage catalog: ⚠ count next to the shop's Products and Designs buttons:",
-      /⚠ 6/.test(btn("league", "products").textContent) && /⚠ 2/.test(btn("league", "designs").textContent));
+      /⚠ 7/.test(btn("league", "products").textContent) && /⚠ 2/.test(btn("league", "designs").textContent));
     console.log("red when any issue is an error:", /background:#b03a2e/.test(btn("league", "products").innerHTML));
     console.log("no marker for a shop with nothing missing, and a note explaining the markers:",
       !btn("club", "products").querySelector(".cat-issue-badge") && /⚠ marks a shop's products or designs/.test(app.textContent));

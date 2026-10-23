@@ -209,7 +209,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   ok("the receive modal has per-line include checkboxes and sends items:[{orderId,itemId}]",
     /class="br-incl"/.test(a) && /orderId: r\.orderId, itemId: r\.sheetRow/.test(a));
   ok("blank stages re-fetch (not patch) and the waiting card shows per-shipment status + links",
-    /if\(\/\^blank\/\.test\(stage\)\)\{ if\(orgObj\) renderAdminOrders/.test(a) && /function blankShipmentLine_/.test(a) && /o\.shipments \|\| \[\]/.test(a));
+    /if\(\/\^blank\/\.test\(stage\)\)\{ if\(orgObj\) refreshOrdersInPlace_/.test(a) && /function blankShipmentLine_/.test(a) && /o\.shipments \|\| \[\]/.test(a));
   ok("the Orders table's blank cells show per-line partial progress + the shipped cell's tracking",
     /N\/T ordered\/shipped\/received|\$\{n\}\/\$\{total\} \$\{field\}/.test(a) && /order\.blankShipments\.map\(blankShipmentLine_\)/.test(a));
   ok("the shipment line shows the carrier's own wording + a View history link opening the history modal",

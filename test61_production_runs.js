@@ -128,14 +128,14 @@ const ok = (desc, cond) => { console.log(desc + ":", !!cond); if (cond) pass++; 
   console.log("\n=== admin.js wiring (Run Order cards, abort modal, screens, nav, routes) ===");
   const a = read("public/admin.js");
   ok("idle cards have Start job + untimed Mark-done; running cards have complete/abort buttons",
-    /class="run-start-btn"/.test(a) && /class="run-complete-btn"/.test(a) && /class="run-abort-btn"/.test(a) && /class="run-btn"/.test(a));
+    /class="run-start-btn"/.test(a) && /class="run-complete-btn"/.test(a) && /class="run-abort-btn[ "]/.test(a) && /class="run-btn"/.test(a));
   ok("busy machines are excluded from idle pickers (proposeMachine_ takes a busy set)",
     /busyMachineIds/.test(a) && /proposeMachine_\(step, machines, hoopsById, window\._roCtx\.busyMachineIds\)/.test(a));
   ok("run actions wired", /action: "startRun"/.test(a) && /action: "completeRun"/.test(a) && /action: "abortRun"/.test(a));
   ok("abort modal defaults to 'Machine problem'", /function showAbortModal_/.test(a) && /\/\^machine problem\$\/i/.test(a));
   ok("abort-reasons management screen exists + wired", /function renderAbortReasons/.test(a) && /function showAbortReasonFormModal_/.test(a) && /action: "saveAbortReason"/.test(a));
   ok("run-time report screen exists + calls the report action", /function renderRunReport/.test(a) && /action: "getRunReportByDesign"/.test(a));
-  ok("nav entries + routes added", /\["abortreasons", "Abort reasons"\]/.test(a) && /\["runreport", "Run Times"\]/.test(a) &&
+  ok("nav entries + routes added", /\["abortreasons", "Abort reasons"\]/.test(a) && /\["runreport", "Run times"\]/.test(a) &&
     /raw === "abortreasons"/.test(a) && /raw === "runreport"/.test(a));
 
   console.log(`\n${fail ? "FAIL" : "ALL PASS"} — ${pass} passed, ${fail} failed`);

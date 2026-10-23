@@ -83,6 +83,7 @@ const httpSrc = strip(read("functions/_lib/http.js"));
   const session = new Function(httpSrc + "\n" + strip(read("functions/_lib/hostConfig.js")) + "\nconst getCatalogData = async () => ({ subdomainMap: {}, orgs: {} });" +
     "\nconst rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;" +
     "\nconst rateLimitCheck = async () => ({ blocked: false }); const rateLimitHit = async () => {};\n" +
+    "const rateLimitCheckGlobal = async () => ({ blocked: false }); const rateLimitHitGlobal = async () => {};\n" +
     accessSrc + "\n" + authSrc + "\n" + strip(read("functions/_lib/totp.js")) + "\n" + dbSrc + "\n" + strip(read("functions/api/admin-session.js")) + "\nreturn onRequestPost;")();
   const login = (body, ip = "198.51.100.7") => session({ env, request: { url: "https://admin.example.com/api/admin-session",
     headers: { get: (h) => ({ origin: "https://admin.example.com", "cf-connecting-ip": ip })[h.toLowerCase()] || null }, json: async () => body } });

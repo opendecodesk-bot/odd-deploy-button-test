@@ -1,5 +1,5 @@
 > **Temporary test copy.** This repository exists only to try the Deploy to Cloudflare button and
-> will be deleted afterwards.
+> will be deleted afterwards. **Trying it out? Start with [TESTING.md](TESTING.md).**
 >
 > [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/opendecodesk-bot/odd-deploy-button-test)
 
@@ -38,23 +38,51 @@ and the tax and shipping features are built around a US business (see [Region](#
   embroidery, with an optional add-on price.
 - Checkout by card (Stripe), Venmo, Zelle or check; local pickup, flat-fee delivery options, or carrier
   rates by ZIP (Shippo).
+- Product categories you manage (the shop's sections and what each packs like), and products made
+  with no blank.
+- Versions of a product — short and long sleeve on one card with a toggle, each with its own sizes,
+  prices, colors and blank — and copying products from one shop to another.
 - An order deadline per shop, an optional bot check (Cloudflare Turnstile), and emailed confirmations.
+- Publish per shop: edits stay a draft (with a signed preview link) until that shop is published.
+- A guided setup for a new shop — one question per screen, products built from blanks — and a shop bar
+  on every catalog screen.
 
 **Orders and production**
-- One Orders page across all shops: payments, discounts, refunds, line edits, stages from blanks ordered
-  to delivered, packing and mailing labels, shipping labels and tracking.
-- Local sales and orders entered by hand; payment links emailed to a customer.
+- An Orders page per shop, and one across all shops: payments, discounts, refunds, line edits, stages
+  from blanks ordered to delivered, packing and mailing labels, shipping labels and tracking.
+- Local sales and orders entered by hand; payment links and invoices emailed to a customer (the
+  invoice page lets them choose delivery and pay).
 - Design approval: email a customer a proof, they approve or ask for changes from a link.
 - Embroidery production: threads, hoops, designs and their stitch files, machines, a Run Order queue
-  with timed runs, and a run-time report.
+  with timed runs, and a run-time report; stitch counts per run and machine maintenance by stitches or
+  run hours.
 - A morning email to the owner with new orders, payments, deliveries and anything that went wrong.
 
 **Inventory and money**
 - Blank garments and transfer sheets: receiving (with landed cost), stock by size and color, write-offs,
-  and cost of goods sold worked out as orders are made.
-- A "blanks to order" list by supplier; CSV import for blanks and products; vendor-invoice PDF import.
+  and cost of goods sold worked out as orders are made. Blanks already on the shelf can be used for an
+  order in one click, and the Blanks screen shows what's set aside for orders.
+- Inventory in three groups: blanks for sale, blanks for testing or shop use, and finished stock —
+  pieces made ahead for a shop, which fill its orders automatically. The Inventory & COGS report and
+  the year-end export show each group, cost of goods by source and write-offs by reason.
+- Accounts & money lists every blank and transfer-sheet purchase of the year, with its receipt.
+- A "blanks to order" list by supplier, with reorder points and each vendor's free-shipping amount ("Get
+  me to free shipping") and brand rules (restricted brands, the supplier's logo approval); CSV import for blanks and products; vendor-invoice PDF import.
+- Blanks straight from a vendor: import complete blanks (colors, sizes, prices, photos) from SanMar's or
+  S&S's product files, or live through PromoStandards; vendor prices kept apart from the average cost,
+  with history and a 30-day reminder to check them; prices by color group (heathers, white); the
+  vendor's minimum advertised price (MAP) read from its files and enforced on product prices; ordering
+  blanks from a supplier through PromoStandards, with its shipment notices tracked.
+- Embroidery files in any format, with previews of Tajima .dst and Barudan .dsb.
+- Pricing awareness: under each price, what an item costs (blank, card fee, tax, transfers, supplies) and
+  what it leaves, the hourly rate from its run time, and targets that flag products priced too low.
+- Products that are embroidered and printed (fixed DTF transfers in the price), and mockups for any
+  product, configurable or not.
 - Expenses with receipts and tax categories, accounts and transfers, bank-statement import and
   reconciliation, closed months, and a year-end export for an accountant.
+- An account viewer: one account's register with a running balance and a receipt on every row. A stock
+  purchase shows as one charge, as on the statement, and its paying account can be changed for the whole
+  receipt at once.
 - Sales tax: one rate and home state, prices that include tax or tax added at checkout, exempt shops,
   and a sales-tax report.
 
@@ -76,7 +104,7 @@ and the tax and shipping features are built around a US business (see [Region](#
 ## Quickstart
 
 ```bash
-git clone <this repository> && cd OpenDecoDesk
+git clone <this repository> && cd opendecodesk
 npm ci
 npx wrangler login
 npm run setup -- --dry-run     # see what it would do — changes nothing
@@ -109,7 +137,8 @@ README deliberately doesn't repeat numbers that change.
 
 ## Talking to embroidery machines
 
-Sending designs to a machine, listing its files and finding machines on the network are done by a small
+Sending designs to a machine, listing its files, copying files off it (Machine Files → Download, saved as
+.DSB, several as a .zip) and finding machines on the network are done by a small
 program that runs on a computer in the shop — the **send-agent**. It is a separate project (machine
 protocols differ by maker, and are kept out of this repository), and it has not been published yet; this
 code only contains the admin screens and the relay that talk to it. Everything else works without it.
@@ -129,12 +158,13 @@ change is written to the audit log.
   is hidden: orders are entered there (Local sale), payment links and design proofs you email still work,
   and Publish, a shop's "ready" box and custom-domain setup keep working for when it is turned back on.
 - **Production** — embroidery production: Threads (and needle settings), Hoops, Designs and their stitch
-  files, Machines, Machine Files, Run Order, Abort reasons, the Run Times report and the send-agent relay.
+  files, Machines, Machine maintenance, Machine Files, Run Order, Abort reasons, the Run Times report and
+  the send-agent relay.
   Off: orders are still moved through their stages by hand on the Orders page — including Mark
   manufactured, which uses up the blanks — no digitizing step or order-design upload is asked for, and the
   catalog health check stops flagging missing designs, hoops and stitch files.
 - **Bookkeeping** — Expenses and receipts, Accounts & money (other income, owner money, transfers),
-  Reconcile, and Periods & Export (closing months, the accountant export). Off: the payments ledger on
+  Reconcile, the Account viewer, and Periods & Export (closing months, the accountant export). Off: the payments ledger on
   orders, the Revenue and Sales Tax reports and Stripe fee tracking stay. No month can be closed or
   reopened, but **months closed earlier stay locked**. Receiving blanks or a transfer sheet no longer asks
   what it was paid from, and can't record an R&D, written-off or personal part (those are an expense or an

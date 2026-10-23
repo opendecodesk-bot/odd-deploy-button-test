@@ -12,7 +12,7 @@
 // Browser side — admin subdomain + requireAdmin, exactly like every other admin endpoint:
 //   POST ?op=status body {hot?}  → {status, online, lastSeenSec, agentIp}   hot:true = a machine
 //        screen is open, so the agent polls fast for the next 5 minutes.
-//   POST ?op=submit body {type: discover|list|send|delete, machineIp, remoteDir, fileKey, fileName}
+//   POST ?op=submit body {type: discover|list|send|read|delete, machineIp, remoteDir, fileKey, fileName}
 //        → {status, id}   refused at once ("agent offline") when no agent has polled lately.
 //   POST ?op=result body {id}    → {status, done, result?}   read once.
 //
@@ -27,9 +27,11 @@ import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
 import { openRelay, IDLE_POLL_SEC, HOT_POLL_SEC } from "../_lib/agentRelay.js";
 import { signedDesignPath, DESIGN_KEY_RE } from "./design.js";
 
-const JOB_TYPES = new Set(["discover", "list", "send", "delete"]);
+const JOB_TYPES = new Set(["discover", "list", "send", "read", "delete"]);
 const ID_RE = /^[0-9a-f]{24}$/;
-const MAX_RESULT_BYTES = 64 * 1024;
+// A read job's answer carries the file (base64), so results can be big: 1.5 MB fits a design of ~1.1 MB and stays
+// under a Durable Object's 2 MB value limit. The agent refuses a bigger read itself, with a plain message.
+const MAX_RESULT_BYTES = 1_500_000;
 const AGENT_AUTH_BUCKET = "agent_auth";
 const AGENT_AUTH_LIMIT = 10;
 const MIN_TOKEN_LENGTH = 32;
@@ -55,6 +57,13 @@ function cleanJob(body){
   if(type === "send"){
     if(!DESIGN_KEY_RE.test(String(body.fileKey || ""))) return { error: "Invalid file reference." };
     job.fileKey = String(body.fileKey);
+  }
+  if(type === "read"){
+    // The name exactly as the machine lists it ("LOGO.012", even "马头机~1.008"): only control characters and
+    // path separators are dropped — the machine looks the file up by that exact string.
+    const name = String(body.fileName || "").replace(/[\u0000-\u001f\u007f\/\\]/g, "").trim().slice(0, 160);
+    if(!name) return { error: "Missing file name." };
+    job.fileName = name;
   }
   if(type === "send" || type === "delete"){
     const name = String(body.fileName || "").replace(/[^\w .()-]/g, "").trim().slice(0, 120);

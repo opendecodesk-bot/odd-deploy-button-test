@@ -41,35 +41,45 @@ refused — delete the old record in the Cloudflare dashboard first.
 
 ## Adding a shop
 
-In the admin: **Manage catalog → + New Org**.
+In the admin: **Manage catalog → ＋ New shop setup** (managers). A guided setup asks one question per
+screen, with the steps down the side, and saves as it goes, so you can stop and resume (**Resume shop
+setup**):
 
-1. Fill in the shop's **id** (permanent, used internally), its **subdomain**, its name and
-   description, an accent color, and optionally its pictures, order deadline, delivery options,
-   payment methods and tax exemption. The subdomain is one word: letters, numbers and inner
-   hyphens. `www`, `api`, `images` and your admin subdomain can't be used.
-2. **Products** → **+ New Product** for each item, or **Import CSV**.
-3. Tick **ready** on the shop when it should start taking orders. A shop that isn't ready shows a
-   "not open yet" page and refuses orders.
-4. **Publish** (below).
-5. Attach the shop's hostname (below).
+1. **Your shop:** its name — the shop ID and web address follow it — then decoration, delivery,
+   payment, an order deadline and the shop's look. The web address is one word of lowercase letters
+   and numbers; `www`, `api`, `images`, `mail`, `admin`, `all` and your own admin subdomain can't be
+   used, nor one another shop has.
+2. **Products:** pick blanks (or ＋ Enter a blank), then for each product its colors, decoration,
+   designs, sizes and prices, and name and details.
+3. **Check everything**, then **Go live** — the shop is ready and published.
+
+Every catalog screen has the **shop bar** at the top: ← Manage catalog, the shop picker, Shop setup,
+Shop settings (the shop's own form), Products, Designs and Graphics, and Publish. Products can also be
+added later with **+ New Product**, **Import CSV** or **Copy from another shop…**. Attach the shop's
+hostname (below).
 
 Nothing here needs a code change. Attaching the hostname needs one `npm run deploy`, unless
 automatic hostnames are set up.
 
 ## Publish
 
-The storefront reads shops and products through a cache, so a page view doesn't cost a database
-read. **Publish** (Manage catalog → Publish) tells every part of the site to use the current
-database contents from now on.
+Each shop is published on its own. What shoppers see — and what orders are priced from — is the shop
+as it was when it was last published: its settings and its products' rows (names, prices, sizes,
+visibility, pictures). Edits in the admin are a **draft** until you press **Publish** for that shop
+(Manage catalog or the shop's Products page, managers), or **Publish all shops**. A shop that has
+never been published since this arrived is served live, as before.
 
-- **Shops, products, prices, pictures and the payment-method switches** reach the storefront when
-  you Publish.
-- **Orders are always priced from the database**, published or not: a price you changed is what
-  the next order is charged, and a product you hid can't be ordered, even from a page that still
-  shows the old catalog.
-- **These don't need Publish** — they refresh the cache themselves when saved: the business
-  profile, Region, Sales tax and the Feature switches.
-- As a safety net the cache also expires by itself after a few minutes.
+- **Unpublished changes** are marked on Manage catalog and the Products page, product by product.
+  **Discard changes…** on the shop bar (managers) puts the shop back to what was last published: its
+  settings and products as they were, and a product added since removed (or hidden, if an order, a
+  stock movement, an approval or a customer's upload already refers to it).
+- **Preview** opens the shop's page with the draft, on the shop's own address, through a link signed
+  with `SIGNING_SECRET` that works for an hour. Ordering is off in a preview.
+- **Graphics, transfers, decoration locations, blank links and tier prices aren't part of the
+  snapshot** — they apply as soon as they're saved.
+- **These don't need Publish either**: the business profile, Region, Sales tax and the Feature
+  switches.
+- A product can't be saved without a price, and a new product starts hidden.
 
 ## Attaching a shop's hostname
 
@@ -128,6 +138,8 @@ routes = [
 With **Global settings → Features → Storefront** off, every shop address and the root domain show
 "Online ordering isn't available here." and the server takes no customer orders. Shops, products,
 "ready", Publish and hostnames all still work in the admin, ready for when it is turned back on.
+An invoice you've sent (below) still works: its link opens card payment and shipping rates for
+that one order.
 
 ## A shop's own settings
 
@@ -142,12 +154,242 @@ Manage catalog → the shop → **Edit**:
 - **Sales tax** — tax exemption (see [sales-tax.md](sales-tax.md)).
 - **Reorder QR code & option prices** — for configurable products.
 
+## Product categories
+
+A product's category (Tools → **Product categories**) decides which section of the shop's page it is
+listed under, in the order set there, and what it packs like when a box is chosen for shipping (a
+shirt, a sweatshirt, a cap, or "other" — no automatic box, the shipping is quoted by hand). The list
+starts with Shirt, Sweatshirt, Cap, T Shirt, Hoodie, Patch and Other, and is yours to change. A category
+in use by a product or a blank can't be deleted. Whether a product has sizes doesn't depend on its
+category: it follows the product's pricing (by size, or one flat price).
+
+On Manage catalog → the shop → **Products** the list is drawn the way the shop's page is, a section per
+category, and ↑ ↓ move a product within its section (Publish to show the new order). On a configurable
+product, the colors offered can be put in order too (↑ ↓ / First under the color boxes): that is the
+order customers see the swatches in, and the first one is shown when the product opens.
+
+## Versions of a product
+
+A shirt sold in short and long sleeve is two products shown as **one card** on the shop page, with a
+toggle between them. On the product form, **Versions** → **Add a version (e.g. long sleeve)…** makes
+the second one: a new product, hidden until you tick Visible, with the first one's shared settings
+(name, description, category, features, personalization, the customer's own design, No blank needed,
+configurable locations, designs). Each version keeps its own sizes and prices, weight, colors,
+pictures, overlay mockups and blank links, so give the new one its own blank. **Copy settings** brings
+the shared settings across again after you change them on the other version; **Separate** makes them
+two ordinary products.
+
+Order lines are named with the version — "Club Tee (Long sleeve)". Both versions must be in the same
+category (the card sits in one section); the catalog check warns when they aren't. The Products list
+keeps them together, the second one indented.
+
+## Copying products from another shop
+
+Manage catalog → the shop → Products → **Copy from another shop…**: pick the shop, tick its products,
+and set each copy's ID, name, subtitle, category, version name and whether it's visible. A copy takes
+the product's prices and sizes, weight, features, personalization, colors, locations (with their upload
+prices), settings and blank links, and its pictures if you tick that. It never takes overlay mockups or
+ready-to-ship stock. Graphics and designs belong to a shop: each one is matched to this shop's graphic
+or design of the same name, or left out, and the result lists which — except a **global** graphic or
+design, which every shop can use, so the copy keeps it. Versions of a product are copied together. Nothing is copied unless every copy is valid. A new shop's "copy products from" does the
+same.
+
+## Global graphics
+
+A graphic can be made **Global** (the graphic form's Global box): every shop can offer it, and it's kept
+in one place with its home shop, like a global design. A global graphic can only link a global design
+and a transfer open to every shop, and it can't be made shop-only again while another shop's products
+use it. The Graphics list shows them under "🌐 Global — every shop", and graphic pickers mark them 🌐.
+
 ## Products without a blank
 
 Linking a product to a blank (Blank links on the product) is optional. Without one the product
 saves and sells as usual; the catalog check marks it in amber, because its stock and cost of goods
 aren't tracked. A configurable product's colors normally come from the blanks ticked for it — with
 no blank, type the colors in by name instead.
+
+A product that is made with **no blank at all** — a patch cut from twill on hand — gets **No blank
+needed** on the product form. Its order lines then skip Blank ordered / received, go to Run Order once
+paid (and the design is ready), stay off Blanks to Order, and the catalog check stops asking for a
+blank link. Record its materials under Expenses as supplies.
+
+## Blanks from stock
+
+Blanks come out of stock when an order's pieces are made, not when they're received. An order whose
+blanks are already on the shelf shows **In stock** on Run Order's "Paid, not yet run" list, with **Use
+from stock**; on the Orders page the stage menu has **Use blanks from stock**. Either marks the order's
+blanks ordered and received from "In stock" in one go. Stock is offered to orders soonest due first,
+and only when it covers the whole order; otherwise you're told what's short, and nothing changes.
+
+The Blanks screen shows, next to what's on hand, how many are **set aside**: promised to orders whose
+blanks are in but not made yet. The shop page and the Products list show how many of a product's blank
+are on the shelf for the color and size picked ("N ready to decorate") — what's on hand less what's set
+aside. It's only a count: nothing is held for the customer. Finished stock ("N in stock") is shown
+instead when there is some.
+
+**Run Transfer Sheets** knows what's on the shelf too: a line whose transfers were already used, were
+marked received, or are covered by transfer stock is ready to press, and the card says which (or what's
+short). Stock is shared out soonest due first, and the gang sheet counts only what still has to be
+printed. An order that has shipped, been delivered or been completed drops off the run pages and stops
+holding blanks, even if it was never marked made. Blanks are received with **Receive order** (or Import from PDF), so
+every receipt is against a vendor order.
+
+## Blanks from vendors, and their prices
+
+**Vendor prices** are kept apart from what your stock cost. On a blank's form each color and size has a
+**Vendor price** (what the vendor charges now) beside a read-only average cost (what what's on the shelf
+cost, landed). Typing a new vendor price never rewrites the average. **Same for all colors**, **Prices
+are current**, **Price history…** and **Re-work average cost** are there too. When a vendor price
+changes, every product priced on that blank is flagged (the catalog check, and on the product) until
+you update its prices or click **Prices still OK**. Every 30 days the morning roll-up and Communications
+list the blanks on products for sale whose prices haven't been checked.
+
+**Blanks from a vendor's file:** Blanks → **+ New blank from vendor file…** (or **Update prices from
+vendor file…**) reads SanMar's product file (SDL CSV) or S&S's Data Library (Products + Styles .xlsx).
+Pick the styles; each comes up for review — colors, sizes, prices per color, description, features and
+photos (from a folder of the vendor's images on your computer, or downloaded from the vendor) — and
+nothing changes until **Create / apply**. An update only takes what you tick, and never touches stock
+or average cost. On a product, **Copy from blank** brings in the blank's description and features.
+
+**Live from a vendor (PromoStandards):** Tools → **Vendor integrations** (admins) connects suppliers
+that offer PromoStandards web services, with a login the vendor gives you, stored encrypted (it needs
+the `VENDOR_CREDENTIALS_KEY` secret — see [accounts-and-keys.md](accounts-and-keys.md)). Then **Refresh
+from vendor** on Blanks, and **New blank from a connected vendor**, bring live data into the same review.
+A blank made or updated from a connection stays linked to it.
+
+**Ordering blanks from a supplier** (admins): on Blanks to Order, a supplier whose connection offers
+PromoStandards Purchase Order gets **Order from <supplier>…**. The window checks each line's part and
+the supplier's stock, then places the order, shipped to your ship-from address (Global settings →
+Ship-from), and marks the order lines "blanks ordered" with the PO number. PO numbers start with the
+Business profile's **Purchase order prefix** (blank = `PO`), then the date. The supplier's shipment
+notices become blank shipments — in the morning roll-up and on **Check shipments** — and **Receive…**
+fills in Receive order. A line whose blank isn't linked to a connection is named under the table.
+Suppliers turn ordering on separately (SanMar after a test order on its test service), and it charges
+the payment method the supplier has on file for you — S&S needs an **integration payment method** (card
+or bank) in your S&S account settings first. **A supplier's test service isn't a promise**: one has
+placed a real order. On a test connection the PO number starts `TEST-` and the order says "TEST ORDER —
+DO NOT PROCESS OR SHIP", but a supplier's system may ignore both, so check with the supplier. **Mark
+cancelled…** records an order you cancelled with the supplier (it doesn't contact them): its lines that
+haven't shipped or arrived go back on Blanks to Order, and its shipments stop being checked.
+
+**Brand rules:** some brands may only be resold on the supplier's terms — most only decorated, and a
+large order (100 pieces of one style by default) only after the supplier approves the logo. Tools →
+**Brand rules** (managers read it, admins change it) starts with the brands SanMar and S&S publish as
+restricted — verify each with the supplier you buy it from — and per brand sets the large quantity,
+whether it must be decorated (with categories that may be sold plain), whether a large order needs
+approval, a note, and the logo concerns. A product on such a brand is flagged by the catalog check, an
+order with a large quantity of one style gets a **Supplier review** pill, and Blanks to Order marks it.
+**Price rule:** Brand rules also sets a price over MAP — dollars or percent, generally and per brand.
+The setup wizard and the product form's **Work out the prices from the blank's cost or MAP…** start a
+blank with a MAP at that price, and a price under the rule (but not under MAP) is a warning on the
+Pricing panel, Price analysis, the Products list and the catalog check. **Show price impact…** lists
+every product price on a blank with a MAP, in every shop — before, after the rule, and the change — and
+a manager can apply the ticked prices (then Publish each shop).
+A manager records the supplier's approval on the product's form, with the supplier's reply attached;
+**Order from <supplier>…** refuses a large quantity without one unless an admin gives a reason
+(audited).
+
+**Reorder points and free shipping:** a supplier charges marked-up freight on a small order, so keep
+the blanks you sell most in stock and top each order up to the free-shipping amount. The blank form's
+**Keep** column is a reorder point per color and size ("keep at least N" not set aside); Blanks shows
+a chip and a **Below reorder point** filter, and Blanks to Order adds the restock under each row's
+count, with an **Include restock** box — change a row's restock or leave it out (✕), and ↺ puts the
+suggestion back. Restock you've already ordered (from the Order window, or **Mark as ordered**) isn't
+suggested again until it arrives. Each vendor's free shipping — a dollar amount or a piece count — is
+set on its Blanks to Order block or in Global settings → **Vendor free shipping**; SanMar and S&S
+start at their published $200. **Get me to free shipping** fills an order up to it: reorder
+shortfalls first, then your best sellers (by the last 90 and 365 days), plus anything you add — then
+Copy / CSV, Mark as ordered, or continue to the Order window.
+
+**MAP (minimum advertised price):** S&S's files (`MAPPrice`; $0.01 means none) and SanMar's
+(`MAP_PRICING`) carry each size's MAP, and it can be typed on the blank's form. A product's price for a
+size can't be below the MAP of the blank sizes it's linked to (the highest across a color group's
+colors): saving such a price is refused, and so is a link that would cause it. A product left below a
+MAP that rose later is a catalog error, flagged in Price analysis, on the Products list (**⚠ Below
+MAP**) and in the morning roll-up. PromoStandards has no MAP, so a refresh from it leaves MAP alone.
+MAP is the vendor's public price, so staff see these warnings too.
+
+**Color price groups:** a configurable product's colors can be grouped, each group with its own price
+per size — heathers dearer, white cheaper (the product form's **Color price groups**, with **Suggest
+from blank prices**). A color in no group keeps the product's own price.
+
+**Weights:** each color and size of a blank can have a weight (the blank form's Weight column, filled
+in from S&S's and SanMar's product files and from PromoStandards). Shipping quotes and package
+weights use it for every product linked to that size; a weight typed on the product overrides it.
+
+**Importing a vendor's invoice PDF:** a line for a color or size the blank doesn't have yet is added to
+the blank (nothing in stock, no cost) instead of being left out.
+
+**Embroidery files** in any format are accepted as a design's files; a known stitch format can't be the
+editable design file and a known project format can't be the machine file. Tajima `.dst` and Barudan
+`.dsb` files get needle stops and previews.
+
+## Pricing: what an item costs and leaves
+
+Managers see, on a product's form, what each item costs the shop under its price and what's left:
+the blank (its vendor price, else the average cost), the card fee, sales tax, transfers (the reorder QR,
+printed transfers and the product's own **DTF / transfer cost per item**) and **Shop supplies per
+item**. Give it a **Run time** and it shows the hourly rate too (or the average of its timed runs on
+Run Order). When sales tax is added on top of your prices, the tax isn't a cost; the card fee is then
+on the price plus the tax.
+
+Global settings → **Pricing** sets the card fee, the default supplies cost and two optional targets —
+**Target income per item** and **Target effective hourly rate**. Meeting either target is enough: a price
+is below target only when it misses every one that applies (the hourly one needs a run time). Such a product is flagged
+on its form, on the Products list, in **Price analysis** (on Manage catalog and the Products list) and
+by the catalog check, and the morning roll-up lists products that slip below one (a blank's cost, a fee
+or a target changed). Staff can edit products but don't see costs and margins.
+
+## Printed transfers and mockups
+
+A product can carry **Printed transfers (DTF)** at fixed locations — a crest on the back of an
+embroidered shirt. They're part of its price; the customer doesn't choose them. Every order line gets
+them, so Run Transfer Sheets, transfer stock and cost of goods handle them like the reorder QR.
+
+Mockups work for any product, not only configurable ones: the product form has a mockup table per
+location, with the graphics offered there and its printed transfers. A plain product's embroidery comes
+from its designs, which have no location, so **Embroidered graphics (for mockups)** names the
+embroidery graphic to picture at each location — for pictures only, never the order or the price.
+
+## Finished stock
+
+Pieces made ahead — a shop's caps already embroidered and on the shelf — are **finished stock**. On
+Manage catalog → the shop → Products, a product's **Stock** button opens its stock window:
+
+- **Make for stock** takes the linked blanks out of blank stock at their cost and adds the finished
+  pieces at that cost. It isn't cost of goods yet; that's counted when a piece is sold.
+- **Correct count** sets the number on hand after a count. A product made with no blank (a patch) has
+  no blanks to take out, so its count is entered this way.
+- **History** lists every change, and each can be voided (a Make for stock entry puts its blanks back).
+  Entries in a closed month can't be changed.
+
+An order from the shop page, or a local sale, for a size that's in stock is **filled from stock**
+automatically: it skips the blank, design and making steps, and the order lines say "From stock". The
+pieces are set aside until the order is marked made (a local sale is handed over, so at once), then
+leave stock with their cost. Cancelling or voiding before it ships puts them back, and two orders can't
+both get the last piece. A product with color and graphic choices, a personalized line, or one with
+the customer's own design is always made, never taken from stock. Each version of a product has its
+own stock.
+
+Blanks bought for testing or shop use are marked **For testing / shop use** on the blank (TESTING on
+the Blanks screen); they're used up with Write off → testing. Every write-off records why: testing,
+damaged, lost or other. Reports → **Inventory & COGS** shows the three groups — blanks for sale, blanks
+for testing, finished stock — with cost of goods split into blanks used on orders and finished stock
+sold, write-offs by reason, and a roll-forward that says whether it adds up. Periods & Export's
+year-end files carry the same figures, with an "Inventory by group" file.
+
+## Invoices
+
+Orders → **Send invoice…** (on any order that still owes), or "Email the customer an invoice" on the
+Local sale form, emails the customer a link to an invoice page on the shop's own address. On it they
+see the lines and what's owed, choose how they'll get the order — the shop's pickup and delivery
+options, or carrier rates for their address — and pay by card, or see how to pay by Venmo, Zelle or
+check (from Global settings → Business profile). Their delivery choice is written to the order: the fee
+comes from the shop's list or a signed carrier rate, never from the page, and the sales tax follows the
+address. "Shipping — cost to follow" is only offered when no box fits the order. The choice can't be
+changed once the order is paid, shipped or in a closed month, or when the invoice was sent with the
+delivery fixed. Sending again keeps the same link and renews it for 60 days; the customer's choice is
+in the morning roll-up.
 
 ## Customers' own designs
 

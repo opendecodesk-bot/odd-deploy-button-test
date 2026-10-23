@@ -196,7 +196,27 @@ function makeDesignsBucket(){
   console.log("nothing stored across any of these rejections:", env.DESIGNS._store.size === 0);
   res = await designApi.post(designCtx({ key: "proxy-pass", contentType: "application/octet-stream", qs: "?designId=9&role=machine&ext=exe&name=virus.exe", body: new ArrayBuffer(10) }, env));
   data = JSON.parse(await res.text());
-  console.log("an unrecognized extension is rejected regardless of role:", res.status === 400 && env.DESIGNS._store.size === 0);
+  console.log("a non-embroidery extension (.exe) is rejected regardless of role:", res.status === 400 && /isn't an embroidery file/.test(data.message) && env.DESIGNS._store.size === 0);
+  for (const [role, ext] of [["design", "html"], ["machine", "svg"], ["machine", "png"], ["design", "pdf"], ["machine", "js"], ["machine", ""]]) {
+    res = await designApi.post(designCtx({ key: "proxy-pass", contentType: "application/octet-stream", qs: `?designId=9&role=${role}&ext=${ext}&name=x.${ext}`, body: new ArrayBuffer(10) }, env));
+    if (res.status !== 400) console.log(`.${ext} as role=${role} should be refused: false`);
+  }
+  console.log("web pages, scripts, images, PDFs and a missing extension are refused as design/machine files:", env.DESIGNS._store.size === 0);
+
+  console.log("\n=== functions/api/design.js: any other embroidery format is accepted (2026-10) ===");
+  env = { PROXY_ADMIN_PASSPHRASE: "proxy-pass", DESIGNS: makeDesignsBucket() };
+  const okUp = async (qs, contentType = "application/octet-stream") => JSON.parse(await (await designApi.post(designCtx({ key: "proxy-pass", contentType, qs, body: new ArrayBuffer(10) }, env))).text());
+  let up = await okUp("?designId=9&role=machine&ext=pes&name=logo.pes");
+  console.log("a Brother .pes machine file is accepted:", up.status === "ok" && /\.pes$/.test(up.key));
+  up = await okUp("?designId=9&role=machine&ext=zz9&name=logo.zz9");
+  console.log("an extension we've never heard of is accepted as a machine file:", up.status === "ok" && /\.zz9$/.test(up.key));
+  up = await okUp("?designId=9&role=design&ext=bx&name=logo.bx");
+  console.log("…and as a design file (another brand's project format):", up.status === "ok" && /\.bx$/.test(up.key));
+  up = await okUp("?itemId=5&ext=jef&name=name.jef");
+  console.log("a line-item upload takes any embroidery format too:", up.status === "ok" && /^order-files\/5\//.test(up.key));
+  up = await okUp("?designId=9&role=machine&ext=hus&name=logo.hus", "text/html");
+  const stored = env.DESIGNS._store.get(up.key);
+  console.log("a non-image upload is always stored as application/octet-stream, whatever Content-Type was sent:", up.status === "ok" && stored && stored.httpMetadata.contentType === "application/octet-stream");
 
   console.log("\n=== functions/api/design.js: order-item upload accepts an image too, WITH magic-byte check ===");
   env = { PROXY_ADMIN_PASSPHRASE: "proxy-pass", DESIGNS: makeDesignsBucket() };

@@ -111,8 +111,9 @@ class AdminResourceLoader extends ResourceLoader {
     window.alert = () => { alertCalled = true; };
     window.document.getElementById("custName").value = ""; // trigger the "add your name" validation path
     await window.placeOrder("league-101");
-    console.log("Validation error used showToast, not alert():", alertCalled === false);
-    const lastToast = window.document.querySelectorAll("#toastRegion .toast");
-    console.log("Toast shown instead:", lastToast[lastToast.length - 1].textContent.includes("add your name"));
+    console.log("Validation error didn't use alert():", alertCalled === false);
+    // Shown next to the order form (a persistent, role=alert box), not a pop-up or a vanishing toast.
+    const msg = window.document.getElementById("checkoutMsg");
+    console.log("Message shown in the order form instead:", !!msg && !msg.hidden && msg.textContent.includes("add your name") && msg.getAttribute("role") === "alert");
   }
 })();

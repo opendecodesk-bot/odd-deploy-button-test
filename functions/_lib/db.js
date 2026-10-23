@@ -330,6 +330,160 @@ export async function getOrgById(db, orgId) {
   return row ? parseOrg_(row) : null;
 }
 
+// ---- Publish per shop (migrations/0076) --------------------------------------------------------
+// A shop's published catalog is its orgs row + products rows as they were when it was last published. Shoppers see
+// it and orders are priced from it; admin edits are a draft until the shop is published again. A shop that has
+// never been published since this (no snapshot) is served live, as before. Graphics, transfers, locations, blank
+// links and tier prices aren't part of the snapshot — they stay live.
+async function liveShopRows_(db, orgId) {
+  const org = await db.prepare("SELECT * FROM orgs WHERE orgId=?").bind(orgId).first();
+  if (!org) return null;
+  const { results: products } = await db.prepare("SELECT * FROM products WHERE orgId=? ORDER BY productId").bind(orgId).all();
+  return { org, products };
+}
+export async function getCatalogSnapshot(db, orgId) {
+  let r = null;
+  try { r = await db.prepare("SELECT json, publishedAt, publishedBy FROM catalog_snapshots WHERE orgId=?").bind(orgId).first(); } catch (e) { return null; }   // before 0076
+  if (!r) return null;
+  const rows = tryParse_(r.json, null);
+  return rows && rows.org ? { ...rows, publishedAt: r.publishedAt, publishedBy: r.publishedBy || "" } : null;
+}
+// The rows shoppers get: the snapshot, else the live rows (never published).
+export async function publishedShopRows_(db, orgId) {
+  return (await getCatalogSnapshot(db, orgId)) || (await liveShopRows_(db, orgId));
+}
+export async function publishShop(db, orgId, by = "") {
+  const rows = await liveShopRows_(db, orgId);
+  if (!rows) return null;
+  const at = new Date().toISOString();
+  await db.prepare("INSERT INTO catalog_snapshots (orgId, json, publishedAt, publishedBy) VALUES (?, ?, ?, ?) ON CONFLICT(orgId) DO UPDATE SET json=excluded.json, publishedAt=excluded.publishedAt, publishedBy=excluded.publishedBy")
+    .bind(orgId, JSON.stringify(rows), at, String(by || "").slice(0, 200)).run();
+  return { publishedAt: at, products: rows.products.length };
+}
+// Discard unpublished changes: put the shop's settings and products back to the published snapshot. A product added
+// since it was published is deleted with its blank links, designs and mockups — unless something already refers to it
+// (an order line, finished stock, a brand approval, a customer's upload), then it's hidden instead. Graphics, transfers,
+// locations, blank links and tier prices aren't in the snapshot (they're live), so they aren't touched.
+// planDiscardShopChanges says what would happen; discardShopChanges does it. null = never published.
+const PRODUCT_HISTORY_TABLES_ = ["order_items", "finished_goods_movements", "brand_approvals", "customer_design_uploads"];
+export async function planDiscardShopChanges(db, orgId) {
+  const snap = await getCatalogSnapshot(db, orgId);
+  if (!snap) return null;
+  const live = await liveShopRows_(db, orgId);
+  if (!live) return null;
+  const skip = new Set(["updatedAt"]);
+  const diff = (a, b) => [...new Set([...Object.keys(a), ...Object.keys(b)])].filter(k => !skip.has(k) && JSON.stringify(a[k] ?? null) !== JSON.stringify(b[k] ?? null));
+  const pubBy = new Map(snap.products.map(p => [p.productId, p]));
+  const restore = [], added = [], missing = [];
+  for (const p of live.products) {
+    const was = pubBy.get(p.productId);
+    if (!was) {
+      let history = false;
+      for (const t of PRODUCT_HISTORY_TABLES_) {
+        const r = await db.prepare(`SELECT 1 FROM ${t} WHERE orgId=? AND productId=? LIMIT 1`).bind(orgId, p.productId).first().catch(() => null);
+        if (r) { history = true; break; }
+      }
+      added.push({ productId: p.productId, name: p.name || p.productId, history });
+    } else if (JSON.stringify(Object.keys(p).sort().map(k => [k, p[k]])) !== JSON.stringify(Object.keys(was).sort().map(k => [k, was[k]]))) {
+      restore.push({ productId: p.productId, name: was.name || p.productId, fields: diff(was, p) });
+    }
+  }
+  const liveIds = new Set(live.products.map(p => p.productId));
+  for (const p of snap.products) if (!liveIds.has(p.productId)) missing.push({ productId: p.productId, name: p.name || p.productId });
+  const shopFields = diff(snap.org, live.org);
+  const shopChanged = JSON.stringify(Object.keys(snap.org).sort().map(k => [k, snap.org[k]])) !== JSON.stringify(Object.keys(live.org).sort().map(k => [k, live.org[k]]));
+  return { orgId, publishedAt: snap.publishedAt, publishedBy: snap.publishedBy, shopChanged, shopFields, restore, added, missing,
+    anything: shopChanged || restore.length > 0 || added.length > 0 || missing.length > 0, snap, live };
+}
+export async function discardShopChanges(db, orgId) {
+  const plan = await planDiscardShopChanges(db, orgId);
+  if (!plan) return null;
+  const cols = async (table) => new Set(((await db.prepare(`PRAGMA table_info(${table})`).all()).results || []).map(c => c.name));
+  const orgCols = await cols("orgs"), productCols = await cols("products");
+  const stmts = [];
+  if (plan.shopChanged) {
+    const ks = Object.keys(plan.snap.org).filter(k => k !== "orgId" && orgCols.has(k));
+    if (ks.length) stmts.push(db.prepare(`UPDATE orgs SET ${ks.map(k => `"${k}"=?`).join(", ")} WHERE orgId=?`).bind(...ks.map(k => plan.snap.org[k]), orgId));
+  }
+  const pubBy = new Map(plan.snap.products.map(p => [p.productId, p]));
+  for (const r of plan.restore) {
+    const was = pubBy.get(r.productId), ks = Object.keys(was).filter(k => k !== "orgId" && k !== "productId" && productCols.has(k));
+    stmts.push(db.prepare(`UPDATE products SET ${ks.map(k => `"${k}"=?`).join(", ")} WHERE orgId=? AND productId=?`).bind(...ks.map(k => was[k]), orgId, r.productId));
+  }
+  for (const m of plan.missing) {
+    const was = pubBy.get(m.productId), ks = Object.keys(was).filter(k => productCols.has(k));
+    stmts.push(db.prepare(`INSERT INTO products (${ks.map(k => `"${k}"`).join(", ")}) VALUES (${ks.map(() => "?").join(", ")})`).bind(...ks.map(k => was[k])));
+  }
+  const deleted = [], hidden = [];
+  for (const a of plan.added) {
+    if (a.history) { stmts.push(db.prepare("UPDATE products SET visible=0 WHERE orgId=? AND productId=?").bind(orgId, a.productId)); hidden.push(a); continue; }
+    for (const t of ["product_blank_links", "product_designs", "product_graphic_images", "ready_to_ship"]) stmts.push(db.prepare(`DELETE FROM ${t} WHERE orgId=? AND productId=?`).bind(orgId, a.productId));
+    stmts.push(db.prepare("DELETE FROM products WHERE orgId=? AND productId=?").bind(orgId, a.productId));
+    deleted.push(a);
+  }
+  if (stmts.length) await db.batch(stmts);
+  const removedRows = plan.live.products.filter(p => deleted.some(d => d.productId === p.productId));
+  return { restored: plan.restore.length, shopRestored: plan.shopChanged, reinserted: plan.missing.length, deleted, hidden, removedRows };
+}
+
+// The admin's link to preview a shop's unpublished draft: HMAC over the shop id and an expiry (1 hour), with the
+// install's signing secret under its own label. Only the admin mints one (getPreviewLink); catalog.js checks it.
+// (Plain functions returning promises, like the rest of this file's exports.)
+const PREVIEW_TOKEN_TTL_SECONDS_ = 60 * 60;
+function previewMac_(env, data) {
+  const secret = (env && (env.SIGNING_SECRET || env.LINK_SIGNING_SECRET || env.QUOTE_SIGNING_SECRET || env.STRIPE_SECRET_KEY)) || "";
+  if (!secret) return Promise.resolve(null);
+  const enc = new TextEncoder();
+  return crypto.subtle.importKey("raw", enc.encode("odd-catalog-preview-v1:" + secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+    .then(key => crypto.subtle.sign("HMAC", key, enc.encode(data)))
+    .then(sig => Array.from(new Uint8Array(sig), b => b.toString(16).padStart(2, "0")).join(""));
+}
+export function signPreviewToken(env, orgId) {
+  if (!orgId) return Promise.resolve(null);
+  const exp = Math.floor(Date.now() / 1000) + PREVIEW_TOKEN_TTL_SECONDS_;
+  return previewMac_(env, String(orgId) + "|" + exp).then(mac => mac ? exp + "." + mac : null);
+}
+export function verifyPreviewToken(env, orgId, token) {
+  const m = /^(\d{9,12})\.([0-9a-f]{64})$/.exec(typeof token === "string" ? token : "");
+  if (!orgId || !m || Number(m[1]) < Math.floor(Date.now() / 1000)) return Promise.resolve(false);
+  return previewMac_(env, String(orgId) + "|" + m[1]).then(expected => {
+    if (!expected) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ m[2].charCodeAt(i);
+    return diff === 0;
+  });
+}
+// The shop as shoppers see it (published orgs row), for order submission's checks (open, deadline, delivery fees).
+export async function getPublishedOrg(db, orgId) {
+  const rows = await publishedShopRows_(db, orgId).catch(() => null);
+  return rows && rows.org ? parseOrg_(rows.org) : null;
+}
+export async function publishedProductRow_(db, orgId, productId) {
+  const snap = await getCatalogSnapshot(db, orgId);
+  if (snap) return snap.products.find(p => p.productId === productId) || null;
+  return db.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first();
+}
+// Per shop: never published, published and current, or with unpublished changes (which products / shop settings).
+// A row "changed" when any stored value differs — updatedAt included, so saving with no change also counts.
+export async function getPublishState(db) {
+  const { results: orgs } = await db.prepare("SELECT orgId FROM orgs ORDER BY orgId").all();
+  const out = {};
+  for (const { orgId } of orgs) {
+    const snap = await getCatalogSnapshot(db, orgId);
+    if (!snap) { out[orgId] = { state: "never" }; continue; }
+    const live = await liveShopRows_(db, orgId);
+    const key = (r) => JSON.stringify(Object.keys(r).sort().map(k => [k, r[k]]));
+    const pubBy = new Map(snap.products.map(p => [p.productId, key(p)]));
+    const liveBy = new Map(live.products.map(p => [p.productId, key(p)]));
+    const changed = [];
+    for (const [id, k] of liveBy) if (pubBy.get(id) !== k) changed.push(id);
+    for (const id of pubBy.keys()) if (!liveBy.has(id)) changed.push(id);
+    const shopChanged = key(snap.org) !== key(live.org);
+    out[orgId] = { state: changed.length || shopChanged ? "changed" : "current", publishedAt: snap.publishedAt, publishedBy: snap.publishedBy, changedProducts: changed, shopChanged };
+  }
+  return out;
+}
+
 export async function createOrg(db, o) {
   const now = new Date().toISOString();
   await db.prepare(`INSERT INTO orgs
@@ -354,6 +508,12 @@ export async function createOrg(db, o) {
 export async function setOrgTaxExemption(db, orgId, { taxExempt, certificate, expires }) {
   await db.prepare("UPDATE orgs SET taxExempt=?, taxExemptCertificate=?, taxExemptExpires=?, updatedAt=? WHERE orgId=?")
     .bind(taxExempt ? 1 : 0, certificate || "", expires || null, new Date().toISOString(), orgId).run();
+}
+
+// Open or close a shop for orders without touching anything else on it (Shop setup → Go live). Like every shop
+// setting it reaches shoppers on the shop's next Publish.
+export async function setOrgReady(db, orgId, ready) {
+  await db.prepare("UPDATE orgs SET ready = ?, updatedAt = ? WHERE orgId = ?").bind(ready ? 1 : 0, new Date().toISOString(), orgId).run();
 }
 
 export async function updateOrg(db, orgId, o) {
@@ -457,6 +617,10 @@ export async function getProductsByOrg(db, orgId, visibleOnly = false) {
     ? "SELECT * FROM products WHERE orgId=? AND visible=1 ORDER BY sortOrder, productId"
     : "SELECT * FROM products WHERE orgId=? ORDER BY sortOrder, productId";
   const { results } = await db.prepare(sql).bind(orgId).all();
+  return productsFromRows_(db, orgId, results);
+}
+// Parsed products (+ their designs) from products rows — live, or a published snapshot's (migrations/0076).
+async function productsFromRows_(db, orgId, results) {
   const products = results.map(parseProduct_);
   // Each product's designs in run order (migrations/0032) — one query for the whole org.
   const byProduct = {};
@@ -469,7 +633,44 @@ export async function getProductsByOrg(db, orgId, visibleOnly = false) {
     p.designs = byProduct[p.productId] || [];
     if (p.customDesign) p.customDesignRequired = customDesignRequired(p);   // migrations/0054
   });
+  // Shipping weight (migrations/0077): the product's own weightOz is an override; otherwise its linked blank sizes'.
+  const weights = await getBlankWeights(db, orgId);
+  products.forEach(p => {
+    const w = weights[orgId + "|" + p.productId];
+    p.blankWeightOz = w ? w.max : null;
+    p.blankWeightBySize = w ? w.bySize : {};
+    p.shipWeightOz = productShipWeightOz(p);
+  });
   return products;
+}
+
+// Linked blank weights per product (migrations/0077): {"orgId|productId": {bySize: {size: oz}, max}} — a size's weight is
+// its heaviest linked color. orgId null = every shop. A database before 0076 answers {}.
+export async function getBlankWeights(db, orgId) {
+  const out = {};
+  try {
+    const { results } = await db.prepare(`SELECT l.orgId, l.productId, l.productSize, MAX(bs.weightOz) AS w
+      FROM product_blank_links l JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+      WHERE bs.weightOz IS NOT NULL ${orgId ? "AND l.orgId = ?" : ""} GROUP BY l.orgId, l.productId, l.productSize`).bind(...(orgId ? [orgId] : [])).all();
+    for (const r of results) {
+      const k = r.orgId + "|" + r.productId, w = Number(r.w);
+      if (!(w > 0)) continue;
+      const e = out[k] = out[k] || { bySize: {}, max: null };
+      e.bySize[r.productSize || "OSFA"] = w;
+      if (e.max == null || w > e.max) e.max = w;
+    }
+  } catch (e) { /* pre-0076 database */ }
+  return out;
+}
+// One piece's shipping weight in ounces: the product's own weight (an override), else its linked blank's for that size,
+// else the heaviest linked size; null = not known (callers fall back to their default).
+export function productShipWeightOz(p, size) {
+  if (!p) return null;
+  if (p.weightOz != null && Number(p.weightOz) > 0) return Number(p.weightOz);
+  const by = p.blankWeightBySize || {};
+  const z = size == null || size === "" ? "OSFA" : String(size);
+  if (by[z] > 0) return by[z];
+  return p.blankWeightOz > 0 ? p.blankWeightOz : null;
 }
 
 export async function createProduct(db, orgId, p) {
@@ -490,10 +691,193 @@ export async function createProduct(db, orgId, p) {
       now, now, p.taxable === false ? 0 : 1
     ).run();
   if (p.noDesignNeeded !== undefined) await setProductNoDesignNeeded_(db, orgId, p.productId, !!p.noDesignNeeded);
+  if (p.noBlankNeeded !== undefined) await setProductNoBlankNeeded_(db, orgId, p.productId, !!p.noBlankNeeded);
+  if (p.versionGroup !== undefined || p.versionLabel !== undefined) await setProductVersion(db, orgId, p.productId, { group: p.versionGroup, label: p.versionLabel });
   if (p.customDesign !== undefined) await setProductCustomDesign_(db, orgId, p.productId, p.customDesign, p.customDesignPrice);
   await setProductConfig_(db, orgId, p);
   if (p.personalizationMode !== undefined || p.personalizationOptionDesigns !== undefined || p.personalizationHoopId !== undefined)
     await setProductPersonalization(db, orgId, p.productId, { mode: p.personalizationMode, hoopId: p.personalizationHoopId, optionDesigns: p.personalizationOptionDesigns });
+  if (p.colorGroupsCents !== undefined) await setProductColorGroups_(db, orgId, p.productId, p.colorGroupsCents);
+  await setProductCosting_(db, orgId, p);
+}
+
+// The order a shop's products are listed in (admin → Products → ↑ ↓). `productIds` is EVERY product
+// of the shop, in the order wanted; anything else (a product added or removed in another tab since
+// the list was drawn) is refused rather than half-applied. Numbers go up in tens, so a product can
+// still be slotted between two others from its own form. Returns how many rows changed.
+export async function setProductOrder(db, orgId, productIds) {
+  const ids = (Array.isArray(productIds) ? productIds : []).map(String);
+  const { results } = await db.prepare("SELECT productId, sortOrder FROM products WHERE orgId=?").bind(orgId).all();
+  const have = new Map(results.map(r => [r.productId, Number(r.sortOrder) || 0]));
+  if (ids.length !== have.size || new Set(ids).size !== ids.length || ids.some(id => !have.has(id))) {
+    throw new Error("The product list changed since this page was loaded — reload it and try again");
+  }
+  const stmts = [];
+  ids.forEach((id, i) => {
+    const n = (i + 1) * 10;
+    if (have.get(id) !== n) stmts.push(db.prepare("UPDATE products SET sortOrder=? WHERE orgId=? AND productId=?").bind(n, orgId, id));
+  });
+  if (stmts.length) await db.batch(stmts);
+  return stmts.length;
+}
+
+// Copy products from one shop to another (admin → Products → Copy from another shop). `rows` say which
+// source products and what each copy is called: [{fromProductId, productId, name, sub, type,
+// versionLabel, visible}] — the caller has already checked the ids, names and categories. A copy takes
+// everything about the product — prices and sizes, weight, features, personalization, garment colors,
+// configurable locations, settings, blank links (blanks are shared by every shop) — and its photos only
+// when `copyImages`. Never its overlay mockups or its ready-to-ship stock. The source shop's own artwork
+// can't come along: a graphic or a (non-global) design is matched to THIS shop's one of the same name,
+// else left out, and each copy's `notes` say what was matched or left out. Versions of a product
+// (migrations/0059) are copied together or not at all and linked again under their new ids.
+// Throws a userFacing error (nothing written) for an unknown source product, an id this shop already
+// has or that's used twice, or a version whose other version isn't in the list.
+export async function copyProductsFromOrg(db, fromOrg, toOrg, rows, { copyImages = false } = {}) {
+  const src = new Map((await getProductsByOrg(db, fromOrg, false)).map(p => [p.productId, p]));
+  const mine = await getProductsByOrg(db, toOrg, false);
+  const taken = new Set(mine.map(p => p.productId));
+  const list = Array.isArray(rows) ? rows : [];
+  const seen = new Set();
+  for (const r of list) {
+    if (!src.has(r.fromProductId)) throw pricingError_(`“${r.fromProductId}” isn't a product of the shop you're copying from.`);
+    if (taken.has(r.productId)) throw pricingError_(`This shop already has a product with the id “${r.productId}” — give the copy another id.`);
+    if (seen.has(r.productId)) throw pricingError_(`The id “${r.productId}” is used for two copies — give each its own.`);
+    seen.add(r.productId);
+  }
+  const picked = new Set(list.map(r => r.fromProductId));
+  for (const r of list) {
+    const g = src.get(r.fromProductId).versionGroup;
+    if (!g) continue;
+    const missing = [...src.values()].filter(p => p.versionGroup === g && !picked.has(p.productId));
+    if (missing.length) throw pricingError_(`“${src.get(r.fromProductId).name}” comes in versions — copy ${missing.map(p => `“${p.versionLabel || p.productId}”`).join(" and ")} too.`);
+  }
+  // This shop's graphics and designs, by name, for the source's own artwork.
+  const key = (s) => String(s || "").trim().toLowerCase();
+  const myGraphics = new Map(), myDesigns = new Map(), designById = new Map();
+  for (const g of await listGraphics(db, toOrg)) if (g.orgId === toOrg && !myGraphics.has(g.kind + "|" + key(g.name))) myGraphics.set(g.kind + "|" + key(g.name), g);
+  for (const d of await listDesigns(db, toOrg)) if (d.orgId === toOrg && !myDesigns.has(key(d.name))) myDesigns.set(key(d.name), d);
+  for (const d of await listDesigns(db, fromOrg)) designById.set(Number(d.id), d);
+  const srcGraphics = new Map((await listGraphics(db, fromOrg)).map(g => [Number(g.id), g]));
+  const blankLinks = await getBlankLinks(db, fromOrg);
+  // A design the copy may use: a global one as it is, else this shop's of the same name, else none.
+  const mapDesign = (id, notes, what) => {
+    const d = designById.get(Number(id));
+    if (!d) return null;
+    if (d.isGlobal) return Number(d.id);
+    const m = myDesigns.get(key(d.name));
+    notes.push(m ? `${what} “${d.name}” → this shop's design of the same name` : `${what} “${d.name}” belongs to the other shop — left out; link this shop's design`);
+    return m ? Number(m.id) : null;
+  };
+  const mapGraphic = (id, notes, where) => {
+    const g = srcGraphics.get(Number(id));
+    if (!g) return null;
+    if (g.isGlobal) return Number(g.id);   // a global graphic (migrations/0078) is every shop's — kept as it is
+    const m = myGraphics.get(g.kind + "|" + key(g.name));
+    notes.push(m ? `${where}: graphic “${g.name}” → this shop's graphic of the same name` : `${where}: graphic “${g.name}” isn't in this shop — left out`);
+    return m ? Number(m.id) : null;
+  };
+  const groupId = {};   // source version group → the new id of its first copy
+  let sortOrder = mine.reduce((n, p) => Math.max(n, Number(p.sortOrder) || 0), 0);
+  const copied = [];
+  for (const r of list) {
+    const p = src.get(r.fromProductId), notes = [];
+    const locations = (p.locations || []).map(loc => Object.assign({}, loc, {
+      graphicIds: (loc.graphicIds || []).map(id => mapGraphic(id, notes, loc.label || loc.key)).filter(id => id != null) }));
+    // Printed transfers (migrations/0068) use this shop's graphic of the same name; locations are shared.
+    const fixedTransfers = (p.fixedTransfers || []).map(f => ({ ...f, graphicId: mapGraphic(f.graphicId, notes, "Printed transfer") })).filter(f => f.graphicId != null);
+    const mockupGraphics = (p.mockupGraphics || []).map(f => ({ ...f, graphicId: mapGraphic(f.graphicId, notes, "Embroidered graphic (mockups)") })).filter(f => f.graphicId != null);
+    const graphicMap = {};
+    for (const loc of p.locations || []) for (const id of loc.graphicIds || []) { const g = srcGraphics.get(Number(id)); const m = g && (g.isGlobal ? g : myGraphics.get(g.kind + "|" + key(g.name))); if (m) graphicMap[Number(id)] = Number(m.id); }
+    const optionDesigns = {};
+    for (const [opt, id] of Object.entries(p.personalizationOptionDesigns || {})) { const m = mapDesign(id, notes, `Pick-list option “${opt}”: design`); if (m) optionDesigns[opt] = m; }
+    if (p.versionGroup && !groupId[p.versionGroup]) groupId[p.versionGroup] = r.productId;
+    sortOrder += 10;
+    await createProduct(db, toOrg, Object.assign({}, p, {
+      productId: r.productId, name: r.name, sub: r.sub, type: r.type, visible: !!r.visible, sortOrder,
+      images: copyImages ? (p.images || []) : [], locations, fixedTransfers, mockupGraphics, personalizationOptionDesigns: optionDesigns,
+      versionGroup: p.versionGroup ? groupId[p.versionGroup] : "", versionLabel: p.versionGroup ? (r.versionLabel ?? p.versionLabel) : "",
+      // Color price groups (migrations/0064) are saved from colorGroupsCents; the parsed product has them in dollars.
+      colorGroupsCents: (p.colorGroups || []).map(g => ({ key: g.key, label: g.label, colors: g.colors || [],
+        ...(g.flatPrice != null ? { flatPriceCents: toCents(g.flatPrice) } : { sizePricingCents: mapValues_(g.sizePricing || {}, toCents) }) })) }));
+    const blocked = (p.blockedGraphicColors || []).filter(b => graphicMap[Number(b.graphicId)]).map(b => ({ graphicId: graphicMap[Number(b.graphicId)], color: b.color }));
+    if (blocked.length) await db.prepare("UPDATE products SET blockedGraphicColorsJson=? WHERE orgId=? AND productId=?").bind(JSON.stringify(blocked), toOrg, r.productId).run();
+    const designs = (await listProductDesigns(db, fromOrg, p.productId))
+      .map(d => ({ designId: mapDesign(d.designId, notes, "Design"), placement: d.placement, isMain: d.isMain })).filter(d => d.designId);
+    if (designs.length) await setProductDesigns(db, toOrg, r.productId, designs);
+    const links = blankLinks.filter(l => l.productId === p.productId);
+    if (links.length) await db.batch(links.map(l => db.prepare(
+      "INSERT INTO product_blank_links (orgId, productId, productColor, productSize, blankId, blankColor, blankSize) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(toOrg, r.productId, l.productColor, l.productSize, l.blankId, l.blankColor, l.blankSize)));
+    copied.push({ productId: r.productId, fromProductId: p.productId, name: r.name, blankLinks: links.length, images: copyImages ? (p.images || []).length : 0, notes: [...new Set(notes)] });
+  }
+  return copied;
+}
+
+
+// migrations/0057 — a product made with no blank at all (a patch: twill and thread are shop
+// supplies). Written only when the caller sends it, so an importer or script that doesn't know the
+// field can't clear it.
+// Versions of a product (migrations/0059): `group` links it to its other versions ('' = none), `label`
+// names this one ("Long sleeve"). Each is written only when given (undefined = leave it), so callers
+// that don't know about versions can't unlink one. Before the migration it's a no-op.
+export async function setProductVersion(db, orgId, productId, { group, label } = {}) {
+  const sets = [], binds = [];
+  if (group !== undefined) { sets.push("versionGroup=?"); binds.push(String(group || "").slice(0, 80)); }
+  if (label !== undefined) { sets.push("versionLabel=?"); binds.push(String(label || "").replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, 40)); }
+  if (!sets.length) return;
+  await db.prepare(`UPDATE products SET ${sets.join(", ")} WHERE orgId=? AND productId=?`).bind(...binds, orgId, productId).run()
+    .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
+}
+// The other versions of a product (same shop, same non-empty versionGroup), in sort order.
+export async function getProductVersions(db, orgId, productId) {
+  try {
+    const me = await db.prepare("SELECT versionGroup FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first();
+    if (!me || !me.versionGroup) return [];
+    const { results } = await db.prepare("SELECT productId, name, versionLabel, visible, type FROM products WHERE orgId=? AND versionGroup=? AND productId<>? ORDER BY sortOrder, productId")
+      .bind(orgId, me.versionGroup, productId).all();
+    return (results || []).map(r => ({ productId: r.productId, name: r.name || r.productId, label: r.versionLabel || "", visible: !!Number(r.visible), type: r.type || "" }));
+  } catch (e) { if (/no such column/i.test(String(e && e.message))) return []; throw e; }
+}
+// The name an order line gets: the product's, plus its version's label when it is one of a pair —
+// "Club Tee (Long sleeve)" — so every screen that shows a line (receipts, packing, Run Order) says which.
+export function productLineName(row, productId) {
+  const name = (row && row.name) || productId || "";
+  return row && row.versionGroup && row.versionLabel ? `${name} (${row.versionLabel})` : name;
+}
+async function setProductNoBlankNeeded_(db, orgId, productId, on) {
+  await db.prepare("UPDATE products SET noBlankNeeded=? WHERE orgId=? AND productId=?").bind(on ? 1 : 0, orgId, productId).run()
+    .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
+}
+// True for an order line (row alias `alias`) whose product is marked "No blank needed". A custom
+// line with no product still counts as needing a blank, as before.
+const noBlankLineSql_ = (alias) => `EXISTS (SELECT 1 FROM products nb WHERE nb.orgId = ${alias}.orgId AND nb.productId = ${alias}.productId AND nb.noBlankNeeded = 1)`;
+// The SQL builder to use against THIS database: the real test, or a constant "no" on a database
+// that doesn't have the column yet — so the order loaders and queues keep working if the code is
+// deployed a moment before the migration. Only a "yes" is remembered (a "no" is re-checked, so the
+// column is picked up as soon as it exists).
+//
+// A line filled from the shop's finished stock (order_items.fromStock, migrations/0060) skips the blank
+// steps too — its blanks were used when the stock was made — so it counts here as well: nothing to buy,
+// set aside or receive for it. (Run Order and the transfer queue leave it out on top: fromStockLine_.)
+const _hasNoBlankColumn = new WeakSet();
+async function noBlankLine_(db) {
+  if (!_hasNoBlankColumn.has(db)) {
+    try { await db.prepare("SELECT noBlankNeeded FROM products LIMIT 0").all(); _hasNoBlankColumn.add(db); }
+    catch (e) { if (!/no such (column|table)/i.test(String(e && e.message))) throw e; return () => "0"; }
+  }
+  if (!(await hasFromStockColumn_(db))) return noBlankLineSql_;
+  return (alias) => `(${noBlankLineSql_(alias)} OR COALESCE(${alias}.fromStock, 0) = 1)`;
+}
+// order_items.fromStock (migrations/0060) — only a "yes" is remembered, like the check above.
+const _hasFromStockColumn = new WeakSet();
+async function hasFromStockColumn_(db) {
+  if (_hasFromStockColumn.has(db)) return true;
+  try { await db.prepare("SELECT fromStock FROM order_items LIMIT 0").all(); _hasFromStockColumn.add(db); return true; }
+  catch (e) { if (!/no such (column|table)/i.test(String(e && e.message))) throw e; return false; }
+}
+// SQL for "this line (alias) is filled from finished stock", or a constant "no" before the migration.
+async function fromStockLine_(db) {
+  return (await hasFromStockColumn_(db)) ? (alias) => `COALESCE(${alias}.fromStock, 0) = 1` : () => "0";
 }
 
 // migrations/0034 — a product that never needs an embroidery design (DTF, …).
@@ -533,13 +917,34 @@ async function setProductConfig_(db, orgId, p) {
   if (p.garmentColors !== undefined)  { sets.push("garmentColorsJson=?");  binds.push(JSON.stringify(Array.isArray(p.garmentColors) ? p.garmentColors : [])); }
   if (p.locations !== undefined)      { sets.push("locationsJson=?");      binds.push(JSON.stringify(Array.isArray(p.locations) ? p.locations : [])); }
   if (p.reorderQr !== undefined)      { sets.push("reorderQr=?");          binds.push(String(p.reorderQr || "default").slice(0, 40)); }
+  // migrations/0068 — printed transfers that are part of the product (orders.js cleanFixedTransfers_ checked them).
+  if (p.fixedTransfers !== undefined) { sets.push("fixedTransfersJson=?"); binds.push(JSON.stringify(Array.isArray(p.fixedTransfers) ? p.fixedTransfers : [])); }
+  // migrations/0069 — embroidered graphics for mockups only (orders.js checkMockupGraphics_ checked them).
+  if (p.mockupGraphics !== undefined) { sets.push("mockupGraphicsJson=?"); binds.push(JSON.stringify(Array.isArray(p.mockupGraphics) ? p.mockupGraphics : [])); }
+  if (!sets.length) return;
+  await db.prepare(`UPDATE products SET ${sets.join(", ")} WHERE orgId=? AND productId=?`).bind(...binds, orgId, p.productId).run()
+    .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
+}
+
+// The three pricing-awareness numbers (migrations/0067), each only when sent; null / "" clears it. The caller
+// (orders.js checkCosting_) has already checked them.
+async function setProductCosting_(db, orgId, p) {
+  const sets = [], binds = [];
+  const num = (v) => v === null || v === "" || v === undefined ? null : Number(v);
+  if (p.runMinutes !== undefined)   { sets.push("runMinutes=?");        binds.push(num(p.runMinutes)); }
+  if (p.transferCost !== undefined) { sets.push("transferCostCents=?"); binds.push(toCentsOrNull(num(p.transferCost))); }
+  if (p.suppliesCost !== undefined) { sets.push("suppliesCostCents=?"); binds.push(toCentsOrNull(num(p.suppliesCost))); }
   if (!sets.length) return;
   await db.prepare(`UPDATE products SET ${sets.join(", ")} WHERE orgId=? AND productId=?`).bind(...binds, orgId, p.productId).run()
     .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
 }
 
 export async function updateProduct(db, orgId, p) {
+  await setProductCosting_(db, orgId, p);
+  if (p.colorGroupsCents !== undefined) await setProductColorGroups_(db, orgId, p.productId, p.colorGroupsCents);
   if (p.noDesignNeeded !== undefined) await setProductNoDesignNeeded_(db, orgId, p.productId, !!p.noDesignNeeded);
+  if (p.noBlankNeeded !== undefined) await setProductNoBlankNeeded_(db, orgId, p.productId, !!p.noBlankNeeded);
+  if (p.versionGroup !== undefined || p.versionLabel !== undefined) await setProductVersion(db, orgId, p.productId, { group: p.versionGroup, label: p.versionLabel });
   if (p.customDesign !== undefined) await setProductCustomDesign_(db, orgId, p.productId, p.customDesign, p.customDesignPrice);
   await setProductConfig_(db, orgId, p);
   if (p.personalizationMode !== undefined || p.personalizationOptionDesigns !== undefined || p.personalizationHoopId !== undefined)
@@ -586,22 +991,241 @@ function parseProduct_(row) {
     visible: !!row.visible,
     sortOrder: row.sortOrder ?? 0,
     taxable: row.taxable === undefined ? true : !!row.taxable,
+    pricesReviewedAt: row.pricesReviewedAt || "",   // migrations/0062
+    // migrations/0064 — color price groups, in dollars: [{key, label, colors, sizePricing | flatPrice}].
+    colorGroups: (tryParse_(row.colorGroupsJson, []) || []).map(g => ({ key: g.key, label: g.label, colors: g.colors || [],
+      ...(g.flatPriceCents != null ? { flatPrice: fromCents(g.flatPriceCents) } : { sizePricing: mapValues_(g.sizePricingCents || {}, fromCents) }) })),
     designId: row.designId == null ? null : Number(row.designId),
     // migrations/0032 — see setProductPersonalization / setProductDesigns.
     personalizationMode: row.personalizationMode === "separate" ? "separate" : "combined",
     personalizationHoopId: row.personalizationHoopId == null ? null : Number(row.personalizationHoopId),
     personalizationOptionDesigns: tryParse_(row.personalizationOptionDesigns, {}) || {},
     noDesignNeeded: !!Number(row.noDesignNeeded),   // migrations/0034
+    noBlankNeeded: !!Number(row.noBlankNeeded),     // migrations/0057
     blockedGraphicColors: tryParse_(row.blockedGraphicColorsJson, []) || [],   // migrations/0050: [{graphicId, color}] not offered
     // migrations/0054 — the customer's own design: '' off | 'embroidery' | 'transfer', and its add-on.
     customDesign: CUSTOM_DESIGN_KINDS.includes(row.customDesign) ? row.customDesign : "",
     customDesignPrice: row.customDesign ? fromCentsOrNull(row.customDesignPriceCents) : null,
+    versionGroup: row.versionGroup || "",         // migrations/0059: versions of a product (short / long sleeve)
+    versionLabel: row.versionLabel || "",
     // migrations/0036 — configurable products (per-location option menus + reorder QR).
     configurable: !!Number(row.configurable),
     garmentColors: tryParse_(row.garmentColorsJson, []) || [],
     locations: tryParse_(row.locationsJson, []) || [],
     reorderQr: row.reorderQr || "default",
+    // migrations/0068 — printed transfers (DTF) at fixed locations, part of the product and its price.
+    fixedTransfers: (tryParse_(row.fixedTransfersJson, []) || []).map(f => ({ locationId: f.locationId == null ? null : Number(f.locationId),
+      graphicId: Number(f.graphicId), ink: String(f.ink || "") })),
+    // migrations/0069 — embroidered graphics shown on mockups only (never on an order line).
+    mockupGraphics: (tryParse_(row.mockupGraphicsJson, []) || []).map(f => ({ locationId: f.locationId == null ? null : Number(f.locationId), graphicId: Number(f.graphicId) })),
+    // migrations/0067 — pricing awareness: minutes to make one, extra DTF / transfer cost, supplies override.
+    runMinutes: row.runMinutes == null ? null : Number(row.runMinutes),
+    transferCost: fromCentsOrNull(row.transferCostCents),
+    suppliesCost: fromCentsOrNull(row.suppliesCostCents),
   };
+}
+
+// ---- Brand rules: brands a supplier restricts (migrations/0075) ----------------------------------
+// Some brands may only be resold on the supplier's terms, and the wording here is the supplier's, not any one vendor's:
+// what suppliers publish is collected into ONE list, to be verified with whichever supplier the blanks come from.
+// Seeded from (2026-10):
+//   SanMar's published brand form: The North Face, Nike, Carhartt (jeans / accessories excepted), Cotopaxi, TravisMathew,
+//     New Era, Eddie Bauer, Champion, OGIO, Tommy Bahama, Brooks Brothers, Outdoor Research, tentree "only with
+//     embellishment"; MiiR and Stanley/Stella also restricted; "large orders need logo pre-approval".
+//   S&S's published terms: adidas, Columbia, Oakley and Puma (Golf) "must be sold with embellishment"; DRI DUCK may be
+//     resold blank only at its MAP.
+// The default large quantity (100) and the logo concerns are a starting point; each shop sets its own.
+// The rules are a setting (global_settings.brandRules, Tools → Brand rules): a default "large" quantity — pieces of
+// ONE style (a blank) on one customer order or one supplier order — with per-brand overrides; per brand whether it
+// must be decorated and whether a large quantity needs the supplier's logo approval. An approval (brand_approvals) is
+// per product, since the logo on it is what's reviewed, with the supplier's reply attached.
+// seedVersion: brands added to the seed later (`since`) are added to rules saved before them (getBrandRules).
+export const BRAND_RULES_SEED_VERSION = 2;
+export const DEFAULT_BRAND_RULES = {
+  seedVersion: BRAND_RULES_SEED_VERSION,
+  largeQty: 100,
+  concerns: ["Guns / firearms", "Tobacco", "Alcohol", "Adult entertainment", "Obscene or violent content"],
+  brands: [
+    { brand: "The North Face" },
+    { brand: "Carhartt", note: "Jeans and accessories may be sold undecorated — tick those categories." },
+    ...["Nike", "Cotopaxi", "TravisMathew", "New Era", "Eddie Bauer", "Champion", "OGIO", "Tommy Bahama", "Brooks Brothers",
+      "Outdoor Research", "tentree", "MiiR", "Stanley/Stella"].map(brand => ({ brand })),
+    { brand: "adidas", since: 2, note: "May not be shipped outside the country." },
+    { brand: "Columbia", since: 2, note: "No professional or college team marks." },
+    { brand: "Oakley", since: 2 },
+    { brand: "Puma", since: 2, note: "Puma Golf." },
+    { brand: "DRI DUCK", since: 2, mustDecorate: false, largeNeedsApproval: false, note: "May be sold blank, but only at DRI DUCK's minimum advertised price (MAP)." },
+  ].map(b => ({ largeQty: null, mustDecorate: true, largeNeedsApproval: true, exceptCategories: [], note: "", since: 1, ...b })),
+};
+// The first seed's notes, replaced by the general wording when rules saved before it are read. (OpenDecoDesk never
+// shipped them: none to replace.)
+const BRAND_NOTES_V1_ = {};
+// "The North Face®" = "the north face" = "THE-NORTH-FACE".
+export const brandKey_ = (s) => String(s == null ? "" : s).toLowerCase().replace(/[®™©]/g, "").replace(/[^a-z0-9]+/g, "");
+export function cleanBrandRules_(input) {
+  const r = input && typeof input === "object" ? input : {};
+  const int = (v, lo, hi) => { const n = Number(v); return Number.isInteger(n) && n >= lo && n <= hi ? n : null; };
+  const largeQty = int(r.largeQty, 1, 100000);
+  if (largeQty == null) throw pricingError_("The default large quantity must be a whole number from 1 to 100,000.");
+  const concerns = (Array.isArray(r.concerns) ? r.concerns : []).map(c => String(c || "").trim().slice(0, 80)).filter(Boolean).slice(0, 20);
+  const brands = [], seen = new Set();
+  for (const b of (Array.isArray(r.brands) ? r.brands : []).slice(0, 80)) {
+    const brand = String((b && b.brand) || "").trim().slice(0, 60), k = brandKey_(brand);
+    if (!k) continue;
+    if (seen.has(k)) throw pricingError_(`“${brand}” is listed twice.`);
+    seen.add(k);
+    let q = null;
+    if (b.largeQty !== null && b.largeQty !== undefined && b.largeQty !== "") { q = int(b.largeQty, 1, 100000); if (q == null) throw pricingError_(`${brand}: the large quantity must be a whole number from 1 to 100,000 (or blank for the default).`); }
+    brands.push({ brand, largeQty: q, mustDecorate: b.mustDecorate !== false, largeNeedsApproval: b.largeNeedsApproval !== false,
+      exceptCategories: (Array.isArray(b.exceptCategories) ? b.exceptCategories : []).map(c => String(c || "").trim().slice(0, 40)).filter(Boolean).slice(0, 20),
+      note: String(b.note || "").trim().slice(0, 300) });
+  }
+  // The price rule: charge at least MAP + $X or + X% — a general one and per brand (Brand rules page). A guide, not a
+  // hard rule like MAP itself: a price under it is a warning.
+  const priceRule = cleanPriceRule_(r.priceRule, "The general price rule");
+  const brandPrices = [], seenP = new Set();
+  for (const b of (Array.isArray(r.brandPrices) ? r.brandPrices : []).slice(0, 200)) {
+    const brand = String((b && b.brand) || "").trim().slice(0, 60), k = brandKey_(brand);
+    if (!k) continue;
+    if (seenP.has(k)) throw pricingError_(`“${brand}” has two price rules.`);
+    seenP.add(k);
+    const rule = cleanPriceRule_(b, brand);
+    if (rule) brandPrices.push({ brand, ...rule });
+  }
+  return { seedVersion: BRAND_RULES_SEED_VERSION, largeQty, concerns, brands, priceRule, brandPrices };
+}
+// {add, unit: "amount" | "pct"} or null (blank = no rule).
+function cleanPriceRule_(x, who) {
+  if (!x || x.add === null || x.add === undefined || x.add === "") return null;
+  const unit = x.unit === "pct" ? "pct" : "amount", add = Number(x.add);
+  if (!Number.isFinite(add) || add < 0 || add > (unit === "pct" ? 1000 : 10000)) throw pricingError_(`${who}: the amount over MAP must be a number from 0 to ${unit === "pct" ? "1,000%" : "$10,000"}.`);
+  return { add: Math.round(add * 100) / 100, unit };
+}
+// The price rule for a blank's brand: its own, else the general one, else null. {add, unit, brand ("" = general)}.
+export function priceRuleFor_(rules, brand) {
+  if (!rules) return null;
+  const k = brandKey_(brand);
+  const b = k ? (rules.brandPrices || []).find(x => brandKey_(x.brand) === k) : null;
+  if (b) return { add: b.add, unit: b.unit, brand: b.brand };
+  return rules.priceRule ? { add: rules.priceRule.add, unit: rules.priceRule.unit, brand: "" } : null;
+}
+// The least a price should be under the rule, in cents, for a MAP in cents.
+export const priceRuleMinCents_ = (mapCents, rule) => rule.unit === "pct" ? Math.round(mapCents * (1 + rule.add / 100)) : mapCents + Math.round(rule.add * 100);
+export const priceRuleText_ = (rule) => rule.unit === "pct" ? `MAP + ${rule.add}%` : `MAP + $${Number(rule.add).toFixed(2)}`;
+const defaultBrandRules_ = () => cleanBrandRules_(DEFAULT_BRAND_RULES);
+export async function getBrandRules(db) {
+  const row = await db.prepare("SELECT value FROM global_settings WHERE key='brandRules'").first().catch(() => null);
+  const saved = row ? tryParse_(row.value, null) : null;
+  if (!saved) return defaultBrandRules_();
+  // Saved before a newer seed: add the brands seeded since (a brand removed by hand stays removed — it was in the
+  // older seed), and replace the first seed's notes with the general wording.
+  const from = Number(saved.seedVersion) || 1;
+  if (from < BRAND_RULES_SEED_VERSION && Array.isArray(saved.brands)) {
+    const have = new Set(saved.brands.map(b => brandKey_(b && b.brand)));
+    for (const b of saved.brands) if (b && BRAND_NOTES_V1_[brandKey_(b.brand)] === b.note) b.note = DEFAULT_BRAND_RULES.brands.find(d => brandKey_(d.brand) === brandKey_(b.brand)).note;
+    for (const d of DEFAULT_BRAND_RULES.brands) if (d.since > from && !have.has(brandKey_(d.brand))) saved.brands.push(d);
+  }
+  try { return cleanBrandRules_(saved); } catch (e) { return defaultBrandRules_(); }
+}
+export async function setBrandRules(db, input) {
+  const clean = cleanBrandRules_(input);
+  await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES ('brandRules', ?)").bind(JSON.stringify(clean)).run();
+  return clean;
+}
+// The rule for a blank's brand (with `threshold` = its own large quantity or the default), or null.
+export function brandRuleFor_(rules, brand) {
+  const k = brandKey_(brand);
+  if (!k || !rules) return null;
+  const b = (rules.brands || []).find(x => brandKey_(x.brand) === k);
+  return b ? { ...b, threshold: b.largeQty || rules.largeQty || 100, concerns: rules.concerns || [] } : null;
+}
+// Active approvals: "<orgId>|<productId>|<brandKey>" → the best one (no limit beats any limit, else the highest).
+export async function activeBrandApprovals_(db) {
+  const { results } = await db.prepare("SELECT * FROM brand_approvals WHERE revokedAt IS NULL").all().catch(() => ({ results: [] }));
+  const out = new Map();
+  for (const a of results) {
+    const k = a.orgId + "|" + a.productId + "|" + brandKey_(a.brand), prev = out.get(k);
+    const better = !prev || (prev.maxQty != null && (a.maxQty == null || Number(a.maxQty) > Number(prev.maxQty)));
+    if (better) out.set(k, { id: Number(a.id), maxQty: a.maxQty == null ? null : Number(a.maxQty), approvedOn: a.approvedOn || "" });
+  }
+  return out;
+}
+export function brandApprovalCovers_(approvals, orgId, productId, brand, pieces) {
+  const a = approvals && approvals.get(orgId + "|" + productId + "|" + brandKey_(brand));
+  return !!a && (a.maxQty == null || Number(pieces) <= a.maxQty);
+}
+// What the checks need, read once: the rules, approvals, every blank link and the blanks' brand / style.
+export async function brandContext_(db) {
+  const [rules, approvals, links, blanks] = await Promise.all([
+    getBrandRules(db), activeBrandApprovals_(db),
+    db.prepare("SELECT orgId, productId, productColor, productSize, blankId FROM product_blank_links").all().then(r => r.results).catch(() => []),
+    db.prepare("SELECT id, name, brand, sku FROM blanks").all().then(r => r.results).catch(() => []),
+  ]);
+  const linkAt = new Map(links.map(l => [[l.orgId, l.productId, l.productColor || "", l.productSize || ""].join("\u0001"), Number(l.blankId)]));
+  const blankAt = new Map(blanks.map(b => [Number(b.id), b]));
+  return { rules, approvals, linkAt, blankAt };
+}
+// For each order: the ruled-brand styles (blanks) it has a LARGE number of — [{brand, style, blank, blankId, pieces,
+// threshold, approved, products: [productId]}] — from its active lines (qty), matched to blanks the same way
+// Blanks to Order matches them (shop + product + garment color + size). Approved = every product it's on has an
+// approval for the brand that covers the pieces. `lines` = raw order_items rows (orderId, orgId, productId, size,
+// configJson, qty, cancelDate).
+export function brandReviewsForLines_(ctx, lines) {
+  const byOrder = new Map();
+  for (const ln of lines || []) {
+    if (ln.cancelDate || !ln.productId) continue;
+    const blankId = ctx.linkAt.get([ln.orgId, ln.productId, itemColor_(ln), ln.size || ""].join("\u0001"));
+    const b = blankId ? ctx.blankAt.get(blankId) : null;
+    const rule = b ? brandRuleFor_(ctx.rules, b.brand) : null;
+    if (!rule || !rule.largeNeedsApproval) continue;
+    const m = byOrder.get(ln.orderId) || byOrder.set(ln.orderId, new Map()).get(ln.orderId);
+    const e = m.get(blankId) || m.set(blankId, { brand: rule.brand, style: b.sku || b.name || "", blank: b.name || "", blankId, pieces: 0, threshold: rule.threshold, orgId: ln.orgId, products: new Set() }).get(blankId);
+    e.pieces += Number(ln.qty) || 0;
+    e.products.add(ln.productId);
+  }
+  const out = new Map();
+  for (const [orderId, m] of byOrder) {
+    const list = [];
+    for (const e of m.values()) {
+      if (e.pieces < e.threshold) continue;
+      const products = [...e.products];
+      list.push({ brand: e.brand, style: e.style, blank: e.blank, blankId: e.blankId, pieces: e.pieces, threshold: e.threshold, products,
+        approved: products.every(pid => brandApprovalCovers_(ctx.approvals, e.orgId, pid, e.brand, e.pieces)) });
+    }
+    if (list.length) out.set(orderId, list);
+  }
+  return out;
+}
+
+// ---- Brand approvals (migrations/0075) ----
+const parseBrandApproval_ = (r) => ({ id: Number(r.id), orgId: r.orgId, productId: r.productId, brand: r.brand, approvedOn: r.approvedOn || "",
+  maxQty: r.maxQty == null ? null : Number(r.maxQty), note: r.note || "", fileKey: r.fileKey || "", fileName: r.fileName || "",
+  createdBy: r.createdBy || "", createdAt: r.createdAt, revokedAt: r.revokedAt || "", revokeNote: r.revokeNote || "" });
+export async function listBrandApprovals(db, { orgId = null, productId = null } = {}) {
+  const where = [], b = [];
+  if (orgId) { where.push("orgId=?"); b.push(orgId); }
+  if (productId) { where.push("productId=?"); b.push(productId); }
+  const { results } = await db.prepare(`SELECT * FROM brand_approvals${where.length ? " WHERE " + where.join(" AND ") : ""} ORDER BY createdAt DESC, id DESC`).bind(...b).all();
+  return results.map(parseBrandApproval_);
+}
+// One approval, for one or more products of a shop (same file). Returns the new rows' ids.
+export async function addBrandApproval(db, { orgId, productIds, brand, approvedOn, maxQty = null, note = "", fileKey, fileName = "", createdBy = "" }) {
+  const now = new Date().toISOString();
+  const ids = [];
+  for (const pid of [...new Set(productIds || [])]) {
+    const r = await db.prepare(`INSERT INTO brand_approvals (orgId, productId, brand, approvedOn, maxQty, note, fileKey, fileName, createdBy, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(orgId, pid, String(brand).slice(0, 60), approvedOn, maxQty == null ? null : Number(maxQty), String(note || "").slice(0, 500), fileKey, String(fileName || "").slice(0, 200), String(createdBy || "").slice(0, 200), now).run();
+    ids.push(Number(r.meta.last_row_id));
+  }
+  return ids;
+}
+export async function revokeBrandApproval(db, id, note) {
+  const r = await db.prepare("UPDATE brand_approvals SET revokedAt=?, revokeNote=? WHERE id=? AND revokedAt IS NULL").bind(new Date().toISOString(), String(note || "").slice(0, 300), Number(id)).run();
+  return !!(r.meta && r.meta.changes);
+}
+export async function getBrandApproval(db, id) {
+  const r = await db.prepare("SELECT * FROM brand_approvals WHERE id=?").bind(Number(id)).first();
+  return r ? parseBrandApproval_(r) : null;
 }
 
 // ---- Catalog health check ---------------------------------------------------------------------
@@ -628,9 +1252,29 @@ export async function getCatalogIssues(db, orgId = null) {
   const hoops = await q("SELECT designId, count(*) n FROM design_hoops GROUP BY designId");
   const pds = await q("SELECT orgId, productId, designId FROM product_designs" + orgFilter, ...ob);
   const links = await q("SELECT orgId, productId, productSize FROM product_blank_links" + orgFilter, ...ob);
+  // Linked blanks filed under another type than the product (a blank re-typed after it was linked — the product form
+  // used to hide it then, so a newly offered color couldn't be linked).
+  const linkedTypes = await q("SELECT DISTINCT l.orgId, l.productId, b.name AS blankName, b.productType, b.brand FROM product_blank_links l JOIN blanks b ON b.id = l.blankId" + (orgId ? " WHERE l.orgId = ?" : ""), ...ob);
+  // Brand rules (migrations/0075): restricted brands on a product — decorated only, and the supplier's logo approval.
+  const brandRules = await getBrandRules(db).catch(() => null);
+  const brandApprovals = await activeBrandApprovals_(db);
+  // Every graphic: a product may use another shop's global one (migrations/0078); graphicUsableBy_ decides.
+  const graphicRows = await q("SELECT * FROM graphics");   // printed transfers (0067)
+  const graphicById = {}; for (const g of graphicRows) graphicById[Number(g.id)] = g;
   const open = await q(`SELECT oi.orgId, oi.productId, count(*) n FROM order_items oi JOIN orders o ON o.orderId = oi.orderId
     WHERE oi.cancelDate IS NULL AND o.manufacturedAt IS NULL AND o.completedAt IS NULL AND o.voidedAt IS NULL AND o.isTest = 0
     GROUP BY oi.orgId, oi.productId`);
+  // Blanks whose vendor price changed since the product's prices were set (migrations/0062).
+  const priceChanged = {};
+  for (const c of await getProductPriceChanges(db, { orgId }).catch(() => [])) priceChanged[c.orgId + "|" + c.productId] = c.changes;
+  // Items below the pricing targets (Global settings → Pricing, migrations/0067) — re-checked on every read, so a
+  // change to a blank's cost, a fee, the tax rate or a target shows up here at once.
+  const belowTarget = {}, belowMap = {}, belowRule = {};
+  for (const a of (await analyzePricing(db, { orgId }).catch(() => ({ products: [] }))).products) {
+    if (a.belowTarget) belowTarget[a.orgId + "|" + a.productId] = a.problems;
+    if (a.belowMap) belowMap[a.orgId + "|" + a.productId] = a.mapProblems;   // below a blank's MAP (migrations/0070)
+    if (a.belowPriceRule) belowRule[a.orgId + "|" + a.productId] = a.ruleProblems;   // under the Brand rules price rule
+  }
   const hoopCount = {}; for (const h of hoops) hoopCount[h.designId] = Number(h.n);
   const latest = {}; for (const v of versions) latest[v.designId] = tryParse_(v.threadColorsJson, []) || [];
   // Designs.
@@ -653,18 +1297,30 @@ export async function getCatalogIssues(db, orgId = null) {
   }
   // Products.
   const shipping = {}; for (const o of orgs) shipping[o.orgId] = !!Number(o.shippingEnabled);
+  const blankWeights = await getBlankWeights(db, null);
   const pdBy = {}; for (const r of pds) (pdBy[r.orgId + "|" + r.productId] = pdBy[r.orgId + "|" + r.productId] || []).push(Number(r.designId));
   const linked = {}; for (const r of links) linked[r.orgId + "|" + r.productId + "|" + r.productSize] = true;
   const openBy = {}; for (const r of open) openBy[r.orgId + "|" + r.productId] = Number(r.n);
   const designName = (id) => (designById[id] && designById[id].name) || ("#" + id);
   for (const p of products) {
     const key = p.orgId + "|" + p.productId;
-    if (!Number(p.visible) && !openBy[key]) continue;
+    // A hidden product is checked too (a copy or an import usually starts hidden), but its problems are only
+    // warnings until it's shown — unless it's on an open order.
+    const hiddenOnly = !Number(p.visible) && !openBy[key];
     const list = [];
     const used = pdBy[key] || (p.designId != null ? [Number(p.designId)] : []);
     // A product the customer supplies the design for (migrations/0054) is made from their upload.
-    if (features.production && !used.length && !Number(p.noDesignNeeded) && !p.customDesign)
-      list.push({ code: "noDesign", level: "error", text: "No design linked — Run Order can't plan its hoopings (tick “No embroidery design needed” if it's DTF)" });
+    // A configurable product whose designs are the options offered at its spots (graphics) needs no design of its own.
+    const offersOptions = Number(p.configurable) && (tryParse_(p.locationsJson, []) || []).some(l => l && Array.isArray(l.graphicIds) && l.graphicIds.length);
+    if (features.production && !used.length && !Number(p.noDesignNeeded) && !p.customDesign && !offersOptions)
+      list.push({ code: "noDesign", level: "warn", text: "No stitch file (design) linked yet — needed to make it on Run Order, not to sell it (tick “No embroidery design needed” if it's DTF)" });
+    // An embroidery graphic offered as an option with no stitch file linked: fine to sell, but it can't be made until linked.
+    // (Only with the Production feature on, like noDesign.)
+    if (features.production && Number(p.configurable)) {
+      const bare = [...new Set((tryParse_(p.locationsJson, []) || []).flatMap(l => (l && l.graphicIds) || []).map(Number))]
+        .map(id => graphicById[id]).filter(g => g && g.kind === "embroidery" && !g.designId);
+      if (bare.length) list.push({ code: "graphicNoDesign", level: "warn", text: `No stitch file (design) linked to ${bare.map(g => `“${g.name}”`).join(", ")} yet — link one on the Graphics screen before orders for it can be made` });
+    }
     const options = tryParse_(p.personalizationOptions, []) || [];
     const map = tryParse_(p.personalizationOptionDesigns, {}) || {};
     const unmapped = options.filter(o => !Number(map[o]) || !designById[Number(map[o])]);
@@ -675,14 +1331,68 @@ export async function getCatalogIssues(db, orgId = null) {
       list.push({ code: "persHoop", level: "error", text: "Typed-in personalization is its own hooping but has no hoop" });
     const sizes = p.pricingMode === "flat" ? ["OSFA"] : Object.keys(tryParse_(p.sizePricingCents, {}) || {});
     if (p.pricingMode === "flat" ? p.flatPriceCents == null : !sizes.length) list.push({ code: "noPrice", level: "error", text: "No price set" });
-    if (features.shipping && shipping[p.orgId] && p.weightOz == null) list.push({ code: "noWeight", level: "error", text: "No weight — the shop ships, so shipping can't be quoted" });
+    if (features.shipping && shipping[p.orgId] && p.weightOz == null && !blankWeights[key]) list.push({ code: "noWeight", level: "error", text: "No weight — the shop ships, so shipping can't be quoted. Enter the weight on its blank (Inventory → Blanks → Edit), or on the product" });
     const noBlank = sizes.filter(sz => !linked[key + "|" + sz]);
     // Blank links matter whether or not the product is embroidered — a DTF tee is still a blank whose
     // stock and cost of goods should be tracked — so "No embroidery design needed" doesn't skip this.
-    if (noBlank.length && sizes.length)
-      list.push({ code: "noBlankLink", level: "warn", text: (noBlank.length === sizes.length ? "Not linked to a blank" : "Sizes not linked to a blank: " + noBlank.join(", ")) + " — stock and cost of goods aren't tracked" });
-    if (!Number(p.visible)) list.forEach(x => { x.text += " (hidden, but on an open order)"; });
+    // …but a product made with no blank at all (migrations/0057) has nothing to link.
+    if (noBlank.length && sizes.length && !Number(p.noBlankNeeded))
+      list.push({ code: "noBlankLink", level: "warn", text: (noBlank.length === sizes.length ? "Not linked to a blank" : "Sizes not linked to a blank: " + noBlank.join(", ")) + " — stock and cost of goods aren't tracked (tick “No blank needed” if it's made without one)" });
+    if (priceChanged[key]) {
+      const money = (v) => v == null ? "not entered" : "$" + Number(v).toFixed(2);
+      const groupOf = (color) => { const g = (tryParse_(p.colorGroupsJson, []) || []).find(x => (x.colors || []).includes(color)); return g ? g.label : (tryParse_(p.colorGroupsJson, []) || []).length ? "Standard" : ""; };
+      const parts = priceChanged[key].map(c => `${c.blankName}${c.color ? " " + c.color : ""}${c.size ? " " + c.size : ""} ${money(c.from)} → ${money(c.to)}${c.productColor && groupOf(c.productColor) ? ` (${groupOf(c.productColor)} price)` : ""}`);
+      list.push({ code: "blankPriceChanged", level: "warn", changes: priceChanged[key],
+        text: "Blank vendor price changed since this product's prices were set: " + parts.slice(0, 6).join("; ") + (parts.length > 6 ? `; +${parts.length - 6} more` : "") +
+          " — update its prices, or confirm they're still right (“Prices still OK” on the product)" });
+    }
+    // Printed transfers (migrations/0068): each needs a transfer graphic of this shop, linked to transfer stock.
+    for (const f of tryParse_(p.fixedTransfersJson, []) || []) {
+      const g = graphicById[Number(f.graphicId)];
+      if (!graphicUsableBy_(g, p.orgId) || g.kind !== "transfer")
+        list.push({ code: "fixedTransferMissing", level: "error", text: "A printed transfer's graphic is gone or isn't a transfer any more — orders won't carry it; pick another on the product" });
+      else if (g.transferId == null)
+        list.push({ code: "fixedTransferUnlinked", level: "warn", text: `Printed transfer “${g.name}” isn't linked to a transfer on the Graphics screen — its stock and cost aren't tracked` });
+    }
+    for (const f of tryParse_(p.mockupGraphicsJson, []) || []) {   // migrations/0069
+      const g = graphicById[Number(f.graphicId)];
+      if (!graphicUsableBy_(g, p.orgId)) list.push({ code: "mockupGraphicMissing", level: "warn", text: "An embroidered graphic for its mockups is gone — pick another on the product" });
+    }
+    const typeOff = linkedTypes.filter(t => t.orgId === p.orgId && t.productId === p.productId && t.productType && p.type && t.productType !== p.type);
+    if (typeOff.length) list.push({ code: "blankTypeMismatch", level: "warn", text: `Linked to ${typeOff.map(t => `“${t.blankName}” (filed as ${t.productType})`).join(", ")}, but this product is a ${p.type} — change one of them so they match` });
+    // A restricted brand (Tools → Brand rules): what the supplier requires, and whether the logo is approved.
+    const ruled = new Map();
+    for (const t of linkedTypes) if (t.orgId === p.orgId && t.productId === p.productId) { const r = brandRuleFor_(brandRules, t.brand); if (r) ruled.set(brandKey_(r.brand), r); }
+    for (const r of ruled.values()) {
+      const appr = brandApprovals.get(p.orgId + "|" + p.productId + "|" + brandKey_(r.brand));
+      const approval = !r.largeNeedsApproval ? "" : appr ? `supplier logo approval on file (${appr.approvedOn}${appr.maxQty != null ? `, up to ${appr.maxQty}` : ""})` : `orders of ${r.threshold}+ of one style need the supplier's logo approval — none on file`;
+      list.push({ code: "brandRule", level: "warn", brand: r.brand, approved: !!appr, needsApproval: r.largeNeedsApproval,
+        text: `${r.brand} (a restricted brand — verify with the supplier): ${[r.mustDecorate ? "must be decorated" : "", approval].filter(Boolean).join(" · ")}${r.concerns.length && r.mustDecorate ? ` · avoid logos with: ${r.concerns.join(", ").toLowerCase()}` : ""}${r.note ? ` · ${r.note}` : ""}` });
+      const decorated = used.length || options.length || p.personalizationPriceCents != null || !!p.customDesign
+        || (tryParse_(p.fixedTransfersJson, []) || []).length || (Number(p.configurable) && (tryParse_(p.locationsJson, []) || []).length);
+      if (r.mustDecorate && !decorated && !(r.exceptCategories || []).includes(p.type))
+        list.push({ code: "brandUndecorated", level: "error", brand: r.brand, text: `${r.brand} can only be sold decorated, and nothing decorates this product (no design, printed transfer, graphic options or personalization)` });
+    }
+    if (belowMap[key]) list.push({ code: "belowMap", level: "error", text: belowMap[key].join("; ") + " — the vendor's minimum advertised price; raise the price (the product can't be saved below it)" });
+    if (belowRule[key]) list.push({ code: "belowPriceRule", level: "warn", text: belowRule[key].join("; ") + " — your price rule (Catalog → Brand rules)" });
+    if (belowTarget[key]) list.push({ code: "belowTarget", level: "warn", text: belowTarget[key].join("; ") + " — see the Pricing panel on the product (or Price analysis)" });
+    // Versions (migrations/0059) share one card on the shop page, which sits in ONE category section.
+    if (p.versionGroup) {
+      const others = products.filter(x => x.orgId === p.orgId && x.versionGroup === p.versionGroup && x.productId !== p.productId);
+      const split = others.filter(x => x.type !== p.type);
+      if (split.length) list.push({ code: "versionSplit", level: "warn", text: `Its other version${split.length === 1 ? "" : "s"} (${split.map(x => x.versionLabel || x.productId).join(", ")}) ${split.length === 1 ? "is" : "are"} in a different category, so the shop page can't show them on one card` });
+    }
+    if (!Number(p.visible)) list.forEach(x => { x.text += hiddenOnly ? " (hidden — fix before showing it)" : " (hidden, but on an open order)"; if (hiddenOnly && x.level === "error") { x.level = "warn"; x.wasError = true; } });
     if (list.length) orgOf(p.orgId).products[p.productId] = list;
+  }
+  // The shop as a whole: what would make its page look unfinished (no visible products).
+  for (const o of orgs) {
+    const mine = products.filter(p => p.orgId === o.orgId), shown = mine.filter(p => Number(p.visible));
+    const shop = [];
+    if (!shown.length) shop.push({ code: "noVisibleProducts", level: "warn", text: mine.length ? "No product is visible — the shop page is empty (tick Visible on the products to show)" : "No products yet" });
+    // Products with no picture of their own aren't flagged: most shops show the blank's photos (and name each
+    // decoration underneath), so that's normal, not unfinished.
+    orgOf(o.orgId).shop = shop;
   }
   for (const o of Object.values(out.orgs)) { o.productCount = Object.keys(o.products).length; o.designCount = Object.keys(o.designs).length; }
   return out;
@@ -750,8 +1460,9 @@ export async function setProductPersonalization(db, orgId, productId, { mode, ho
 // only the storefront refuses that (a local sale or an Edit items change goes through, and the
 // admin attaches the file with Files).
 export async function priceItem(db, orgId, productId, size, qty, personalized, config, opts = {}) {
-  // Every column, so this keeps working on a database a migration behind the code.
-  const row = await db.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first();
+  // The PUBLISHED product (migrations/0076) — what the shopper saw — every column, so this keeps working on a
+  // database a migration behind the code. A shop never published since then is priced live, as before.
+  const row = await publishedProductRow_(db, orgId, productId);
 
   if (!row || !row.visible) throw pricingError_(`Product not available: ${productId}`);
 
@@ -771,6 +1482,12 @@ export async function priceItem(db, orgId, productId, size, qty, personalized, c
     if (!Number.isFinite(cents) || cents < 0) throw pricingError_(`Size ${String(size).slice(0, 40)} not available for ${productId}`);
     unitPriceCents = cents;
   }
+  // Color price groups (migrations/0064): a configurable line's garment color may be in a group with its own
+  // price for this size. A color in no group keeps the product's own price (Standard).
+  if (row.configurable && Number(row.configurable)) {
+    const group = colorGroupBaseCents_(row, String((config || {}).garmentColor || (config || {}).color || ""), size);
+    if (group != null) unitPriceCents = group;
+  }
 
   // Configurable products (migrations/0036): base price + Σ tier add-ons for the chosen per-location
   // options. Validates each option server-side and returns a snapshot to store on the line.
@@ -779,7 +1496,7 @@ export async function priceItem(db, orgId, productId, size, qty, personalized, c
     const built = await priceConfigurable_(db, orgId, row, size, config, custom);
     const cfgPersCents = personalized && row.personalizationPriceCents != null ? Number(row.personalizationPriceCents) : 0;
     return { unitPrice: fromCents(unitPriceCents + built.addOnCents), personalizationFee: fromCents(cfgPersCents),
-      name: row.name || productId, type: row.type || "", config: built.snapshot,
+      name: productLineName(row, productId), type: row.type || "", config: built.snapshot,
       ...(built.needsCustomUpload ? { needsCustomUpload: true } : {}) };
   }
 
@@ -802,15 +1519,376 @@ export async function priceItem(db, orgId, productId, size, qty, personalized, c
 
   const out = {
     unitPrice: fromCents(unitPriceCents), personalizationFee: fromCents(personalizationFeeCents),
-    name: row.name || productId, type: row.type || "",
+    name: productLineName(row, productId), type: row.type || "",
     ...(needsCustomUpload ? { needsCustomUpload: true } : {}),
   };
   // A plain product can carry a reorder QR code too (migrations/0048): the line's snapshot then holds
   // just that automatic transfer. `plain: true` says "not a configurable line — nothing here was
   // picked", so screens that edit a configurable line's choices leave it alone.
   const qr = await reorderQrEntry_(db, orgId, row.reorderQr);
-  const locs = [customEntry, qr].filter(Boolean);
+  const locs = [customEntry, ...(await fixedTransferEntries_(db, orgId, row)), qr].filter(Boolean);
   if (locs.length) out.config = { garmentColor: "", size: size || "", locations: locs, plain: true };
+  return out;
+}
+
+// The product's printed transfers (migrations/0068) as order-line snapshot entries: one per location, kind
+// 'transfer', `fixed: true`, no add-on — they're part of the product and its price, like the reorder QR, so
+// Run Transfer Sheets, transfer stock and COGS treat them like any other transfer. A graphic that's gone, or
+// isn't a transfer any more, is left out (the catalog check says so). Hidden graphics still apply: hiding one
+// only stops customers picking it.
+async function fixedTransferEntries_(db, orgId, row) {
+  const list = tryParse_(row && row.fixedTransfersJson, []) || [];
+  if (!list.length) return [];
+  const names = {};
+  try { for (const l of await listLocations(db)) names[Number(l.id)] = l.name; } catch (e) {}
+  const out = [];
+  for (const f of list) {
+    const g = Number(f.graphicId) ? await getGraphic(db, Number(f.graphicId)) : null;
+    if (!graphicUsableBy_(g, orgId) || g.kind !== "transfer") continue;
+    const label = names[Number(f.locationId)] || "Printed transfer";
+    const ink = g.inkColors.includes(String(f.ink || "")) ? String(f.ink) : (g.inkColors[0] || "");
+    out.push({ location: "fixed" + (Number(f.locationId) || out.length), label, graphicId: g.id, kind: "transfer",
+      designId: null, transferId: g.transferId, graphicName: g.name, ink, tier: null, addOnCents: 0,
+      imageUrl: g.imageUrl, thumbUrl: g.thumbUrl, fixed: true });
+  }
+  return out;
+}
+
+// ---- Color price groups (migrations/0064) ----------------------------------------------------------
+// The base price (cents) a garment color's group gives this size, or null when the color is in no group (or
+// the group doesn't price that size) — then the product's own price applies.
+export function colorGroupBaseCents_(row, color, size) {
+  if (!color) return null;
+  const groups = tryParse_(row.colorGroupsJson, []) || [];
+  const g = groups.find(x => Array.isArray(x.colors) && x.colors.includes(color));
+  if (!g) return null;
+  if (row.pricingMode === "flat") return g.flatPriceCents == null ? null : Number(g.flatPriceCents);
+  const v = (g.sizePricingCents || {})[size];
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+// Checks color groups sent with a product (dollars) against its pricing mode, sizes and garment colors.
+// Returns {groups} in cents (what's stored) or {error}. Each color sits in at most one group, every group
+// names at least one of the product's colors and prices every size the product prices (or the flat price).
+export function cleanColorGroups_(groups, product) {
+  if (!Array.isArray(groups)) return { error: "Color price groups must be a list." };
+  if (groups.length > 10) return { error: "Up to 10 color price groups." };
+  const colors = Array.isArray(product.garmentColors) ? product.garmentColors.map(String) : [];
+  const flat = product.pricingMode === "flat";
+  const sizes = flat ? [] : Object.keys(product.sizePricing || {}).filter(z => product.sizePricing[z] !== "" && product.sizePricing[z] != null);
+  const used = new Set(), out = [], labels = new Set();
+  for (const [i, g] of groups.entries()) {
+    const label = String(g && g.label || "").trim().slice(0, 40);
+    if (!label) return { error: `Color price group ${i + 1} needs a name.` };
+    if (labels.has(label.toLowerCase())) return { error: `Two color price groups are called “${label}”.` };
+    labels.add(label.toLowerCase());
+    const gColors = [...new Set((Array.isArray(g.colors) ? g.colors : []).map(c => String(c)))];
+    if (!gColors.length) return { error: `“${label}” has no colors.` };
+    for (const c of gColors) {
+      if (colors.length && !colors.includes(c)) return { error: `“${label}”: ${c} isn't one of this product's colors.` };
+      if (used.has(c)) return { error: `${c} is in two color price groups.` };
+      used.add(c);
+    }
+    const money = (v) => { if (v === "" || v == null) return null; const n = Number(v); return Number.isFinite(n) && n >= 0 && n < 100000 ? Math.round(n * 100) : NaN; };
+    const entry = { key: String(g.key || label.toLowerCase().replace(/[^a-z0-9]+/g, "-")).slice(0, 40), label, colors: gColors };
+    if (flat) {
+      const v = money(g.flatPrice);
+      if (v == null || Number.isNaN(v)) return { error: `“${label}” needs a price.` };
+      entry.flatPriceCents = v;
+    } else {
+      entry.sizePricingCents = {};
+      for (const z of sizes) {
+        const v = money((g.sizePricing || {})[z]);
+        if (v == null || Number.isNaN(v)) return { error: `“${label}” needs a price for ${z}.` };
+        entry.sizePricingCents[z] = v;
+      }
+    }
+    out.push(entry);
+  }
+  return { groups: out };
+}
+
+async function setProductColorGroups_(db, orgId, productId, groupsCents) {
+  await db.prepare("UPDATE products SET colorGroupsJson=? WHERE orgId=? AND productId=?").bind(JSON.stringify(groupsCents || []), orgId, productId).run()
+    .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
+}
+
+// Suggested groups from the blank prices behind each color: colors whose linked blank sizes have the same
+// vendor prices (else average cost) form a group. The group most colors share is Standard (the product's
+// own prices); each other group's suggested price keeps Standard's margin — Standard's price plus the
+// difference in blank cost, per size. Returns {standard: {colors, costs}, groups: [{label, colors, costs,
+// sizePricing | flatPrice}], unpriced: [colors with no blank price]} (dollars).
+export async function suggestColorGroups(db, orgId, productId) {
+  const row = await db.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first();
+  if (!row) return null;
+  const p = parseProduct_(row);
+  const flat = p.pricingMode === "flat";
+  const sizes = flat ? ["OSFA"] : Object.keys(p.sizePricing || {});
+  const { results } = await db.prepare(`SELECT l.productColor, l.productSize, bs.vendorPriceCents, bs.purchasePriceCents, bs.mapPriceCents
+    FROM product_blank_links l LEFT JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+    WHERE l.orgId=? AND l.productId=?`).bind(orgId, productId).all();
+  const costOf = {}, mapOf = {};
+  for (const r of results) {
+    if (r.mapPriceCents != null) (mapOf[r.productColor || ""] = mapOf[r.productColor || ""] || {})[r.productSize || "OSFA"] = Number(r.mapPriceCents);
+    const c = r.vendorPriceCents != null ? Number(r.vendorPriceCents) : (Number(r.purchasePriceCents) || null);
+    if (c != null) (costOf[r.productColor || ""] = costOf[r.productColor || ""] || {})[r.productSize || "OSFA"] = c;
+  }
+  const colors = p.garmentColors.length ? p.garmentColors : [""];
+  const sig = (c) => sizes.map(z => (costOf[c] || {})[z] ?? "-").join(",");
+  const bySig = new Map(), unpriced = [];
+  for (const c of colors) {
+    if (!costOf[c]) { unpriced.push(c); continue; }
+    const k = sig(c);
+    (bySig.get(k) || bySig.set(k, []).get(k)).push(c);
+  }
+  const ranked = [...bySig.entries()].sort((a, b) => b[1].length - a[1].length);
+  if (!ranked.length) return { standard: { colors: [], costs: {} }, groups: [], unpriced };
+  const costs = (c) => Object.fromEntries(sizes.map(z => [z, (costOf[c] || {})[z] != null ? fromCents(costOf[c][z]) : null]));
+  const std = ranked[0][1], stdCost = costOf[std[0]];
+  const stdPrice = (z) => flat ? toCents(p.flatPrice) : toCents((p.sizePricing || {})[z]);
+  const groups = ranked.slice(1).map(([, cs], i) => {
+    const cost = costOf[cs[0]];
+    // Never below the group's MAP (migrations/0070): the highest MAP of its colors for that size.
+    const groupMap = (z) => Math.max(0, ...cs.map(c => (mapOf[c] || {})[z] || 0));
+    const priced = (z) => { const base = stdPrice(z); const d = (cost[z] ?? stdCost[z] ?? 0) - (stdCost[z] ?? cost[z] ?? 0); return fromCents(Math.max(0, base + d, groupMap(z))); };
+    const label = cs.length === 1 ? cs[0] : (cs.every(c => /heather/i.test(c)) ? "Heathers" : (Object.values(cost).reduce((a, b) => a + b, 0) > Object.values(stdCost).reduce((a, b) => a + b, 0) ? "Premium colors" : "Value colors") + (i ? " " + (i + 1) : ""));
+    return { label, colors: cs, costs: costs(cs[0]), ...(flat ? { flatPrice: priced("OSFA") } : { sizePricing: Object.fromEntries(sizes.map(z => [z, priced(z)])) }) };
+  });
+  return { standard: { colors: std, costs: costs(std[0]) }, groups, unpriced };
+}
+
+// ---- Pricing awareness (2026-10, migrations/0067) ------------------------------------------------------
+// What each item of a product costs the shop under its price, and what's left. Per price row (a size, or the
+// flat price; per color price group when it has groups):
+//   blank     — the linked blank's vendor price, else its average cost (the dearest color of the group, so a
+//               row never looks better than its worst color); 0 for a product made with no blank
+//   card      — card processing at the Global settings rate (default 2.9% + 30¢), as if paid by card
+//   tax       — the sales tax backed out of the (tax-inclusive) price for a taxable product, in-state
+//   transfer  — the linked transfers' average cost (the reorder QR) + the product's own DTF / transfer cost
+//   supplies  — the product's supplies cost, else the global per-item default
+//   income    = price − all of the above;  hourly = income ÷ (runMinutes ÷ 60), only when a run time is typed
+// A configurable product's graphic add-ons are listed apart (`addOns`, per location its worst graphic: add-on
+// price − card − tax − its transfer's cost). Rows below a target (Global settings → Pricing) are flagged.
+const DEFAULT_PRICING_SETTINGS = { cardPctBps: 290, cardFixedCents: 30, suppliesCents: 0, targetHourlyCents: null, targetIncomeCents: null };
+export async function getPricingSettings(db) {
+  const row = await db.prepare("SELECT value FROM global_settings WHERE key='pricing'").first().catch(() => null);
+  return { ...DEFAULT_PRICING_SETTINGS, ...((row && tryParse_(row.value, {})) || {}) };
+}
+// The settings as the admin screens show them: dollars and percent, plus the sales tax rate in use.
+export async function getPricingSettingsView(db) {
+  const s = await getPricingSettings(db), { rateBps } = await getSalesTaxSettings(db);
+  return { ...s, cardPct: s.cardPctBps / 100, cardFixed: fromCents(s.cardFixedCents), supplies: fromCents(s.suppliesCents),
+    targetHourly: s.targetHourlyCents == null ? null : fromCents(s.targetHourlyCents), targetIncome: s.targetIncomeCents == null ? null : fromCents(s.targetIncomeCents), taxRateBps: rateBps };
+}
+// Takes cents / basis points (orders.js converts what the form sends). A blank target turns that alert off.
+export async function setPricingSettings(db, s) {
+  const n = (v, max, nullable) => {
+    if (v === null || v === undefined || v === "") { if (nullable) return null; throw pricingError_("Fill in every fee field (0 is fine)."); }
+    const x = Math.round(Number(v));
+    if (!Number.isFinite(x) || x < 0 || x > max) throw pricingError_("A pricing setting is out of range.");
+    return x;
+  };
+  const next = { cardPctBps: n(s.cardPctBps, 2000), cardFixedCents: n(s.cardFixedCents, 1000), suppliesCents: n(s.suppliesCents, 100000),
+    targetHourlyCents: n(s.targetHourlyCents, 10000000, true), targetIncomeCents: n(s.targetIncomeCents, 10000000, true) };
+  await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES ('pricing', ?)").bind(JSON.stringify(next)).run();
+  return next;
+}
+
+// Average minutes to make one piece of each product, from its timed, finished runs (every hooping of a piece
+// added up). {productId: {minutes, pieces}} for one shop. Untimed hoopings ("Mark done (no timing)") and pieces
+// with any untimed hooping are left out, so a piece is never counted as quicker than it was.
+async function avgRunMinutesByProduct_(db, orgId) {
+  const { results } = await db.prepare(
+    `SELECT oi.productId, pr.id, pr.itemId, pr.pieceNo, pr.startedAt, pr.finishedAt, pr.timed
+     FROM production_runs pr JOIN order_items oi ON oi.id = pr.itemId
+     WHERE pr.status = 'done' AND oi.orgId = ? AND oi.productId IS NOT NULL AND oi.productId <> ''`).bind(orgId).all().catch(() => ({ results: [] }));
+  const pieces = new Map();
+  for (const r of results || []) {
+    const key = r.productId + "\u0001" + r.itemId + "\u0001" + (r.pieceNo != null ? r.pieceNo : "r" + r.id);
+    const ms = new Date(r.finishedAt) - new Date(r.startedAt);
+    const cur = pieces.get(key) || { productId: r.productId, ms: 0, bad: false };
+    if (!Number(r.timed) || !Number.isFinite(ms) || ms <= 0) cur.bad = true; else cur.ms += ms;
+    pieces.set(key, cur);
+  }
+  const out = {};
+  for (const p of pieces.values()) {
+    if (p.bad) continue;
+    const o = out[p.productId] = out[p.productId] || { totalMs: 0, pieces: 0 };
+    o.totalMs += p.ms; o.pieces++;
+  }
+  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, { minutes: Math.round(v.totalMs / v.pieces / 6000) / 10, pieces: v.pieces }]));
+}
+
+// The pricing analysis of a shop's products (orgId), one product (productId), or every shop (no orgId).
+// `draft` (one product only) = the product form's unsaved price fields, so the numbers follow what's typed.
+// Returns {settings, products: [{orgId, productId, name, visible, runMinutes, avgRunMinutes, avgRunPieces,
+// rows: [{group, size, price, blank, blankSource, card, tax, transfer, supplies, costs, income, hourly, flags}],
+// addOns: [...], minIncome, maxIncome, minHourly, belowTarget, problems: [text]}]}, money in dollars.
+export async function analyzePricing(db, { orgId = null, productId = null, draft = null } = {}) {
+  const settings = await getPricingSettings(db);
+  const { rateBps, taxMode } = await getSalesTaxSettings(db);
+  // Tax added on top (Global settings → Sales tax): the customer pays it over the price, so it isn't a cost —
+  // but the card fee is charged on the price plus that tax. Prices that include tax: the tax comes out of them.
+  const taxOnTop = taxMode_(taxMode) === "exclusive";
+  const where = orgId ? (productId ? "WHERE orgId=? AND productId=?" : "WHERE orgId=?") : "";
+  const binds = orgId ? (productId ? [orgId, productId] : [orgId]) : [];
+  const { results: prows } = await db.prepare(`SELECT * FROM products ${where} ORDER BY orgId, sortOrder, productId`).bind(...binds).all();
+  let products = prows.map(parseProduct_);
+  if (draft && products.length === 1) {
+    const d = draft, p = products[0];
+    for (const k of ["pricingMode", "flatPrice", "sizePricing", "colorGroups", "taxable", "runMinutes", "transferCost", "suppliesCost", "reorderQr", "noBlankNeeded", "fixedTransfers"]) if (d[k] !== undefined) p[k] = d[k];
+  }
+  const linkSql = (map) => `SELECT l.orgId, l.productId, l.productColor, l.productSize, l.blankColor, l.blankSize, bs.vendorPriceCents, bs.purchasePriceCents${map ? ", bs.mapPriceCents" : ""}, b.name AS blankName, b.brand AS blankBrand
+    FROM product_blank_links l LEFT JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+    LEFT JOIN blanks b ON b.id = l.blankId` + (orgId ? " WHERE l.orgId = ?" : "");
+  // (a database from before migrations/0070 has no MAP column: read the links without it)
+  const { results: links } = await db.prepare(linkSql(true)).bind(...(orgId ? [orgId] : [])).all()
+    .catch(() => db.prepare(linkSql(false)).bind(...(orgId ? [orgId] : [])).all());
+  const linksOf = new Map();
+  for (const l of links) { const k = l.orgId + "\u0001" + l.productId; (linksOf.get(k) || linksOf.set(k, []).get(k)).push(l); }
+  const { results: trows } = await db.prepare("SELECT id, name, purchasePriceCents, visible FROM transfers").all().catch(() => ({ results: [] }));
+  const transferById = new Map((trows || []).map(t => [Number(t.id), t]));
+  const { results: grows } = await db.prepare("SELECT id, name, kind, transferId, tier FROM graphics").all().catch(() => ({ results: [] }));
+  const graphicById = new Map((grows || []).map(g => [Number(g.id), g]));
+  const brandRules = await getBrandRules(db).catch(() => null);
+  const tierCache = {}, runCache = {};
+  const tiersOf = async (org) => tierCache[org] || (tierCache[org] = await getTierPrices(db, org));
+  const runsOf = async (org) => runCache[org] || (runCache[org] = await avgRunMinutesByProduct_(db, org));
+  const transferCents = (id) => { const t = transferById.get(Number(id)); return t ? Math.max(0, Number(t.purchasePriceCents) || 0) : 0; };
+  const cardOf = (c) => c > 0 ? Math.round(c * settings.cardPctBps / 10000) + settings.cardFixedCents : 0;
+  const out = [];
+  for (const p of products) {
+    const tiers = await tiersOf(p.orgId), runs = await runsOf(p.orgId);
+    const plinks = linksOf.get(p.orgId + "\u0001" + p.productId) || [];
+    const colorName = (c) => typeof c === "object" && c ? String(c.color || c.name || "") : String(c || "");
+    const garment = (p.garmentColors || []).map(colorName).filter(Boolean);
+    const grouped = new Set((p.colorGroups || []).flatMap(g => g.colors || []));
+    const groups = [{ label: (p.colorGroups || []).length ? "Standard" : "", colors: garment.length ? garment.filter(c => !grouped.has(c)) : [""], sizePricing: p.sizePricing, flatPrice: p.flatPrice }]
+      .concat((p.colorGroups || []).map(g => ({ label: g.label, colors: g.colors || [], sizePricing: g.sizePricing, flatPrice: g.flatPrice })));
+    // The reorder QR's transfer (a plain product can carry one too) + the product's own DTF / transfer cost.
+    const qr = resolveReorderQr_(p.reorderQr, { transferId: tiers.reorderQrTransferId, graphicId: tiers.reorderQrGraphicId });
+    let qrCents = 0, qrName = "";
+    if (qr && qr.transferId) { const t = transferById.get(Number(qr.transferId)); if (t && Number(t.visible)) { qrCents = transferCents(t.id); qrName = t.name || "Reorder QR"; } }
+    else if (qr && qr.graphicId) { const g = graphicById.get(Number(qr.graphicId)); if (g && g.transferId) { qrCents = transferCents(g.transferId); qrName = g.name || "Reorder QR"; } }
+    // Its printed transfers (migrations/0068) are in the base price, so their cost is on every row.
+    let fixedCents = 0;
+    for (const f of Array.isArray(p.fixedTransfers) ? p.fixedTransfers : []) { const g = graphicById.get(Number(f.graphicId)); if (g && g.kind === "transfer" && g.transferId) fixedCents += transferCents(g.transferId); }
+    const ownTransfer = toCentsOrNull(p.transferCost) || 0;
+    const supplies = p.suppliesCost != null ? toCents(p.suppliesCost) : settings.suppliesCents;
+    const blankFor = (colors, size, flat) => {
+      if (p.noBlankNeeded) return { cents: 0, source: "none", map: null, mapOf: "", ruleMin: null, ruleOf: "" };
+      const want = new Set(colors);
+      let cand = plinks.filter(l => (flat || (l.productSize || "") === size) && want.has(l.productColor || ""));
+      if (!cand.length) cand = plinks.filter(l => (flat || (l.productSize || "") === size) && !(l.productColor || ""));
+      let best = null, src = null, map = null, mapOf = "", mapBlank = "", mapBrand = "", ruleMin = null, ruleOf = "";
+      for (const l of cand) {
+        // The price rule (Brand rules): MAP + $ / % for the blank's brand, else the general one — the highest wins.
+        const rule = l.mapPriceCents != null ? priceRuleFor_(brandRules, l.blankBrand) : null;
+        if (rule) { const m = priceRuleMinCents_(Number(l.mapPriceCents), rule); if (ruleMin == null || m > ruleMin) { ruleMin = m; ruleOf = priceRuleText_(rule) + (rule.brand ? ` for ${rule.brand}` : ""); } }
+        const v = l.vendorPriceCents != null ? Number(l.vendorPriceCents) : (Number(l.purchasePriceCents) > 0 ? Number(l.purchasePriceCents) : null);
+        if (v != null && (best == null || v > best)) { best = v; src = l.vendorPriceCents != null ? "vendor" : "average"; }
+        // MAP (migrations/0070): the highest of the linked blank sizes — the price may not be below any of them.
+        if (l.mapPriceCents != null && (map == null || Number(l.mapPriceCents) > map)) { map = Number(l.mapPriceCents); mapOf = [l.blankName, l.blankColor, l.blankSize].filter(Boolean).join(" "); mapBlank = l.blankName || ""; mapBrand = l.blankBrand || ""; }
+      }
+      return { cents: best, source: src, map, mapOf, mapBlank, mapBrand, ruleMin, ruleOf };
+    };
+    const minutes = p.runMinutes != null && Number(p.runMinutes) > 0 ? Number(p.runMinutes) : null;
+    const rows = [];
+    const flat = p.pricingMode === "flat";
+    for (const g of groups) {
+      if (g.label && !g.colors.length) continue;
+      const sizes = flat ? [""] : Object.keys(g.sizePricing || {}).filter(z => (g.sizePricing || {})[z] != null && (g.sizePricing || {})[z] !== "");
+      for (const size of sizes) {
+        const raw = flat ? g.flatPrice : g.sizePricing[size];
+        if (raw == null || raw === "") continue;
+        const price = toCents(raw);
+        const b = blankFor(g.colors, size, flat);
+        const taxIn = p.taxable === false ? 0 : taxOnTop ? addTaxExclusive(price, rateBps).taxCents : splitTaxInclusive(price, rateBps).taxCents;
+        const card = cardOf(taxOnTop ? price + taxIn : price), tax = taxOnTop ? 0 : taxIn;
+        const transfer = qrCents + fixedCents + ownTransfer;
+        const costs = (b.cents || 0) + card + tax + transfer + supplies;
+        const income = price - costs;
+        const hourly = minutes ? Math.round(income * 60 / minutes) : null;
+        const flags = [];
+        if (b.cents == null) flags.push("noBlankCost");
+        if (b.map != null && price < b.map) flags.push("map");
+        else if (b.ruleMin != null && price < b.ruleMin) flags.push("mapRule");
+        // The targets are an OR: a price is fine when it meets EITHER one that applies (the hourly target only applies
+        // with a run time) — a $5 cap that makes $40/hr against $10 / $40/hr targets isn't flagged. It's flagged only
+        // when it misses every target that applies; the flags say which.
+        const incomeOk = settings.targetIncomeCents != null && income >= settings.targetIncomeCents;
+        const hourlyOk = settings.targetHourlyCents != null && hourly != null && hourly >= settings.targetHourlyCents;
+        if (!incomeOk && !hourlyOk) {
+          if (settings.targetIncomeCents != null) flags.push("income");
+          if (settings.targetHourlyCents != null && hourly != null) flags.push("hourly");
+        }
+        rows.push({ group: g.label, size, price, blank: b.cents, blankSource: b.source, map: b.map, mapOf: b.mapOf, mapBlank: b.mapBlank, mapBrand: b.mapBrand, ruleMin: b.ruleMin, ruleOf: b.ruleOf, card, tax, transfer, supplies, costs, income, hourly, flags });
+      }
+    }
+    // A configurable product's graphic add-ons: per location, the offered graphic that leaves the least.
+    const addOns = [];
+    if (p.configurable) for (const loc of p.locations || []) {
+      let worst = null;
+      for (const gid of loc.graphicIds || []) {
+        const g = graphicById.get(Number(gid)); if (!g) continue;
+        const add = g.tier ? (tiers.tiersCents[g.tier] || 0) : 0;
+        const cost = g.kind === "transfer" && g.transferId ? transferCents(g.transferId) : 0;
+        const income = add - (add > 0 ? Math.round(add * settings.cardPctBps / 10000) : 0) - (p.taxable === false ? 0 : splitTaxInclusive(add, rateBps).taxCents) - cost;
+        if (!worst || income < worst.income) worst = { location: loc.label || loc.key, graphic: g.name || "", kind: g.kind, price: add, transfer: cost, income };
+      }
+      if (worst) addOns.push(worst);
+    }
+    const incomes = rows.map(r => r.income), hours = rows.map(r => r.hourly).filter(h => h != null);
+    const problems = [];
+    const has = (r, k) => r.flags.includes(k);
+    const lowBoth = rows.filter(r => has(r, "income") && has(r, "hourly")), lowIncome = rows.filter(r => has(r, "income") && !has(r, "hourly")), lowHourly = rows.filter(r => has(r, "hourly") && !has(r, "income"));
+    const label = (r) => [r.group, r.size].filter(Boolean).join(" ") || "the price";
+    const incT = () => `$${fromCents(settings.targetIncomeCents).toFixed(2)}`, hrT = () => `$${fromCents(settings.targetHourlyCents).toFixed(2)}/hr`;
+    if (lowBoth.length) problems.push(`Below both targets (income under ${incT()}, hourly rate under ${hrT()}) on ${lowBoth.map(label).join(", ")}`);
+    if (lowIncome.length) problems.push(`Income below the ${incT()} target on ${lowIncome.map(label).join(", ")}`);
+    if (lowHourly.length) problems.push(`Hourly rate below the ${hrT()} target on ${lowHourly.map(label).join(", ")}`);
+    // Below the blank's minimum advertised price (migrations/0070) — a hard rule, kept apart from the targets.
+    const mapProblems = rows.filter(r => r.flags.includes("map")).map(r => `${label(r) === "the price" ? "The price" : label(r)} $${fromCents(r.price).toFixed(2)} is below the MAP of $${fromCents(r.map).toFixed(2)} (${r.mapOf})`);
+    // Under the price rule (Brand rules) but not under MAP — a warning, softer than MAP.
+    const ruleProblems = rows.filter(r => r.flags.includes("mapRule")).map(r => `${label(r) === "the price" ? "The price" : label(r)} $${fromCents(r.price).toFixed(2)} is under the price rule of $${fromCents(r.ruleMin).toFixed(2)} (${r.ruleOf})`);
+    const run = runs[p.productId] || null;
+    const $ = (c) => c == null ? null : fromCents(c);
+    out.push({ orgId: p.orgId, productId: p.productId, name: p.name, visible: p.visible, runMinutes: minutes,
+      avgRunMinutes: run ? run.minutes : null, avgRunPieces: run ? run.pieces : 0, reorderQr: qrName, transferOwn: $(ownTransfer), transferFixed: $(fixedCents),
+      suppliesFromProduct: p.suppliesCost != null,
+      belowMap: mapProblems.length > 0, mapProblems, belowPriceRule: ruleProblems.length > 0, ruleProblems,
+      rows: rows.map(r => ({ ...r, price: $(r.price), blank: $(r.blank), map: $(r.map), ruleMin: $(r.ruleMin), card: $(r.card), tax: $(r.tax), transfer: $(r.transfer), supplies: $(r.supplies), costs: $(r.costs), income: $(r.income), hourly: $(r.hourly) })),
+      addOns: addOns.map(a => ({ ...a, price: $(a.price), transfer: $(a.transfer), income: $(a.income) })),
+      minIncome: incomes.length ? $(Math.min(...incomes)) : null, maxIncome: incomes.length ? $(Math.max(...incomes)) : null,
+      minHourly: hours.length ? $(Math.min(...hours)) : null, belowTarget: !!(lowBoth.length || lowIncome.length || lowHourly.length), problems });
+  }
+  return { settings: { ...(await getPricingSettingsView(db)), taxMode: taxOnTop ? "exclusive" : "inclusive" }, taxMode: taxOnTop ? "exclusive" : "inclusive", products: out };
+}
+
+// For the 6 AM roll-up: visible products below a pricing target that WEREN'T last time (global_settings key
+// 'pricingAlerts' = the keys reported then), so each is mentioned once, when it slips — not every morning. A
+// product that recovers and slips again is reported again. `commit()` saves today's set once the email is out.
+export async function getNewPricingAlerts(db) {
+  const prev = new Set(((tryParse_(await getSettingRaw(db, "pricingAlerts").catch(() => null), {}) || {}).keys) || []);
+  const below = (await analyzePricing(db)).products.filter(p => p.visible && (p.belowTarget || p.belowMap));
+  const keys = below.map(p => p.orgId + "|" + p.productId);
+  return { products: below.filter(p => !prev.has(p.orgId + "|" + p.productId)).map(p => ({ orgId: p.orgId, productId: p.productId, name: p.name, problems: [...p.mapProblems, ...p.problems] })),
+    commit: () => setSettingRaw(db, "pricingAlerts", JSON.stringify({ keys, at: new Date().toISOString() })) };
+}
+
+// After a blank's cost changes (vendor prices, a receive moving its average, a vendor file / refresh): the products
+// using those blanks that are now below a pricing target — [{orgId, productId, name, problems}] (visible ones only).
+export async function pricingBelowTargetForBlanks(db, blankIds) {
+  const ids = [...new Set((blankIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return [];
+  const { results } = await db.prepare(`SELECT DISTINCT orgId, productId FROM product_blank_links WHERE blankId IN (${ids.map(() => "?").join(",")})`).bind(...ids).all();
+  const want = new Set(results.map(r => r.orgId + "|" + r.productId));
+  const out = [];
+  for (const org of [...new Set(results.map(r => r.orgId))]) {
+    for (const a of (await analyzePricing(db, { orgId: org })).products) {
+      if (a.visible && (a.belowTarget || a.belowMap) && want.has(a.orgId + "|" + a.productId)) out.push({ orgId: a.orgId, productId: a.productId, name: a.name, problems: [...a.mapProblems, ...a.problems], belowMap: a.belowMap, mapProblems: a.mapProblems });
+    }
+  }
   return out;
 }
 
@@ -882,7 +1960,7 @@ export async function refreshOrderLinesFromCatalog(db, orderId, apply = true) {
   if (order.completedAt) throw new Error("This order is completed — reopen it first");
   const { results: items } = await db.prepare(
     `SELECT i.id, i.name, i.size, i.qty, i.productId, i.configJson, i.cancelDate, COALESCE(i.manufacturedQty,0) AS made,
-            p.configurable, p.reorderQr, p.productId AS hasProduct
+            p.configurable, p.reorderQr, p.fixedTransfersJson, p.productId AS hasProduct
      FROM order_items i LEFT JOIN products p ON p.orgId = i.orgId AND p.productId = i.productId
      WHERE i.orderId = ? ORDER BY i.id`).bind(orderId).all();
   const t = await getTierPrices(db, order.orgId);
@@ -896,7 +1974,7 @@ export async function refreshOrderLinesFromCatalog(db, orderId, apply = true) {
     const changes = [], locs = [];
     const picked = Number(it.configurable) && old && !old.plain;
     if (picked) for (const l of oldLocs) {
-      if (l.auto) continue;
+      if (l.auto || l.fixed) continue;   // re-read below
       const g = l.graphicId ? await getGraphic(db, Number(l.graphicId)) : null;
       if (!g) { locs.push(l); continue; }
       const n = Object.assign({}, l, { kind: g.kind, designId: g.designId, transferId: g.transferId, graphicName: g.name, imageUrl: g.imageUrl, thumbUrl: g.thumbUrl });
@@ -906,6 +1984,15 @@ export async function refreshOrderLinesFromCatalog(db, orderId, apply = true) {
       else if ((l.graphicName || "") !== n.graphicName) changes.push(`"${l.graphicName || ""}" is now "${n.graphicName}"`);
       locs.push(n);
     }
+    // The product's printed transfers (migrations/0068), re-read like the QR.
+    const fixed = await fixedTransferEntries_(db, order.orgId, it);
+    const fkey = (l) => l.location + "|" + (l.transferId || "") + "|" + (l.graphicName || "") + "|" + (l.ink || "");
+    const oldFixed = oldLocs.filter(l => l.fixed);
+    for (const f of fixed) { const o = oldFixed.find(x => x.location === f.location);
+      if (!o) changes.push(`Printed transfer added: ${f.label} — ${f.graphicName}`);
+      else if (fkey(o) !== fkey(f)) changes.push(`Printed transfer at ${f.label} is now ${f.graphicName}${f.transferId ? "" : " (no transfer linked)"}`); }
+    for (const o of oldFixed) if (!fixed.some(f => f.location === o.location)) changes.push(`Printed transfer removed: ${o.label} — ${o.graphicName}`);
+    locs.push(...fixed);
     const oldQr = oldLocs.find(l => l.auto) || null;
     const qr = await reorderQrEntry_(db, order.orgId, it.reorderQr, orgDefault);
     if (qr) locs.push(qr);
@@ -917,7 +2004,7 @@ export async function refreshOrderLinesFromCatalog(db, orderId, apply = true) {
     else if (old && !old.plain) continue;                      // a snapshot we don't understand: leave it
     else {
       // An ordinary line keeps the customer's own design (migrations/0054); only the QR is re-read.
-      const kept = oldLocs.filter(l => l && l.custom).concat(qr ? [qr] : []);
+      const kept = oldLocs.filter(l => l && l.custom).concat(fixed, qr ? [qr] : []);
       next = kept.length ? { garmentColor: "", size: it.size || "", locations: kept, plain: true } : null;
     }
     const nextJson = next ? JSON.stringify(next) : "";
@@ -969,7 +2056,7 @@ async function priceConfigurable_(db, orgId, productRow, size, config, custom = 
     if (!gid) continue; // "None" at this location
     if (!(loc.graphicIds || []).map(Number).includes(gid)) throw pricingError_(`That option isn't available at ${loc.label || loc.key}.`);
     const g = await getGraphic(db, gid);
-    if (!g || g.orgId !== orgId || !g.visible) throw pricingError_("That option isn't available.");
+    if (!graphicUsableBy_(g, orgId) || !g.visible) throw pricingError_("That option isn't available.");
     if (g.allowedLocations.length && !g.allowedLocations.includes(String(loc.key))) throw pricingError_(`${g.name} can't go on ${loc.label || loc.key}.`);
     if (g.allowedGarmentColors.length && garmentColor && !g.allowedGarmentColors.includes(garmentColor)) throw pricingError_(`${g.name} isn't available on ${garmentColor}.`);
     if (garmentColor && blocked.some(b => Number(b.graphicId) === gid && b.color === garmentColor)) throw pricingError_(`${g.name} isn't available on ${garmentColor}.`);
@@ -982,7 +2069,13 @@ async function priceConfigurable_(db, orgId, productRow, size, config, custom = 
       designId: g.designId, transferId: g.transferId, graphicName: g.name, ink, tier: g.tier || null,
       addOnCents: add, imageUrl: g.imageUrl, thumbUrl: g.thumbUrl });
   }
-  if (!snapLocs.length) throw pricingError_("Pick at least one graphic — a blank garment can't be ordered.");
+  // The product's own printed transfers (migrations/0068) decorate it too, so with any of them every location
+  // may be left at None.
+  const fixedLocs = await fixedTransferEntries_(db, orgId, productRow);
+  // A product that offers no options at all (only garment colors — its decoration is its own designs, e.g. one made
+  // with the New shop setup wizard) needs no pick.
+  if (!snapLocs.length && !fixedLocs.length && productLocations.length) throw pricingError_("Pick at least one graphic — a blank garment can't be ordered.");
+  snapLocs.push(...fixedLocs);
 
   // Reorder QR: an automatic, unpriced transfer application (COGS only), appended to the snapshot.
   // It's a TRANSFER linked directly (migrations/0047) — no graphic in between (see reorderQrEntry_).
@@ -1020,6 +2113,57 @@ export async function setSettingRaw(db, key, value) {
 
 export async function deleteSettingRaw(db, key) {
   await db.prepare("DELETE FROM global_settings WHERE key = ?").bind(key).run();
+}
+
+// ---- New shop setup wizard (admin → Manage catalog → New shop setup) ----------------------------------
+// Where the wizard is and what was answered, per shop, so the admin can stop at any screen and resume there. It's
+// working state, not shop data: the shop and its products are written to their own tables as the wizard goes.
+const SHOP_WIZARD_MAX_ = 200000;   // characters of JSON
+const shopWizardKey_ = (orgId) => "shopWizard:" + orgId;
+export async function getShopWizard(db, orgId) {
+  return tryParse_(await getSettingRaw(db, shopWizardKey_(orgId)), null);
+}
+export async function saveShopWizard(db, orgId, state) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) throw Object.assign(new Error("Nothing to save"), { userFacing: true });
+  const json = JSON.stringify(Object.assign({}, state, { updatedAt: new Date().toISOString() }));
+  if (json.length > SHOP_WIZARD_MAX_) throw Object.assign(new Error("The setup is too large to save"), { userFacing: true });
+  await setSettingRaw(db, shopWizardKey_(orgId), json);
+  return JSON.parse(json);
+}
+export async function deleteShopWizard(db, orgId) { await deleteSettingRaw(db, shopWizardKey_(orgId)); }
+// Every shop with a setup in progress: {orgId, step, done, updatedAt}.
+export async function listShopWizards(db) {
+  const rows = (await db.prepare("SELECT key, value FROM global_settings WHERE key LIKE 'shopWizard:%'").all()).results || [];
+  return rows.map(r => { const v = tryParse_(r.value, {}) || {};
+    return { orgId: r.key.slice("shopWizard:".length), step: v.step || "", done: !!v.done, updatedAt: v.updatedAt || "" }; });
+}
+
+// Links every color × size of a product to ONE blank, replacing the product's links (the wizard's "this product is
+// made from that blank"). Names match ignoring case and spaces, as the product form's autoPick does; a product
+// without colors (productColors = [""]) takes the blank's unnamed color, else its first; a one-size product
+// ("OSFA") takes the blank color's only size. Returns {linked, missing: ["Navy XL", …]}.
+export async function setProductLinksFromBlank(db, orgId, productId, blank, productColors, productSizes) {
+  const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, "");
+  const colors = (blank.colors || []).map(c => c.color);
+  const sizesOf = (color) => (blank.sizes || []).filter(z => norm(z.color) === norm(color)).map(z => z.size);
+  const rows = [], missing = [];
+  for (const pc of (productColors && productColors.length ? productColors : [""])) {
+    const bc = pc ? colors.find(c => norm(c) === norm(pc)) : (colors.includes("") ? "" : colors[0]);
+    if (bc === undefined) { missing.push(pc); continue; }
+    const have = sizesOf(bc);
+    for (const ps of productSizes) {
+      const bs = have.find(z => norm(z) === norm(ps)) ?? (ps === "OSFA" && have.length === 1 ? have[0] : undefined);
+      if (bs === undefined) { missing.push((pc ? pc + " " : "") + ps); continue; }
+      rows.push([orgId, productId, pc, ps, Number(blank.id), bc, bs]);
+    }
+  }
+  const stmts = [db.prepare("DELETE FROM product_blank_links WHERE orgId = ? AND productId = ?").bind(orgId, productId)];
+  if (rows.length) stmts.push(...importMultiInsert_(db,
+    "INSERT INTO product_blank_links (orgId, productId, productColor, productSize, blankId, blankColor, blankSize)", "(?, ?, ?, ?, ?, ?, ?)",
+    "ON CONFLICT (orgId, productId, productColor, productSize) DO UPDATE SET blankId=excluded.blankId, blankColor=excluded.blankColor, blankSize=excluded.blankSize",
+    rows, 14));
+  await db.batch(stmts);
+  return { linked: rows.length, missing };
 }
 
 // Atomic increment (one statement), so two Publish clicks can't write the same version.
@@ -1342,7 +2486,7 @@ export async function localToday(env, now) {
 // in for a missing name so nothing ever renders blank.
 export const BUSINESS_NAME_FALLBACK = "Our shop";
 const BUSINESS_FIELDS = { name: 120, legalName: 160, tagline: 200, supportEmail: 200, ownerEmail: 200, receiptsEmail: 200,
-  mailingAddress: 300, venmo: 60, zelle: 200, footer: 300 };
+  mailingAddress: 300, venmo: 60, zelle: 200, footer: 300, poPrefix: 10 };
 const BUSINESS_EMAIL_FIELDS = ["supportEmail", "ownerEmail", "receiptsEmail"];
 // What a visitor's browser may see. ownerEmail / receiptsEmail are internal inboxes and stay private.
 const BUSINESS_PUBLIC_FIELDS = ["name", "legalName", "tagline", "supportEmail", "mailingAddress", "venmo", "zelle", "footer"];
@@ -1372,6 +2516,9 @@ export async function setBusinessProfile(db, p) {
   const bad = (m) => { const e = new Error(m); e.userFacing = true; return e; };
   for (const k of BUSINESS_EMAIL_FIELDS) if (clean[k] && !/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(clean[k])) throw bad("That doesn't look like a valid email: " + clean[k]);
   if (clean.venmo && !/^[A-Za-z0-9_-]+$/.test(clean.venmo)) throw bad("A Venmo username has only letters, numbers, - and _");
+  // Starts the number of each purchase order placed with a supplier (migrations/0072): PO-20261021-1.
+  clean.poPrefix = clean.poPrefix.toUpperCase();
+  if (clean.poPrefix && !/^[A-Z0-9]+$/.test(clean.poPrefix)) throw bad("A purchase order prefix has only letters and numbers");
   await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES ('business', ?)").bind(JSON.stringify(clean)).run();
   return clean;
 }
@@ -1510,21 +2657,55 @@ export function methodFromPaymentMethod(paymentMethod) {
 // opts: { method, reference, feeCents, kind: 'payment'|'refund'|'dispute',
 // receivedAt }. Refunds and lost disputes are NEGATIVE amounts.
 // Returns the new row id, or 0 when it was already recorded.
+// The order's paid flag worked out from the ledger in ONE statement — the same rule as
+// refreshPaidStatus below, orderAmounts' "owed" (items + shipping − discount, plus the sales tax when
+// it's added on top, migrations/0052; test124 checks the two agree) — so it can ride in the same batch
+// as the payment row it depends on. `tm` spells the order's tax mode (its column, or 'inclusive' on a
+// database from before 0052). Bind: [now, orderId].
+const paidRefreshSql_ = (tm) => {
+  const items = "COALESCE((SELECT SUM(lineTotalCents) FROM order_items WHERE orderId = orders.orderId AND cancelDate IS NULL), 0)";
+  const itemsTax = "COALESCE((SELECT SUM(taxCents) FROM order_items WHERE orderId = orders.orderId AND cancelDate IS NULL), 0)";
+  const taxAdded = `(CASE WHEN ${tm} = 'exclusive' THEN MAX(0, ${itemsTax} - COALESCE(discountTaxCents, 0)) ELSE 0 END)`;
+  const owed = `MAX(0, ${items} + (CASE WHEN ${items} > 0 THEN COALESCE(shippingCostCents, 0) ELSE 0 END) - COALESCE(discountCents, 0) + ${taxAdded})`;
+  const received = "COALESCE((SELECT SUM(amountCents) FROM order_payments WHERE orderId = orders.orderId AND kind = 'payment' AND voidedAt IS NULL), 0)";
+  return `UPDATE orders SET
+    paidAt = CASE WHEN ${owed} = 0 THEN paidAt
+                  WHEN ${received} >= ${owed} THEN (CASE WHEN paid = 1 THEN paidAt ELSE COALESCE((SELECT MAX(receivedAt) FROM order_payments WHERE orderId = orders.orderId AND kind = 'payment' AND voidedAt IS NULL), ?) END)
+                  ELSE (CASE WHEN paid = 1 THEN NULL ELSE paidAt END) END,
+    paid = CASE WHEN ${owed} = 0 THEN paid WHEN ${received} >= ${owed} THEN 1 ELSE 0 END
+  WHERE orderId = ?`;
+};
+async function paidRefreshStmt_(db, orderId) {
+  if (db.__ordersHaveTaxMode === undefined) {
+    try { const { results } = await db.prepare("PRAGMA table_info(orders)").all(); db.__ordersHaveTaxMode = results.some(c => c.name === "taxMode"); }
+    catch (e) { db.__ordersHaveTaxMode = false; }
+  }
+  return db.prepare(paidRefreshSql_(db.__ordersHaveTaxMode ? "taxMode" : "'inclusive'")).bind(new Date().toISOString(), orderId);
+}
+
+// Records one ledger row and brings the order's paid flag up to date IN THE SAME TRANSACTION (one
+// batch): the row and the flag can't be left disagreeing by a failure between two writes. A repeat
+// of a payment already recorded (same externalRef — a webhook retry) inserts nothing but still
+// re-checks the flag, so a retry repairs an order instead of just acknowledging. Returns the new
+// row's id, or 0 when it was already there.
 export async function addOrderPayment(db, orderId, amount, note, externalRef = "", opts = {}) {
   const receivedAt = opts.receivedAt || new Date().toISOString();
   const method = PAYMENT_METHODS.includes(opts.method) ? opts.method : "other";
   const kind = ["payment", "refund", "dispute"].includes(opts.kind) ? opts.kind : "payment";
   // Which account the money moved through: given, or the one the method implies.
   const accountId = opts.accountId ? Number(opts.accountId) : await accountIdForMethod(db, method);
-  const result = await db.prepare(
+  const insert = db.prepare(
     `INSERT OR IGNORE INTO order_payments (orderId, amountCents, note, receivedAt, externalRef, method, reference, feeCents, kind, accountId)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(orderId, toCents(amount), note || "", receivedAt, externalRef || "", method,
-    String(opts.reference || "").slice(0, 100), Math.max(0, Math.round(Number(opts.feeCents) || 0)), kind, accountId).run();
-  const id = result.meta.changes > 0 ? Number(result.meta.last_row_id) : 0;
-  if (id && opts.shippingCents > 0) await db.prepare("UPDATE order_payments SET shippingCents=? WHERE id=?").bind(Math.round(opts.shippingCents), id).run();
-  if (id) await refreshPaidStatus(db, orderId);
-  return id;
+    String(opts.reference || "").slice(0, 100), Math.max(0, Math.round(Number(opts.feeCents) || 0)), kind, accountId);
+  const stmts = [insert];
+  // How much of a refund was shipping (migrations/0035): set on the row just inserted, and only then.
+  if (opts.shippingCents > 0) stmts.push(db.prepare("UPDATE order_payments SET shippingCents=? WHERE id = last_insert_rowid() AND changes() > 0").bind(Math.round(opts.shippingCents)));
+  stmts.push(await paidRefreshStmt_(db, orderId));
+  const results = await db.batch(stmts);
+  const meta = (results && results[0] && results[0].meta) || {};
+  return meta.changes > 0 ? Number(meta.last_row_id) : 0;
 }
 
 // Records a shipping payment AND bumps orders.shippingPaidCents atomically
@@ -1542,8 +2723,8 @@ export async function addShippingPayment(db, orderId, amount, note, externalRef,
     db.prepare(
       "UPDATE orders SET shippingPaidCents = shippingPaidCents + ? WHERE orderId = ? AND changes() > 0"
     ).bind(amt, orderId),
+    await paidRefreshStmt_(db, orderId),   // same transaction as the payment row (see addOrderPayment)
   ]);
-  await refreshPaidStatus(db, orderId);
 }
 
 // A Stripe refund on a shipping payment also lowers orders.shippingPaidCents
@@ -1664,6 +2845,12 @@ function parseBlank_(row, sizeRows, colorRows, needleTypeNames) {
   const sizes = (sizeRows || []).map(s => ({
     id: Number(s.id), color: s.color || "", size: s.size || "",
     purchasePrice: fromCents(s.purchasePriceCents), quantity: Number(s.quantity) || 0,
+    // The vendor's price, entered by hand (migrations/0062) — null = not entered. purchasePrice above
+    // is the average cost of what's on hand.
+    vendorPrice: s.vendorPriceCents == null ? null : fromCents(s.vendorPriceCents), vendorPriceAt: s.vendorPriceAt || "",
+    mapPrice: s.mapPriceCents == null ? null : fromCents(s.mapPriceCents),   // migrations/0070 — minimum advertised price
+    reorderPoint: s.reorderPoint == null ? null : Number(s.reorderPoint),     // migrations/0074 — keep at least N free
+    weightOz: s.weightOz == null ? null : Number(s.weightOz),                 // migrations/0077 — one piece, ounces
   }));
   const byColor = new Map();
   for (const c of (colorRows || [])) byColor.set(c.color || "", { color: c.color || "", images: (tryParse_(c.imagesJson, []) || []).map(normBlankImage_).filter(Boolean), sortOrder: Number(c.sortOrder) || 0, sizes: [] });
@@ -1682,6 +2869,14 @@ function parseBlank_(row, sizeRows, colorRows, needleTypeNames) {
     // that follows the thread weight. null / "" = not set.
     needleTypeId,
     needleType:  (needleTypeId != null && needleTypeNames && needleTypeNames[needleTypeId]) || "",
+    // Bought for testing / shop use (migrations/0060) — still inventory, reported as its own group.
+    forTesting:  !!Number(row.forTesting),
+    pricesCheckedAt: row.pricesCheckedAt || "",   // migrations/0062 — the 30-day vendor-price reminder
+    // migrations/0063 — content from its vendor.
+    description: row.description || "",
+    features:    tryParse_(row.featuresJson, []) || [],
+    source:      tryParse_(row.sourceJson, {}) || {},
+    vendorConnectionId: row.vendorConnectionId == null ? null : Number(row.vendorConnectionId),   // migrations/0065
     createdAt:   row.createdAt   || "",
     updatedAt:   row.updatedAt   || "",
     colors,
@@ -1705,6 +2900,30 @@ function normalizeBlankColors_(fields, sizesArg) {
             sizes: Array.isArray(sizesArg) ? sizesArg : (Array.isArray(fields.sizes) ? fields.sizes : []) }];
 }
 
+// Blanks → Find duplicate photos: take the photos the admin ticked off a blank's colors. `removals` =
+// [{color, items: [{index, url}]}] — by POSITION, and only when the photo there still has that address (the same
+// address can be on a color twice, and the first copy must stay). Everything else on the color stays in order. The
+// files stay in the image store (Tools → Orphaned images clears them). Returns {removed, colors}.
+export async function removeBlankColorImages(db, blankId, removals) {
+  const id = Number(blankId);
+  let removed = 0, colors = 0;
+  const now = new Date().toISOString();
+  for (const r of Array.isArray(removals) ? removals : []) {
+    const items = (Array.isArray(r && r.items) ? r.items : []).filter(x => x && Number.isInteger(Number(x.index)));
+    if (!items.length) continue;
+    const row = await db.prepare("SELECT id, imagesJson FROM blank_colors WHERE blankId = ? AND color = ?").bind(id, String(r.color || "")).first();
+    if (!row) continue;
+    const list = tryParse_(row.imagesJson, []) || [];
+    const urlOf = (im) => String(typeof im === "object" && im ? im.url : im);
+    const drop = new Set(items.filter(x => list[Number(x.index)] !== undefined && urlOf(list[Number(x.index)]) === String(x.url)).map(x => Number(x.index)));
+    if (!drop.size || drop.size >= list.length) continue;   // never empties a color
+    const keep = list.filter((im, i) => !drop.has(i));
+    await db.prepare("UPDATE blank_colors SET imagesJson = ?, updatedAt = ? WHERE id = ?").bind(JSON.stringify(keep), now, row.id).run();
+    removed += drop.size; colors++;
+  }
+  return { removed, colors };
+}
+
 export async function getAllBlanks(db) {
   const { results: blankRows } = await db.prepare(
     "SELECT * FROM blanks ORDER BY productType, brand, name, color"
@@ -1726,33 +2945,80 @@ export async function getAllBlanks(db) {
 // Upserts a blank's color catalog + color-keyed sizes, recording any starting/edited stock as
 // movements so the history always sums to stock. `mode` 'create' records new stock as 'adjust'
 // "Initial stock"; 'update' diffs new−old per (color,size) and records the delta.
-async function writeBlankColors_(db, id, colors, mode) {
+// Replaces a blank's colors and sizes with `colors`, in ONE transaction: the old rows are deleted and
+// the new ones inserted — and the stock movements recorded — together or not at all. (They used to be
+// separate steps, so a save that failed halfway left the blank with no sizes and no stock.)
+//
+// Stock and cost are only changed where the form's user changed them. The form sends, for each size
+// it loaded, the numbers it was SHOWING (`baseQuantity`, `basePurchasePrice`). A size whose quantity
+// box still holds the shown number keeps whatever the database has NOW — an order made or a delivery
+// received while the form sat open is not overwritten — and a changed box applies the DIFFERENCE
+// (shown 10, typed 12, now 7 → 9). The same for cost: an untouched box keeps the current average
+// cost. A caller that doesn't send the shown numbers (an import, an older page) sets them outright,
+// as before.
+// Writes the blank's colors and sizes from the form. Per size: quantity (a change is an adjustment
+// movement), the average cost (only when the caller changed it from what it showed — the form no longer
+// does), and the VENDOR price (migrations/0062; only when sent — undefined keeps it, "" clears it), each
+// change kept in blank_vendor_prices. Returns the vendor-price changes [{color, size, from, to}] (cents).
+// A weight in ounces: a number 0–1000, two decimals; anything else (blank, junk) = null (not known).
+function cleanWeightOz_(v) {
+  if (v === "" || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 && n <= 1000 ? Math.round(n * 100) / 100 : null;
+}
+
+async function writeBlankColors_(db, id, colors, mode, opts = {}) {
   const now = new Date().toISOString();
   // Old stock for diffing (update) / nothing (create).
   const { results: oldRows } = mode === "update"
-    ? await db.prepare("SELECT color, size, quantity, purchasePriceCents FROM blank_sizes WHERE blankId=?").bind(Number(id)).all()
+    ? await db.prepare("SELECT * FROM blank_sizes WHERE blankId=?").bind(Number(id)).all()
     : { results: [] };
   const oldByKey = new Map(oldRows.map(r => [(r.color || "") + "|" + r.size, r]));
-  // Replace the color catalog + sizes wholesale, then re-seed from `colors`.
-  await db.batch([
+  const shown = (v) => (v === undefined || v === null || v === "" || !Number.isFinite(Number(v))) ? null : Number(v);
+  const stmts = [
     db.prepare("DELETE FROM blank_colors WHERE blankId=?").bind(Number(id)),
     db.prepare("DELETE FROM blank_sizes WHERE blankId=?").bind(Number(id)),
-  ]);
-  const writes = [], movements = [];
+  ];
+  const movements = [], priceChanges = [];
+  const seen = new Set();
   let sortOrder = 0;
   for (const c of colors) {
     const color = String(c.color || "").slice(0, 80);
-    writes.push(db.prepare("INSERT INTO blank_colors (blankId, color, imagesJson, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+    stmts.push(db.prepare("INSERT INTO blank_colors (blankId, color, imagesJson, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
       .bind(Number(id), color, JSON.stringify(c.images || []), sortOrder++, now, now));
     for (const s of (c.sizes || [])) {
       const size = String(s.size || "").slice(0, 20);
-      if (!size) continue;
-      const qty = Math.max(0, Math.floor(Number(s.quantity) || 0));
-      const costCents = Math.max(0, toCents(s.purchasePrice));
-      writes.push(db.prepare("INSERT INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity) VALUES (?, ?, ?, ?, ?)")
-        .bind(Number(id), color, size, costCents, qty));
+      if (!size || seen.has(color + "|" + size)) continue;
+      seen.add(color + "|" + size);
       const old = oldByKey.get(color + "|" + size);
-      const delta = qty - (old ? Number(old.quantity) || 0 : 0);
+      const oldQty = old ? Number(old.quantity) || 0 : 0;
+      const typedQty = Math.max(0, Math.floor(Number(s.quantity) || 0));
+      const baseQty = old ? shown(s.baseQuantity) : null;
+      const qty = baseQty === null ? typedQty : Math.max(0, oldQty + (typedQty - Math.max(0, Math.floor(baseQty))));
+      const typedCost = Math.max(0, toCents(s.purchasePrice));
+      const baseCost = old ? shown(s.basePurchasePrice) : null;
+      const oldVendor = old && old.vendorPriceCents != null ? Number(old.vendorPriceCents) : null;
+      let vendor = oldVendor, vendorAt = old ? old.vendorPriceAt || null : null;
+      if (s.vendorPrice !== undefined) {
+        const v = shown(s.vendorPrice) === null ? null : Math.max(0, toCents(s.vendorPrice));
+        if (v !== oldVendor) { vendor = v; vendorAt = now; priceChanges.push({ color, size, from: oldVendor, to: v }); }
+      }
+      // MAP (migrations/0070): kept unless sent ("" / null clears it).
+      let mapCents = old && old.mapPriceCents != null ? Number(old.mapPriceCents) : null;
+      if (s.mapPrice !== undefined) mapCents = shown(s.mapPrice) === null ? null : Math.max(0, toCents(s.mapPrice));
+      // Reorder point (migrations/0074): kept unless sent ("" / null clears it).
+      let reorderPoint = old && old.reorderPoint != null ? Number(old.reorderPoint) : null;
+      if (s.reorderPoint !== undefined) reorderPoint = shown(s.reorderPoint) === null ? null : Math.min(100000, Math.max(0, Math.floor(Number(s.reorderPoint))));
+      // Weight in ounces (migrations/0077): kept unless sent ("" / null clears it).
+      let weightOz = old && old.weightOz != null ? Number(old.weightOz) : null;
+      if (s.weightOz !== undefined) weightOz = cleanWeightOz_(s.weightOz);
+      // A size that's new here starts at the cost typed, else its vendor price.
+      const costCents = !old ? (typedCost || vendor || 0)
+        : (baseCost !== null && typedCost === Math.max(0, toCents(baseCost))) ? Number(old.purchasePriceCents) || 0
+        : (s.purchasePrice === undefined ? Number(old.purchasePriceCents) || 0 : typedCost);
+      stmts.push(db.prepare("INSERT INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity, vendorPriceCents, vendorPriceAt, mapPriceCents, reorderPoint, weightOz) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(Number(id), color, size, costCents, qty, vendor, vendorAt, mapCents, reorderPoint, weightOz));
+      const delta = qty - oldQty;
       if (delta) movements.push({ blankId: Number(id), color, size, qtyDelta: delta, unitCostCents: costCents || (old ? old.purchasePriceCents : 0),
         kind: "adjust", note: mode === "update" ? "Edited in blank form" : "Initial stock" });
       oldByKey.delete(color + "|" + size);
@@ -1761,13 +3027,699 @@ async function writeBlankColors_(db, id, colors, mode) {
   // Sizes present before but gone now → record the removal as an adjustment to zero.
   for (const [key, old] of oldByKey) {
     const q = Number(old.quantity) || 0;
-    if (q) { const [color, size] = key.split("|"); movements.push({ blankId: Number(id), color, size, qtyDelta: -q, unitCostCents: old.purchasePriceCents, kind: "adjust", note: "Edited in blank form" }); }
+    if (q) { const k = key.indexOf("|"); movements.push({ blankId: Number(id), color: key.slice(0, k), size: key.slice(k + 1), qtyDelta: -q, unitCostCents: old.purchasePriceCents, kind: "adjust", note: "Edited in blank form" }); }
   }
-  if (writes.length) await db.batch(writes);
-  for (const m of movements) await insertMovement_(db, m);
+  if (movements.length) { const blankName = await blankName_(db, Number(id)); for (const m of movements) stmts.push(movementStmt_(db, { ...m, blankName })); }
+  for (const c of priceChanges) stmts.push(vendorPriceStmt_(db, Number(id), c, now, opts.actor, opts.note || (mode === "update" ? "Blank form" : "New blank")));
+  if (priceChanges.length) stmts.push(db.prepare("UPDATE blanks SET pricesCheckedAt=? WHERE id=?").bind(now, Number(id)));
+  await db.batch(stmts);
+  return priceChanges;
 }
 
-export async function createBlank(db, fields, sizes) {
+// ---- Vendor prices (migrations/0062) ------------------------------------------------------------
+// The vendor's price per blank + color + size, entered by hand — separate from the average cost of
+// what's on hand (blank_sizes.purchasePriceCents), which is what cost of goods uses. Every entry is a
+// blank_vendor_prices row. Products are priced from these assumptions: a linked size whose vendor
+// price changed since the product's prices were set flags the product (getProductPriceChanges).
+const VENDOR_PRICE_STALE_DAYS = 30;
+
+function vendorPriceStmt_(db, blankId, c, at, actor, note) {
+  return db.prepare("INSERT INTO blank_vendor_prices (blankId, color, size, priceCents, previousCents, enteredAt, actor, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(Number(blankId), String(c.color || ""), String(c.size || ""), c.to == null ? null : Number(c.to), c.from == null ? null : Number(c.from),
+      at, String(actor || "").slice(0, 120), String(note || "").slice(0, 200));
+}
+
+// "The prices are current" — the vendor's prices were checked and nothing changed.
+export async function markBlankPricesChecked(db, blankId) {
+  const now = new Date().toISOString();
+  const r = await db.prepare("UPDATE blanks SET pricesCheckedAt=? WHERE id=?").bind(now, Number(blankId)).run();
+  return Number(r && r.meta && r.meta.changes) ? now : "";
+}
+
+export async function getBlankVendorPriceHistory(db, blankId) {
+  const { results } = await db.prepare("SELECT * FROM blank_vendor_prices WHERE blankId=? ORDER BY enteredAt DESC, id DESC LIMIT 500").bind(Number(blankId)).all();
+  return results.map(r => ({ id: Number(r.id), color: r.color || "", size: r.size || "",
+    price: r.priceCents == null ? null : fromCents(r.priceCents), previous: r.previousCents == null ? null : fromCents(r.previousCents),
+    enteredAt: r.enteredAt, actor: r.actor || "", note: r.note || "" }));
+}
+
+// Products whose prices were set on different blank prices: per linked blank size, the vendor price in
+// effect when the product's prices were last set or confirmed (pricesReviewedAt, else when it was
+// created) — or, if none was entered yet, the first one entered after — against today's. A size with
+// no vendor price at all has nothing to compare. Returns [{orgId, productId, name, visible,
+// reviewedAt, changes: [{blankId, blankName, color, size, from, to, changedAt}]}] (dollars).
+export async function getProductPriceChanges(db, { orgId = null, visibleOnly = false } = {}) {
+  const where = [orgId ? "p.orgId = ?" : "", visibleOnly ? "p.visible = 1" : ""].filter(Boolean).join(" AND ");
+  let rows;
+  try {
+    rows = (await db.prepare(`SELECT DISTINCT p.orgId, p.productId, p.name, p.visible, COALESCE(p.pricesReviewedAt, p.createdAt) AS reviewedAt,
+        l.blankId, l.blankColor, l.blankSize, l.productColor, b.name AS blankName, bs.vendorPriceCents AS nowCents
+      FROM products p
+      JOIN product_blank_links l ON l.orgId = p.orgId AND l.productId = p.productId
+      JOIN blanks b ON b.id = l.blankId
+      JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+      WHERE bs.vendorPriceAt IS NOT NULL${where ? " AND " + where : ""}`).bind(...(orgId ? [orgId] : [])).all()).results;
+  } catch (e) { if (/no such (table|column)/i.test(String(e && e.message))) return []; throw e; }
+  if (!rows.length) return [];
+  const blankIds = [...new Set(rows.map(r => Number(r.blankId)))];
+  const hist = {};
+  for (let i = 0; i < blankIds.length; i += 50) {
+    const ids = blankIds.slice(i, i + 50);
+    const { results } = await db.prepare(`SELECT blankId, color, size, priceCents, enteredAt FROM blank_vendor_prices WHERE blankId IN (${ids.map(() => "?").join(",")}) ORDER BY enteredAt, id`).bind(...ids).all();
+    for (const h of results) (hist[h.blankId + "|" + (h.color || "") + "|" + (h.size || "")] = hist[h.blankId + "|" + (h.color || "") + "|" + (h.size || "")] || []).push(h);
+  }
+  const out = new Map();
+  for (const r of rows) {
+    const list = hist[r.blankId + "|" + (r.blankColor || "") + "|" + (r.blankSize || "")] || [];
+    if (!list.length) continue;
+    const before = list.filter(h => h.enteredAt <= r.reviewedAt);
+    const basis = before.length ? before[before.length - 1] : list[0];
+    const nowCents = r.nowCents == null ? null : Number(r.nowCents);
+    const basisCents = basis.priceCents == null ? null : Number(basis.priceCents);
+    if (basisCents === nowCents || nowCents == null) continue;
+    const last = list[list.length - 1];
+    const key = r.orgId + "|" + r.productId;
+    if (!out.has(key)) out.set(key, { orgId: r.orgId, productId: r.productId, name: r.name, visible: !!Number(r.visible), reviewedAt: r.reviewedAt, changes: [] });
+    if (out.get(key).changes.some(x => x.blankId === Number(r.blankId) && x.color === (r.blankColor || "") && x.size === (r.blankSize || ""))) continue;
+    out.get(key).changes.push({ blankId: Number(r.blankId), blankName: r.blankName || "", color: r.blankColor || "", size: r.blankSize || "", productColor: r.productColor || "",
+      from: basisCents == null ? null : fromCents(basisCents), to: fromCents(nowCents), changedAt: last.enteredAt });
+  }
+  return [...out.values()];
+}
+
+// Price rule → Apply these prices (Brand rules → Show price impact): set chosen prices of one product. Each change is
+// {group ("" / "Standard" = the product's own prices, else a color price group's label), size ("" = the flat price),
+// price (dollars)}. Only prices the product already has are changed (no size is added). Stamps pricesReviewedAt.
+// Returns {changed: [{group, size, from, to}], problems: [text]} — nothing is written when there's a problem.
+export async function applyProductPrices(db, orgId, productId, changes) {
+  const row = await db.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first();
+  if (!row) return { changed: [], problems: [`${productId}: no such product`] };
+  const flat = row.pricingMode === "flat";
+  let sizes = tryParse_(row.sizePricingCents, {}) || {}, flatC = row.flatPriceCents == null ? null : Number(row.flatPriceCents);
+  const groups = tryParse_(row.colorGroupsJson, []) || [];
+  const changed = [], problems = [];
+  for (const c of Array.isArray(changes) ? changes : []) {
+    const price = Number(c && c.price), size = String((c && c.size) || ""), label = String((c && c.group) || "");
+    const where = `${row.name || productId}${label ? " " + label : ""}${size ? " " + size : ""}`;
+    if (!Number.isFinite(price) || price < 0 || price > 10000) { problems.push(`${where}: not a price`); continue; }
+    const cents = toCents(price);
+    const g = label && label !== "Standard" ? groups.find(x => x.label === label) : null;
+    if (label && label !== "Standard" && !g) { problems.push(`${where}: no such color price group`); continue; }
+    const target = g || null;
+    if (flat || !size) {
+      if (!flat || size) { problems.push(`${where}: the product isn't priced that way any more`); continue; }
+      const from = target ? target.flatPriceCents : flatC;
+      if (from === cents) continue;
+      if (target) target.flatPriceCents = cents; else flatC = cents;
+      changed.push({ group: label, size: "", from: from == null ? null : fromCents(from), to: price });
+    } else {
+      const map = target ? (target.sizePricingCents = target.sizePricingCents || {}) : sizes;
+      if (map[size] == null) { problems.push(`${where}: the product doesn't sell that size`); continue; }
+      if (Number(map[size]) === cents) continue;
+      changed.push({ group: label, size, from: fromCents(Number(map[size])), to: price });
+      map[size] = cents;
+    }
+  }
+  if (problems.length || !changed.length) return { changed: problems.length ? [] : changed, problems };
+  const now = new Date().toISOString();
+  await db.prepare("UPDATE products SET sizePricingCents=?, flatPriceCents=?, colorGroupsJson=?, pricesReviewedAt=?, updatedAt=? WHERE orgId=? AND productId=?")
+    .bind(JSON.stringify(sizes), flatC, JSON.stringify(groups), now, now, orgId, productId).run();
+  return { changed, problems };
+}
+
+// The product's prices are still right for its blanks' current vendor prices.
+export async function confirmProductPrices(db, orgId, productId) {
+  const now = new Date().toISOString();
+  const r = await db.prepare("UPDATE products SET pricesReviewedAt=? WHERE orgId=? AND productId=?").bind(now, orgId, productId).run();
+  return Number(r && r.meta && r.meta.changes) ? now : "";
+}
+
+// Blanks for sale (not for testing) used by a visible product whose vendor prices haven't been checked
+// in 30 days (or ever) — what the roll-up's 30-day reminder lists. [{id, name, vendor, checkedAt,
+// sizesWithPrice, sizes, products: [{orgId, productId, name}]}]
+export async function getBlanksNeedingPriceCheck(db, now = new Date()) {
+  const cutoff = new Date(now.getTime() - VENDOR_PRICE_STALE_DAYS * 86400000).toISOString();
+  let rows;
+  try {
+    rows = (await db.prepare(`SELECT DISTINCT b.id, b.name, b.vendor, b.pricesCheckedAt, p.orgId, p.productId, p.name AS productName
+      FROM blanks b
+      JOIN product_blank_links l ON l.blankId = b.id
+      JOIN products p ON p.orgId = l.orgId AND p.productId = l.productId AND p.visible = 1
+      WHERE b.forTesting = 0 AND (b.pricesCheckedAt IS NULL OR b.pricesCheckedAt < ?)
+      ORDER BY b.name, p.orgId, p.name`).bind(cutoff).all()).results;
+  } catch (e) { if (/no such (table|column)/i.test(String(e && e.message))) return []; throw e; }
+  const byBlank = new Map();
+  for (const r of rows) {
+    if (!byBlank.has(r.id)) byBlank.set(r.id, { id: Number(r.id), name: r.name || "", vendor: r.vendor || "", checkedAt: r.pricesCheckedAt || "", products: [] });
+    byBlank.get(r.id).products.push({ orgId: r.orgId, productId: r.productId, name: r.productName || r.productId });
+  }
+  const list = [...byBlank.values()];
+  for (let i = 0; i < list.length; i += 50) {
+    const ids = list.slice(i, i + 50).map(b => b.id);
+    const { results } = await db.prepare(`SELECT blankId, count(*) n, sum(vendorPriceCents IS NOT NULL) priced FROM blank_sizes WHERE blankId IN (${ids.map(() => "?").join(",")}) GROUP BY blankId`).bind(...ids).all();
+    for (const r of results) { const b = byBlank.get(Number(r.blankId)); if (b) { b.sizes = Number(r.n) || 0; b.sizesWithPrice = Number(r.priced) || 0; } }
+  }
+  return list.map(b => ({ sizes: 0, sizesWithPrice: 0, ...b }));
+}
+
+// Which products use each blank (through product_blank_links), for the Blanks screen: { blankId: [{orgId,
+// orgName, productId, name, visible, sizes: [product sizes linked]}] }, visible products first. A blank
+// missing from the map isn't linked to any product.
+export async function getBlankProductUses(db) {
+  const { results } = await db.prepare(`SELECT l.blankId, l.orgId, o.name AS orgName, p.productId, p.name, p.visible, l.productSize
+    FROM product_blank_links l
+    JOIN products p ON p.orgId = l.orgId AND p.productId = l.productId
+    LEFT JOIN orgs o ON o.orgId = l.orgId
+    ORDER BY p.visible DESC, o.name, p.name, l.productSize`).all();
+  const out = {};
+  for (const r of results) {
+    const list = (out[r.blankId] = out[r.blankId] || []);
+    let p = list.find(x => x.orgId === r.orgId && x.productId === r.productId);
+    if (!p) list.push(p = { orgId: r.orgId, orgName: r.orgName || r.orgId, productId: r.productId, name: r.name || r.productId, visible: !!Number(r.visible), sizes: [] });
+    if (r.productSize && !p.sizes.includes(r.productSize)) p.sizes.push(r.productSize);
+  }
+  return out;
+}
+
+// The 30-day vendor-price reminder in the daily roll-up: due once 30 days have passed since it was last
+// sent (or it never was). global_settings key "blankPriceReminder" = {"sentAt": ISO}.
+export async function getBlankPriceReminder(db, now = new Date()) {
+  const row = await db.prepare("SELECT value FROM global_settings WHERE key='blankPriceReminder'").first().catch(() => null);
+  const state = (row && tryParse_(row.value, null)) || {};
+  const lastSentAt = state.sentAt || "";
+  const due = !lastSentAt || (now.getTime() - Date.parse(lastSentAt)) >= VENDOR_PRICE_STALE_DAYS * 86400000;
+  const nextDueAt = lastSentAt ? new Date(Date.parse(lastSentAt) + VENDOR_PRICE_STALE_DAYS * 86400000).toISOString() : "";
+  const [blanks, products] = await Promise.all([getBlanksNeedingPriceCheck(db, now), getProductPriceChanges(db, { visibleOnly: true })]);
+  return { due, lastSentAt, nextDueAt, blanks, products };
+}
+
+// ---- Vendor blanks (2026-10): onboard complete blanks and per-color prices from a vendor ----------------
+// Every source — a vendor's product file read in the browser, a long-format CSV, later the PromoStandards
+// web services — becomes the same vendor PRODUCT: {vendor, style, name, brand, description, features[],
+// category, sourceUrl, colors: [{color, hex, images: [{url, type, fileName}]}], sizes[], prices: {color:
+// {size: dollars}}} ("*" = every color). planVendorBlanks says what it would do to each blank (matched on
+// vendor + style, strictly); applyVendorBlanks does only what was ticked. Name, brand, category, stock and the
+// average cost of an existing blank are never changed.
+const vendorColorKey_ = (c) => String(c || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const vendorSizeKey_ = (z) => String(z || "").trim().toUpperCase();
+const IMAGE_TYPES_ = ["front", "back", "side", "swatch", "flat", "flatback", "model", "modelback", "other"];
+
+export function cleanVendorProduct_(p) {
+  if (!p || typeof p !== "object") return null;
+  const str = (v, n) => String(v == null ? "" : v).trim().slice(0, n);
+  const style = str(p.style, 100);
+  if (!style) return null;
+  const http = (u) => /^https?:\/\/[^\s"'<>`\\]+$/i.test(String(u || "").trim()) ? String(u).trim().slice(0, 1000) : "";
+  const colors = [], seen = new Set();
+  for (const c of (Array.isArray(p.colors) ? p.colors : []).slice(0, 300)) {
+    const color = str(c && c.color, 80), k = vendorColorKey_(color);
+    if (!color || seen.has(k)) continue;
+    seen.add(k);
+    const hex = /^#?[0-9a-f]{6}$/i.test(String(c.hex || "")) ? "#" + String(c.hex).replace("#", "").toLowerCase() : "";
+    const images = (Array.isArray(c.images) ? c.images : []).slice(0, 20).map(im => ({
+      url: http(im && im.url), type: IMAGE_TYPES_.includes(String(im && im.type || "").toLowerCase()) ? String(im.type).toLowerCase() : "other",
+      fileName: str(im && im.fileName, 200) || String(http(im && im.url)).split(/[?#]/)[0].split("/").pop().slice(0, 200),
+    })).filter(im => im.url || im.fileName);
+    colors.push({ color, hex, images });
+  }
+  const prices = {};
+  for (const [c, m] of Object.entries(p.prices && typeof p.prices === "object" ? p.prices : {}).slice(0, 301)) {
+    const ck = c === "*" ? "*" : vendorColorKey_(c);
+    if (!ck) continue;
+    for (const [z, v] of Object.entries(m && typeof m === "object" ? m : {}).slice(0, 60)) {
+      const n = Number(v);
+      if (!vendorSizeKey_(z) || !Number.isFinite(n) || n < 0 || n > 100000) continue;
+      (prices[ck] = prices[ck] || {})[vendorSizeKey_(z)] = Math.round(n * 100);
+    }
+  }
+  const sizes = [...new Set([...(Array.isArray(p.sizes) ? p.sizes : []).map(vendorSizeKey_), ...Object.values(prices).flatMap(m => Object.keys(m))].filter(Boolean))].slice(0, 60);
+  // MAP (migrations/0070), same shape as prices; null = the file says "no MAP" for that size (S&S's 0.01). `maps` is
+  // undefined when the source has no MAP column at all (PromoStandards, a CSV without one) — then MAP is left alone.
+  let maps;
+  if (p.maps && typeof p.maps === "object") {
+    maps = {};
+    for (const [c, m] of Object.entries(p.maps).slice(0, 301)) {
+      const ck = c === "*" ? "*" : vendorColorKey_(c);
+      if (!ck) continue;
+      for (const [z, v] of Object.entries(m && typeof m === "object" ? m : {}).slice(0, 60)) {
+        if (!vendorSizeKey_(z)) continue;
+        const n = Number(v);
+        (maps[ck] = maps[ck] || {})[vendorSizeKey_(z)] = v != null && v !== "" && Number.isFinite(n) && n > 0.01 && n <= 100000 ? Math.round(n * 100) : null;
+      }
+    }
+  }
+  // Weight per piece in OUNCES (migrations/0077), same shape as prices; undefined when the source has none.
+  let weights;
+  if (p.weights && typeof p.weights === "object") {
+    weights = {};
+    for (const [c, m] of Object.entries(p.weights).slice(0, 301)) {
+      const ck = c === "*" ? "*" : vendorColorKey_(c);
+      if (!ck) continue;
+      for (const [z, v] of Object.entries(m && typeof m === "object" ? m : {}).slice(0, 60)) {
+        const w = cleanWeightOz_(v);
+        if (vendorSizeKey_(z) && w != null && w > 0) (weights[ck] = weights[ck] || {})[vendorSizeKey_(z)] = w;
+      }
+    }
+    if (!Object.keys(weights).length) weights = undefined;
+  }
+  return { vendor: str(p.vendor, 100), style, name: str(p.name, 200), brand: str(p.brand, 100), description: str(p.description, 4000),
+    features: cleanFeatures_(p.features), category: str(p.category, 100), sourceUrl: http(p.sourceUrl), colors, sizes, prices, maps, weights };
+}
+
+// The key a vendor product goes by in a plan and its selections: vendor | style | brand (S&S reuses style
+// numbers across brands).
+const vendorKey_ = (vp) => vp.vendor + "|" + vp.style + (vp.brand ? "|" + vp.brand : "");
+
+// Prices (cents) a vendor product gives one of its colors: its own, else the "every color" row.
+const vendorPricesFor_ = (vp, color) => vp.prices[vendorColorKey_(color)] || vp.prices["*"] || {};
+// A size's MAP from the file: cents, null (the file says none), or undefined (the file doesn't say).
+const vendorMapFor_ = (vp, color, size) => { if (!vp.maps) return undefined; const m = vp.maps[vendorColorKey_(color)] || vp.maps["*"]; return m && Object.prototype.hasOwnProperty.call(m, vendorSizeKey_(size)) ? m[vendorSizeKey_(size)] : undefined; };
+
+// A size's weight from the file, ounces, or undefined (the file doesn't say).
+const vendorWeightFor_ = (vp, color, size) => { if (!vp.weights) return undefined; const m = vp.weights[vendorColorKey_(color)] || vp.weights["*"]; const w = m && m[vendorSizeKey_(size)]; return w == null ? undefined : w; };
+
+export async function planVendorBlanks(db, products, opts = {}) {
+  const list = (products || []).map(cleanVendorProduct_).filter(Boolean).slice(0, 50);
+  const { results: blankRows } = await db.prepare("SELECT id, name, sku, vendor, brand, productType, description, featuresJson, sourceJson FROM blanks").all();
+  const categories = await listProductCategories(db);
+  const out = [];
+  for (const vp of list) {
+    const sameStyle = blankRows.filter(b => String(b.sku || "").trim().toLowerCase() === vp.style.toLowerCase());
+    // Same vendor, and — when both say — the same brand (a blank with no brand matches any).
+    const matches = (vp.vendor ? sameStyle.filter(b => sameVendor_(b.vendor, vp.vendor)) : sameStyle)
+      .filter(b => !vp.brand || !b.brand || sameVendor_(b.brand, vp.brand));
+    const pick = opts.blankIds && opts.blankIds[vendorKey_(vp)];
+    // A blank filed under one of the vendor's ITEM numbers (an S&S invoice's size-specific item #) has no
+    // style # to match on: the browser found that item # in the vendor's file and names the blank here.
+    const aliasIds = opts.aliases && opts.aliases[vendorKey_(vp)] != null ? [].concat(opts.aliases[vendorKey_(vp)]).map(Number).filter(Boolean) : [];
+    const aliasBlanks = matches.length ? [] : aliasIds.map(id => blankRows.find(b => Number(b.id) === id && (!vp.vendor || sameVendor_(b.vendor, vp.vendor)))).filter(Boolean);
+    const alias = aliasBlanks[0] || null;
+    if (alias) matches.push(alias);
+    const blank = (pick && matches.find(b => b.id === Number(pick))) || matches[0] || null;
+    const type = importTypeFromCategory(vp.category, categories) || (blank && blank.productType) || "";
+    const plan = { key: vendorKey_(vp), vendor: vp.vendor, style: vp.style, name: vp.name || [vp.brand, vp.style].filter(Boolean).join(" "),
+      brand: vp.brand, category: type, categoryFromVendor: vp.category, description: vp.description, features: vp.features, sourceUrl: vp.sourceUrl,
+      action: blank ? "update" : "create", blankId: blank ? Number(blank.id) : null, blankName: blank ? blank.name || "" : "",
+      aliasSku: alias && blank && Number(blank.id) === Number(alias.id) ? String(alias.sku || "") : "",
+      alsoFiled: aliasBlanks.slice(1).map(b => ({ id: Number(b.id), name: b.name || "", sku: b.sku || "" })),
+      candidates: matches.map(b => ({ id: Number(b.id), name: b.name || "", vendor: b.vendor || "" })),
+      otherVendors: sameStyle.filter(b => !matches.includes(b)).map(b => ({ id: Number(b.id), name: b.name || "", vendor: b.vendor || "" })),
+      colors: [], priceChanges: 0, newColors: 0, newSizes: 0, repricing: [], currentDescription: "", currentFeatures: [] };
+    let sizeRows = [], colorRows = [], have = new Set();
+    if (blank) {
+      sizeRows = (await db.prepare("SELECT * FROM blank_sizes WHERE blankId=?").bind(blank.id).all()).results;
+      colorRows = (await db.prepare("SELECT color, imagesJson FROM blank_colors WHERE blankId=?").bind(blank.id).all()).results;
+      have = new Set(((tryParse_(blank.sourceJson, {}) || {}).images || []).map(String));
+      plan.currentDescription = blank.description || "";
+      plan.currentFeatures = tryParse_(blank.featuresJson, []) || [];
+    }
+    const blankColorOf = (c) => {
+      const k = vendorColorKey_(c);
+      return [...new Set([...colorRows.map(r => r.color || ""), ...sizeRows.map(r => r.color || "")])].find(x => vendorColorKey_(x) === k);
+    };
+    const changed = [];
+    for (const c of vp.colors.length ? vp.colors : (vp.prices["*"] ? [] : [])) {
+      const onBlank = blank ? blankColorOf(c.color) : undefined;
+      const want = vendorPricesFor_(vp, c.color);
+      const sizes = Object.keys(want).sort((a, b) => sizeRank_(a) - sizeRank_(b));
+      const rows = sizes.map(z => {
+        const cur = onBlank !== undefined ? sizeRows.find(r => (r.color || "") === onBlank && vendorSizeKey_(r.size) === z) : null;
+        const current = cur && cur.vendorPriceCents != null ? Number(cur.vendorPriceCents) : null;
+        const row = { size: cur ? cur.size : z, price: fromCents(want[z]), current: current == null ? null : fromCents(current), onBlank: !!cur,
+          change: !!cur && current !== want[z] };
+        // MAP from the file (migrations/0070), and what the blank has now.
+        const mapNew = vendorMapFor_(vp, c.color, z);
+        if (mapNew !== undefined) { row.map = mapNew == null ? null : fromCents(mapNew); row.mapCurrent = cur && cur.mapPriceCents != null ? fromCents(cur.mapPriceCents) : null; row.mapChange = !!cur && (cur.mapPriceCents == null ? null : Number(cur.mapPriceCents)) !== mapNew; }
+        // Weight from the file (migrations/0077), ounces, and what the blank has now.
+        const wNew = vendorWeightFor_(vp, c.color, z);
+        if (wNew !== undefined) { row.weightOz = wNew; row.weightCurrent = cur && cur.weightOz != null ? Number(cur.weightOz) : null; }
+        if (row.change) changed.push({ color: onBlank, size: cur.size });
+        return row;
+      });
+      // How many photos the blank's color has now (for "Only colors with no photos yet" / "Replace").
+      const colorRow = onBlank !== undefined ? colorRows.find(r => (r.color || "") === onBlank) : null;
+      const imagesNow = colorRow ? ((tryParse_(colorRow.imagesJson, []) || []).length) : 0;
+      const entry = { color: onBlank !== undefined ? onBlank : c.color, vendorColor: c.color, hex: c.hex, onBlank: onBlank !== undefined, imagesNow,
+        images: c.images.map(im => ({ ...im, have: have.has(im.fileName) })), prices: rows, signature: sizes.map(z => z + ":" + want[z]).join(",") };
+      plan.colors.push(entry);
+      if (!entry.onBlank) plan.newColors++;
+      plan.priceChanges += rows.filter(r => r.change).length;
+      if (entry.onBlank) plan.newSizes += rows.filter(r => !r.onBlank).length;
+    }
+    // A long CSV row with no color ("*") prices every color already on the blank.
+    if (!vp.colors.length && vp.prices["*"] && blank) {
+      for (const color of [...new Set(sizeRows.map(r => r.color || ""))]) {
+        const want = vp.prices["*"];
+        const rows = sizeRows.filter(r => (r.color || "") === color && want[vendorSizeKey_(r.size)] != null).map(r => {
+          const current = r.vendorPriceCents == null ? null : Number(r.vendorPriceCents), price = want[vendorSizeKey_(r.size)];
+          if (current !== price) changed.push({ color, size: r.size });
+          return { size: r.size, price: fromCents(price), current: current == null ? null : fromCents(current), onBlank: true, change: current !== price };
+        });
+        plan.colors.push({ color, vendorColor: color, hex: "", onBlank: true, images: [], prices: rows, signature: "" });
+        plan.priceChanges += rows.filter(r => r.change).length;
+      }
+    }
+    // Colors priced differently from most of the style: any size whose price isn't that size's usual price
+    // (a color that just comes in fewer sizes isn't "different").
+    const usual = {};
+    for (const c of plan.colors) for (const z of c.prices) { const k = vendorSizeKey_(z.size); (usual[k] = usual[k] || {})[z.price] = ((usual[k] || {})[z.price] || 0) + 1; }
+    const modeOf = (k) => Object.entries(usual[k] || {}).sort((a, b) => b[1] - a[1])[0];
+    for (const c of plan.colors) { c.differs = c.prices.some(z => { const m = modeOf(vendorSizeKey_(z.size)); return m && Number(m[0]) !== z.price; }); delete c.signature; }
+    plan.descriptionDiffers = !!vp.description && vp.description !== plan.currentDescription;
+    plan.featuresDiffer = vp.features.length > 0 && JSON.stringify(vp.features) !== JSON.stringify(plan.currentFeatures);
+    // Products priced on the prices that change (migrations/0062).
+    if (blank && changed.length) {
+      const { results } = await db.prepare(`SELECT DISTINCT p.orgId, p.productId, p.name, l.blankColor, l.blankSize FROM product_blank_links l
+        JOIN products p ON p.orgId = l.orgId AND p.productId = l.productId WHERE l.blankId = ?`).bind(blank.id).all();
+      const hit = new Map();
+      for (const r of results) if (changed.some(c => c.color === (r.blankColor || "") && c.size === r.blankSize)) hit.set(r.orgId + "|" + r.productId, { orgId: r.orgId, productId: r.productId, name: r.name });
+      plan.repricing = [...hit.values()];
+    }
+    out.push(plan);
+  }
+  return out;
+}
+const sizeRank_ = (z) => { const i = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "OSFA"].indexOf(vendorSizeKey_(z)); return i < 0 ? 50 : i; };
+
+// Does what was ticked. `selections` = [{key, blankId?, create?: {name, brand, sku, productType,
+// needleTypeId}, prices: bool (existing colors' prices, default true), colors: [vendor colors to add (new
+// ones)], newSizes: bool, images: [{color, url, fileName, locationId}] (already uploaded to our bucket),
+// replaceImages: bool (a color that gets images has them INSTEAD of its current ones), description: bool,
+// features: bool}]. Re-plans first, so only what the vendor product really has is
+// written. Returns one result per selection: {key, blankId, created, pricesChanged, colorsAdded,
+// sizesAdded, imagesAdded}.
+export async function applyVendorBlanks(db, products, selections, opts = {}) {
+  const now = new Date().toISOString(), note = String(opts.note || "Vendor import").slice(0, 200);
+  const raw = (products || []).slice(0, 50);
+  const byKey = new Map(raw.map(cleanVendorProduct_).filter(Boolean).map(vp => [vendorKey_(vp), vp]));
+  // Products fetched through a vendor connection (fetchVendorProducts) say which one: the blank is linked to it.
+  const connOf = new Map();
+  for (const p of raw) { const vp = cleanVendorProduct_(p); const c = p && Number(p.connectionId); if (vp && Number.isInteger(c) && c > 0) connOf.set(vendorKey_(vp), c); }
+  const blankIds = {};
+  for (const sel of selections || []) if (sel && sel.blankId) blankIds[sel.key] = sel.blankId;
+  const plans = await planVendorBlanks(db, raw, { blankIds, aliases: opts.aliases || {} });   // the products as sent — the plan cleans them itself
+  const results = [];
+  for (const sel of (selections || []).slice(0, 50)) {
+    const plan = plans.find(p => p.key === sel.key), vp = byKey.get(sel.key);
+    if (!plan || !vp) continue;
+    const res = { key: sel.key, blankId: plan.blankId, created: false, pricesChanged: 0, colorsAdded: 0, sizesAdded: 0, imagesAdded: 0 };
+    const pickColors = new Set((Array.isArray(sel.colors) ? sel.colors : []).map(vendorColorKey_));
+    const imagesFor = (color) => (Array.isArray(sel.images) ? sel.images : []).filter(im => im && vendorColorKey_(im.color) === vendorColorKey_(color) && im.url)
+      .slice(0, 20).map(im => ({ url: String(im.url).slice(0, 500), locationId: im.locationId == null || im.locationId === "" ? null : (Number(im.locationId) || null), fileName: String(im.fileName || "").slice(0, 200) }));
+    const source = (prev) => {
+      const s = prev || {};
+      const files = new Set([...(s.images || []), ...(Array.isArray(sel.images) ? sel.images : []).map(im => im && String(im.fileName || "")).filter(Boolean)]);
+      return JSON.stringify({ ...s, vendor: vp.vendor, style: vp.style, sourceUrl: vp.sourceUrl || s.sourceUrl || "", images: [...files].slice(0, 2000), syncedAt: now });
+    };
+    if (plan.action === "create") {
+      const c = sel.create || {};
+      const colors = plan.colors.filter(x => pickColors.has(vendorColorKey_(x.vendorColor)));
+      if (!colors.length) continue;
+      const fields = { name: String(c.name || plan.name).slice(0, 200), productType: String(c.productType || plan.category || "other").slice(0, 40), vendor: vp.vendor,
+        brand: String(c.brand != null ? c.brand : plan.brand).slice(0, 100), sku: String(c.sku || vp.style).slice(0, 100), notes: "",
+        description: vp.description, features: vp.features,
+        colors: colors.map(x => ({ color: x.vendorColor, images: imagesFor(x.vendorColor).map(({ url, locationId }) => ({ url, locationId })),
+          sizes: x.prices.map(z => ({ size: z.size, quantity: 0, vendorPrice: z.price, ...(z.map !== undefined ? { mapPrice: z.map == null ? "" : z.map } : {}), ...(z.weightOz !== undefined ? { weightOz: z.weightOz } : {}) })) })) };
+      if (c.needleTypeId != null && c.needleTypeId !== "") fields.needleTypeId = Number(c.needleTypeId) || null;
+      const made = await createBlank(db, fields, undefined, { actor: opts.actor, note });
+      await db.prepare("UPDATE blanks SET sourceJson=?, vendorConnectionId=COALESCE(?, vendorConnectionId) WHERE id=?").bind(source({}), connOf.get(sel.key) || null, made.id).run();
+      Object.assign(res, { blankId: made.id, created: true, colorsAdded: colors.length, sizesAdded: colors.reduce((n, x) => n + x.prices.length, 0),
+        pricesChanged: made.priceChanges.length, imagesAdded: colors.reduce((n, x) => n + imagesFor(x.vendorColor).length, 0) });
+      results.push(res);
+      continue;
+    }
+    const id = plan.blankId;
+    // 1. New colors and (if ticked) the sizes an existing color is missing — empty, no stock.
+    const add = [];
+    for (const x of plan.colors) {
+      if (!x.onBlank && pickColors.has(vendorColorKey_(x.vendorColor))) { add.push(...x.prices.map(z => ({ color: x.color, size: z.size }))); res.colorsAdded++; }
+      else if (x.onBlank && sel.newSizes) add.push(...x.prices.filter(z => !z.onBlank).map(z => ({ color: x.color, size: z.size })));
+    }
+    if (add.length) res.sizesAdded = await addBlankSizes(db, id, add);
+    // 2. Vendor prices, per color and size.
+    const { results: rows } = await db.prepare("SELECT color, size, vendorPriceCents, mapPriceCents, weightOz FROM blank_sizes WHERE blankId=?").bind(id).all();
+    const stmts = [];
+    for (const x of plan.colors) {
+      const included = x.onBlank ? sel.prices !== false : pickColors.has(vendorColorKey_(x.vendorColor));
+      if (!included) continue;
+      for (const z of x.prices) {
+        const row = rows.find(r => (r.color || "") === x.color && vendorSizeKey_(r.size) === vendorSizeKey_(z.size));
+        if (!row) continue;
+        // MAP rides with the vendor prices (migrations/0070): set or cleared as the file says, left alone if it says nothing.
+        if (z.map !== undefined) {
+          const mapTo = z.map == null ? null : toCents(z.map), mapFrom = row.mapPriceCents == null ? null : Number(row.mapPriceCents);
+          if (mapTo !== mapFrom) { stmts.push(db.prepare("UPDATE blank_sizes SET mapPriceCents=? WHERE blankId=? AND color=? AND size=?").bind(mapTo, id, row.color || "", row.size)); res.mapsChanged = (res.mapsChanged || 0) + 1; }
+        }
+        // Weight (migrations/0077): filled from the file only where the blank has none — a weight typed in stays.
+        if (z.weightOz !== undefined && row.weightOz == null) {
+          stmts.push(db.prepare("UPDATE blank_sizes SET weightOz=? WHERE blankId=? AND color=? AND size=?").bind(z.weightOz, id, row.color || "", row.size)); res.weightsFilled = (res.weightsFilled || 0) + 1;
+        }
+        const to = toCents(z.price), from = row.vendorPriceCents == null ? null : Number(row.vendorPriceCents);
+        if (from === to) continue;
+        stmts.push(db.prepare("UPDATE blank_sizes SET vendorPriceCents=?, vendorPriceAt=? WHERE blankId=? AND color=? AND size=?").bind(to, now, id, row.color || "", row.size));
+        stmts.push(vendorPriceStmt_(db, id, { color: row.color || "", size: row.size, from, to }, now, opts.actor, note));
+        res.pricesChanged++;
+      }
+    }
+    // 3. Images onto their colors (no duplicates).
+    const { results: colorRows } = await db.prepare("SELECT color, imagesJson FROM blank_colors WHERE blankId=?").bind(id).all();
+    for (const x of plan.colors) {
+      const imgs = imagesFor(x.vendorColor);
+      if (!imgs.length) continue;
+      const row = colorRows.find(r => (r.color || "") === x.color);
+      // "Replace this blank's photos": the color's photos become just the new ones; otherwise they're added.
+      const current = sel.replaceImages ? [] : (tryParse_(row && row.imagesJson, []) || []).map(normBlankImage_).filter(Boolean);
+      const fresh = imgs.filter((im, i, all) => !current.some(c => c.url === im.url) && all.findIndex(o => o.url === im.url) === i).map(({ url, locationId }) => ({ url, locationId }));
+      if (!fresh.length) continue;
+      if (sel.replaceImages && row) res.imagesReplaced = (res.imagesReplaced || 0) + (tryParse_(row.imagesJson, []) || []).length;
+      stmts.push(row ? db.prepare("UPDATE blank_colors SET imagesJson=?, updatedAt=? WHERE blankId=? AND color=?").bind(JSON.stringify([...current, ...fresh].slice(0, 20)), now, id, x.color)
+        : db.prepare("INSERT OR IGNORE INTO blank_colors (blankId, color, imagesJson, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, 999, ?, ?)").bind(id, x.color, JSON.stringify(fresh.slice(0, 20)), now, now));
+      res.imagesAdded += fresh.length;
+    }
+    // 4. Content, only when ticked; where it came from; prices checked.
+    const blank = await db.prepare("SELECT sourceJson FROM blanks WHERE id=?").bind(id).first();
+    if (sel.description && vp.description) stmts.push(db.prepare("UPDATE blanks SET description=? WHERE id=?").bind(vp.description, id));
+    // Filed under an item #: take the style # as its SKU (ticked), so the next import matches it by style.
+    if (sel.setSku && plan.aliasSku) { stmts.push(db.prepare("UPDATE blanks SET sku=? WHERE id=?").bind(vp.style.slice(0, 100), id)); res.skuFrom = plan.aliasSku; res.skuTo = vp.style; }
+    if (sel.features && vp.features.length) stmts.push(db.prepare("UPDATE blanks SET featuresJson=? WHERE id=?").bind(JSON.stringify(vp.features), id));
+    stmts.push(db.prepare("UPDATE blanks SET sourceJson=?, pricesCheckedAt=CASE WHEN ? THEN ? ELSE pricesCheckedAt END, updatedAt=? WHERE id=?")
+      .bind(source(tryParse_(blank && blank.sourceJson, {})), sel.prices !== false ? 1 : 0, now, now, id));
+    // Updated through a vendor connection: linked to it if it wasn't linked to any (one linked elsewhere stays put).
+    if (connOf.get(sel.key)) stmts.push(db.prepare("UPDATE blanks SET vendorConnectionId=? WHERE id=? AND vendorConnectionId IS NULL").bind(connOf.get(sel.key), id));
+    await db.batch(stmts);
+    results.push(res);
+  }
+  return results;
+}
+
+// ---- Vendor connections (migrations/0065): PromoStandards suppliers ----------------------------------------
+// The id + password are encrypted (functions/_lib/vendorCredentials.js) before they reach here and never
+// leave the server: parseVendorConnection_ says only whether they're set.
+const parseVendorConnection_ = (r) => ({ id: Number(r.id), companyCode: r.companyCode, name: r.name,
+  endpoints: tryParse_(r.endpointsJson, {}) || {}, overrides: tryParse_(r.overridesJson, {}) || {}, hasCredentials: !!r.credentialsEnc,
+  status: r.status || "new", lastTestedAt: r.lastTestedAt || "", lastRefreshAt: r.lastRefreshAt || "", lastError: r.lastError || "",
+  blankCount: Number(r.blankCount) || 0, createdAt: r.createdAt, updatedAt: r.updatedAt });
+
+export async function listVendorConnections(db) {
+  try {
+    const { results } = await db.prepare(`SELECT c.*, (SELECT count(*) FROM blanks b WHERE b.vendorConnectionId = c.id) AS blankCount
+      FROM vendor_connections c ORDER BY c.name`).all();
+    return results.map(parseVendorConnection_);
+  } catch (e) { if (/no such (table|column)/i.test(String(e && e.message))) return []; throw e; }
+}
+// The raw row (with credentialsEnc) — server use only.
+export async function getVendorConnectionRow(db, id) {
+  return db.prepare("SELECT * FROM vendor_connections WHERE id=?").bind(Number(id)).first();
+}
+// Creates or updates. credentialsEnc: undefined keeps what's stored, "" clears it.
+export async function saveVendorConnection(db, c) {
+  const now = new Date().toISOString();
+  const endpoints = JSON.stringify(c.endpoints || {}), overrides = JSON.stringify(c.overrides || {});
+  if (c.id) {
+    await db.prepare(`UPDATE vendor_connections SET name=?, endpointsJson=?, overridesJson=?, credentialsEnc=COALESCE(?, credentialsEnc), status=CASE WHEN ? THEN 'new' ELSE status END, updatedAt=? WHERE id=?`)
+      .bind(String(c.name).slice(0, 100), endpoints, overrides, c.credentialsEnc === undefined ? null : c.credentialsEnc, c.credentialsEnc !== undefined ? 1 : 0, now, Number(c.id)).run();
+    return Number(c.id);
+  }
+  const r = await db.prepare(`INSERT INTO vendor_connections (companyCode, name, endpointsJson, overridesJson, credentialsEnc, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(String(c.companyCode).slice(0, 60), String(c.name).slice(0, 100), endpoints, overrides, c.credentialsEnc || "", now, now).run();
+  return Number(r.meta.last_row_id);
+}
+export async function setVendorConnectionStatus(db, id, { ok, error = "", tested = false, refreshed = false }) {
+  const now = new Date().toISOString();
+  await db.prepare(`UPDATE vendor_connections SET status=?, lastError=?, lastTestedAt=CASE WHEN ? THEN ? ELSE lastTestedAt END,
+    lastRefreshAt=CASE WHEN ? THEN ? ELSE lastRefreshAt END, updatedAt=? WHERE id=?`)
+    .bind(ok ? "ok" : "error", String(error || "").slice(0, 500), tested ? 1 : 0, now, refreshed ? 1 : 0, now, now, Number(id)).run();
+}
+export async function deleteVendorConnection(db, id) {
+  await db.batch([db.prepare("UPDATE blanks SET vendorConnectionId=NULL WHERE vendorConnectionId=?").bind(Number(id)),
+    db.prepare("DELETE FROM vendor_connections WHERE id=?").bind(Number(id))]);
+}
+// Which blanks get their prices and content from this connection: exactly `blankIds` (others are unlinked).
+export async function linkBlanksToVendorConnection(db, id, blankIds) {
+  const ids = [...new Set((blankIds || []).map(Number).filter(Boolean))].slice(0, 2000);
+  const stmts = [db.prepare("UPDATE blanks SET vendorConnectionId=NULL WHERE vendorConnectionId=?").bind(Number(id))];
+  for (let i = 0; i < ids.length; i += 90) stmts.push(db.prepare(`UPDATE blanks SET vendorConnectionId=? WHERE id IN (${ids.slice(i, i + 90).map(() => "?").join(",")})`).bind(Number(id), ...ids.slice(i, i + 90)));
+  await db.batch(stmts);
+  return ids.length;
+}
+
+// ---- Orders placed with a supplier (migrations/0072) ----------------------------------------------------
+// The blanks and sizes an order to a supplier is for: {blank: {…}, sizes: Map("color|size" → row)} per blankId.
+export async function getBlanksForSupplierOrder(db, blankIds) {
+  const ids = [...new Set((blankIds || []).map(Number).filter(Boolean))].slice(0, 200);
+  const out = new Map();
+  if (!ids.length) return out;
+  const ph = ids.map(() => "?").join(",");
+  const [{ results: blanks }, { results: sizes }] = await Promise.all([
+    db.prepare(`SELECT * FROM blanks WHERE id IN (${ph})`).bind(...ids).all(),
+    db.prepare(`SELECT * FROM blank_sizes WHERE blankId IN (${ph})`).bind(...ids).all(),
+  ]);
+  for (const b of blanks) out.set(Number(b.id), { blank: b, sizes: new Map() });
+  for (const z of sizes) { const e = out.get(Number(z.blankId)); if (e) e.sizes.set((z.color || "") + "\u0001" + (z.size || ""), z); }
+  return out;
+}
+// A PO number nobody has used: <prefix>-YYYYMMDD-N (≤ 28 characters, letters, digits and dashes).
+export async function nextSupplierPoNumber(db, prefix = "PO", now = new Date()) {
+  const day = now.toISOString().slice(0, 10).replace(/-/g, "");
+  const base = `${String(prefix || "PO").replace(/[^A-Za-z0-9]/g, "").slice(0, 10) || "PO"}-${day}-`;
+  const { results } = await db.prepare("SELECT poNumber FROM supplier_orders WHERE poNumber LIKE ?").bind(base + "%").all();
+  let n = 1;
+  for (const r of results) { const k = Number(String(r.poNumber).slice(base.length)); if (Number.isInteger(k) && k >= n) n = k + 1; }
+  return base + n;
+}
+function parseSupplierOrder_(r) {
+  if (!r) return null;
+  return { id: Number(r.id), connectionId: Number(r.connectionId), vendor: r.vendor || "", environment: r.environment, poNumber: r.poNumber, status: r.status,
+    transactionId: r.transactionId || "", error: r.error || "", carrier: r.carrier || "", service: r.service || "",
+    shipTo: tryParse_(r.shipToJson, {}), total: fromCents(r.totalCents), lines: tryParse_(r.linesJson, []), itemIds: tryParse_(r.itemIdsJson, []),
+    createdAt: r.createdAt, createdBy: r.createdBy || "", placedAt: r.placedAt || "", lastShipmentCheckAt: r.lastShipmentCheckAt || "",
+    cancelledAt: r.cancelledAt || "", cancelNote: r.cancelNote || "" };
+}
+// Writes the row as 'sending' BEFORE the supplier is called; the UNIQUE poNumber makes a second click (or a
+// second tab) fail here instead of ordering twice. Returns the new id, or null if the PO number is taken.
+export async function insertSupplierOrder(db, o) {
+  const now = new Date().toISOString();
+  try {
+    const r = await db.prepare(`INSERT INTO supplier_orders (connectionId, vendor, environment, poNumber, status, carrier, service, shipToJson, totalCents, linesJson, itemIdsJson, createdAt, createdBy)
+      VALUES (?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(Number(o.connectionId), String(o.vendor || "").slice(0, 100), o.environment === "test" ? "test" : "production", String(o.poNumber), String(o.carrier || ""), String(o.service || ""),
+        JSON.stringify(o.shipTo || {}), Math.max(0, Math.round(Number(o.totalCents) || 0)), JSON.stringify(o.lines || []), JSON.stringify(o.itemIds || []), now, String(o.createdBy || "").slice(0, 200)).run();
+    return Number(r.meta.last_row_id);
+  } catch (e) {
+    if (/UNIQUE/i.test(String(e && e.message))) return null;
+    throw e;
+  }
+}
+// A retry of an order whose answer never came ('unknown') or that the supplier refused ('failed'): back to
+// 'sending' only if it's still in that state — so two retries can't both send.
+export async function claimSupplierOrderRetry(db, id) {
+  const r = await db.prepare("UPDATE supplier_orders SET status='sending', error='' WHERE id=? AND status IN ('unknown', 'failed')").bind(Number(id)).run();
+  return !!(r.meta && r.meta.changes);
+}
+export async function setSupplierOrderResult(db, id, { status, transactionId = "", error = "" }) {
+  const placed = status === "placed";
+  await db.prepare("UPDATE supplier_orders SET status=?, transactionId=?, error=?, placedAt=CASE WHEN ? THEN ? ELSE placedAt END WHERE id=?")
+    .bind(status, String(transactionId || "").slice(0, 200), String(error || "").slice(0, 500), placed ? 1 : 0, new Date().toISOString(), Number(id)).run();
+}
+export async function getSupplierOrder(db, id) {
+  return parseSupplierOrder_(await db.prepare("SELECT * FROM supplier_orders WHERE id=?").bind(Number(id)).first());
+}
+export async function getSupplierOrderByPo(db, poNumber) {
+  return parseSupplierOrder_(await db.prepare("SELECT * FROM supplier_orders WHERE poNumber=?").bind(String(poNumber || "")).first());
+}
+// Newest first, each with the blank shipments found for it so far (by PO number, see recordSupplierShipments).
+export async function listSupplierOrders(db, { limit = 30 } = {}) {
+  const { results } = await db.prepare("SELECT * FROM supplier_orders ORDER BY createdAt DESC, id DESC LIMIT ?").bind(Math.min(200, Math.max(1, Number(limit) || 30))).all();
+  const orders = results.map(parseSupplierOrder_);
+  if (!orders.length) return orders;
+  const { results: ships } = await db.prepare(`SELECT id, carrier, trackingNumber, shippedAt, status, deliveredAt, supplierPoNumber FROM blank_shipments
+    WHERE supplierPoNumber IN (${orders.map(() => "?").join(",")})`).bind(...orders.map(o => o.poNumber)).all().catch(() => ({ results: [] }));
+  for (const o of orders) o.shipments = ships.filter(s => s.supplierPoNumber === o.poNumber)
+    .map(s => ({ id: Number(s.id), carrier: s.carrier || "", trackingNumber: s.trackingNumber || "", shippedAt: s.shippedAt || "", status: s.status || "", deliveredAt: s.deliveredAt || "" }));
+  return orders;
+}
+// Placed orders still worth asking the supplier about: placed in the last `days`, least recently checked first.
+export async function supplierOrdersAwaitingShipment(db, { days = 30, limit = 10 } = {}) {
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const { results } = await db.prepare(`SELECT * FROM supplier_orders WHERE status='placed' AND cancelledAt IS NULL AND placedAt >= ?
+    ORDER BY COALESCE(lastShipmentCheckAt, '') ASC, placedAt ASC LIMIT ?`).bind(since, Math.max(1, Number(limit) || 10)).all();
+  return results.map(parseSupplierOrder_);
+}
+// Records the tracking numbers the supplier reported for one of its orders: each one not seen before becomes a
+// blank shipment covering the order's lines (addBlankShipment — which stamps them shipped, and the daily Shippo
+// check takes over from there). Returns how many were new.
+export async function recordSupplierShipments(db, order, shipments) {
+  let added = 0;
+  for (const s of shipments || []) {
+    const tn = String(s.trackingNumber || "").trim();
+    if (!tn) continue;
+    const seen = await db.prepare("SELECT id FROM blank_shipments WHERE trackingNumber=?").bind(tn).first();
+    if (seen) continue;
+    let id;
+    try {
+      id = await addBlankShipment(db, { carrier: s.carrier || order.carrier || "", trackingNumber: tn, vendor: order.vendor, shippedAt: s.shipDate, itemIds: order.itemIds });
+    } catch (e) { continue; }   // none of its lines are still active (cancelled since): nothing to attach it to
+    await db.prepare("UPDATE blank_shipments SET supplierPoNumber=? WHERE id=?").bind(order.poNumber, id).run();
+    added++;
+  }
+  await db.prepare("UPDATE supplier_orders SET lastShipmentCheckAt=? WHERE id=?").bind(new Date().toISOString(), Number(order.id)).run();
+  return added;
+}
+// The order was cancelled with the supplier (migrations/0073): recorded with when and why, its PO number taken off
+// the order lines still carrying it that haven't shipped or arrived (they're back on Blanks to Order), and the
+// shipment checks stop. Placed or no-answer orders only. Returns {order, unmarked} or {error}.
+export async function cancelSupplierOrder(db, id, { note = "" } = {}) {
+  const o = await getSupplierOrder(db, id);
+  if (!o) return { error: "That supplier order wasn't found", code: 404 };
+  if (o.cancelledAt) return { error: `Order ${o.poNumber} is already marked cancelled.`, code: 409 };
+  if (!["placed", "unknown"].includes(o.status)) return { error: `Order ${o.poNumber} was never placed, so there's nothing to cancel.`, code: 409 };
+  const now = new Date().toISOString();
+  const r = await db.prepare("UPDATE supplier_orders SET cancelledAt=?, cancelNote=? WHERE id=? AND cancelledAt IS NULL").bind(now, String(note || "").slice(0, 300), o.id).run();
+  if (!(r.meta && r.meta.changes)) return { error: `Order ${o.poNumber} is already marked cancelled.`, code: 409 };
+  const ids = [...new Set((o.itemIds || []).map(Number).filter(Boolean))];
+  const unmarked = [], orders = new Set();
+  for (let i = 0; i < ids.length; i += 90) {
+    const chunk = ids.slice(i, i + 90);
+    const { results } = await db.prepare(`SELECT id, orderId FROM order_items WHERE id IN (${chunk.map(() => "?").join(",")})
+      AND blankVendorOrderId=? AND blankShippedAt IS NULL AND blankReceivedAt IS NULL`).bind(...chunk, o.poNumber).all();
+    if (!results.length) continue;
+    await db.batch(results.map(x => db.prepare(`UPDATE order_items SET blankOrderedAt=NULL, blankVendor='', blankVendorOrderId='', blankEstDelivery=NULL
+      WHERE id=? AND blankVendorOrderId=? AND blankShippedAt IS NULL AND blankReceivedAt IS NULL`).bind(Number(x.id), o.poNumber)));
+    for (const x of results) { unmarked.push(Number(x.id)); orders.add(x.orderId); }
+  }
+  for (const orderId of orders) await recomputeOrderBlankStatus_(db, orderId);
+  return { order: await getSupplierOrder(db, o.id), unmarked };
+}
+
+// Marks the order lines a supplier order was placed for as "blanks ordered" with its PO number. Only lines not
+// yet ordered or received are touched (one already on another order keeps its vendor and number). Returns the
+// line ids marked. Like the other automatic paths that record what really happened, it doesn't apply the
+// stage-order check (an unpaid order's blanks can be bought on purpose with "Include unpaid orders").
+export async function markItemsBlankOrdered(db, itemIds, { vendor = "", vendorOrderId = "" } = {}) {
+  const ids = [...new Set((itemIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return [];
+  const nb = await noBlankLine_(db);
+  const marked = [], orders = new Set();
+  for (let i = 0; i < ids.length; i += 90) {
+    const chunk = ids.slice(i, i + 90);
+    const { results } = await db.prepare(`SELECT oi.id, oi.orderId FROM order_items oi WHERE oi.id IN (${chunk.map(() => "?").join(",")})
+      AND oi.cancelDate IS NULL AND oi.blankOrderedAt IS NULL AND oi.blankReceivedAt IS NULL AND NOT ${nb("oi")}`).bind(...chunk).all();
+    if (!results.length) continue;
+    const now = new Date().toISOString();
+    await db.batch(results.map(r => db.prepare(`UPDATE order_items SET blankOrderedAt=?, blankVendor=?, blankVendorOrderId=? WHERE id=? AND blankOrderedAt IS NULL AND blankReceivedAt IS NULL`)
+      .bind(now, String(vendor).slice(0, 100), String(vendorOrderId).slice(0, 100), Number(r.id))));
+    for (const r of results) { marked.push(Number(r.id)); orders.add(r.orderId); }
+  }
+  for (const o of orders) await recomputeOrderBlankStatus_(db, o);
+  return marked;
+}
+
+export async function setBlankPriceReminderSent(db, at = new Date().toISOString()) {
+  await db.prepare("INSERT INTO global_settings (key, value) VALUES ('blankPriceReminder', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .bind(JSON.stringify({ sentAt: at })).run();
+}
+
+export async function createBlank(db, fields, sizes, opts = {}) {
   const now = new Date().toISOString();
   const colors = normalizeBlankColors_(fields, sizes);
   const legacyColor = String((fields.color != null ? fields.color : (colors[0] && colors[0].color)) || "").slice(0, 80);
@@ -1786,11 +3738,13 @@ export async function createBlank(db, fields, sizes) {
   ).run();
   const id = Number(result.meta.last_row_id);
   await setBlankNeedleType_(db, id, fields);
-  await writeBlankColors_(db, id, colors, "create");
-  return { id, createdAt: now };
+  await setBlankForTesting_(db, id, fields);
+  await setBlankContent_(db, id, fields);
+  const priceChanges = await writeBlankColors_(db, id, colors, "create", opts);
+  return { id, createdAt: now, priceChanges };
 }
 
-export async function updateBlank(db, id, fields, sizes) {
+export async function updateBlank(db, id, fields, sizes, opts = {}) {
   const now = new Date().toISOString();
   const hasColors = Array.isArray(fields.colors) || Array.isArray(sizes) || Array.isArray(fields.sizes);
   const colors = normalizeBlankColors_(fields, sizes);
@@ -1808,8 +3762,52 @@ export async function updateBlank(db, id, fields, sizes) {
     now, Number(id)
   ).run();
   await setBlankNeedleType_(db, Number(id), fields);
-  if (hasColors) await writeBlankColors_(db, Number(id), colors, "update");
+  await setBlankForTesting_(db, Number(id), fields);
+  await setBlankContent_(db, Number(id), fields);
+  // Stock movements carry the blank's name (for History, receipts and reports): a rename renames them too.
+  const name = await blankName_(db, Number(id));
+  if (name) await db.prepare("UPDATE inventory_movements SET blankName=? WHERE blankId=? AND blankName <> ?").bind(name, Number(id), name).run();
+  return hasColors ? await writeBlankColors_(db, Number(id), colors, "update", opts) : [];
 }
+
+// Adds colors / sizes a blank doesn't have yet, with nothing in stock and no cost — so an invoice line for
+// a color or size not on file (Import from PDF → Receive order) can be received instead of left out.
+// Existing colors and sizes are untouched. `list` = [{color, size}]; returns how many sizes were added.
+export async function addBlankSizes(db, blankId, list) {
+  const now = new Date().toISOString(), id = Number(blankId);
+  const want = [];
+  for (const x of (Array.isArray(list) ? list : []).slice(0, 100)) {
+    const color = String(x && x.color || "").trim().slice(0, 80), size = String(x && x.size || "").trim().slice(0, 20);
+    if (size && !want.some(w => w.color === color && w.size === size)) want.push({ color, size });
+  }
+  if (!want.length) return 0;
+  const { results: colors } = await db.prepare("SELECT color, sortOrder FROM blank_colors WHERE blankId = ?").bind(id).all().catch(() => ({ results: [] }));
+  let nextOrder = colors.reduce((n, c) => Math.max(n, Number(c.sortOrder) || 0), 0);
+  const stmts = [];
+  for (const c of [...new Set(want.map(w => w.color))]) {
+    if (colors.some(x => (x.color || "") === c)) continue;
+    stmts.push(db.prepare("INSERT OR IGNORE INTO blank_colors (blankId, color, imagesJson, sortOrder, createdAt, updatedAt) VALUES (?, ?, '[]', ?, ?, ?)").bind(id, c, ++nextOrder, now, now));
+  }
+  for (const w of want) stmts.push(db.prepare("INSERT OR IGNORE INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity) VALUES (?, ?, ?, 0, 0)").bind(id, w.color, w.size));
+  const res = await db.batch(stmts);
+  return res.slice(-want.length).reduce((n, r) => n + (Number(r && r.meta && r.meta.changes) || 0), 0);
+}
+
+
+// For testing / shop use (migrations/0060). Written only when the caller sends it, like the needle type.
+async function setBlankForTesting_(db, id, fields) {
+  if (!fields || fields.forTesting === undefined) return;
+  await db.prepare("UPDATE blanks SET forTesting=? WHERE id=?").bind(fields.forTesting ? 1 : 0, Number(id)).run()
+    .catch((e) => { if (!/no such column/i.test(String(e && e.message))) throw e; });
+}
+
+// Description and bullet-point features (migrations/0063). Each written only when the caller sends it.
+async function setBlankContent_(db, id, fields) {
+  if (!fields) return;
+  if (fields.description !== undefined) await db.prepare("UPDATE blanks SET description=? WHERE id=?").bind(String(fields.description || "").slice(0, 4000), Number(id)).run();
+  if (fields.features !== undefined) await db.prepare("UPDATE blanks SET featuresJson=? WHERE id=?").bind(JSON.stringify(cleanFeatures_(fields.features)), Number(id)).run();
+}
+const cleanFeatures_ = (list) => (Array.isArray(list) ? list : String(list || "").split(/\n/)).map(x => String(x || "").trim().slice(0, 300)).filter(Boolean).slice(0, 30);
 
 // The blank's needle type (migrations/0044). Written only when the caller sends the field, so a
 // caller that doesn't know about it (the PDF importer, merges, older scripts) can't clear it.
@@ -1840,6 +3838,7 @@ export async function mergeBlanks(db, { targetId, sourceIds }) {
   const tname = await blankName_(db, target);
   for (const src of sources) {
     await db.prepare("UPDATE inventory_movements SET blankId=?, blankName=? WHERE blankId=?").bind(target, tname, src).run();
+    await db.prepare("UPDATE blank_vendor_prices SET blankId=? WHERE blankId=?").bind(target, src).run().catch(() => {});
     const { results: tColors } = await db.prepare("SELECT color FROM blank_colors WHERE blankId=?").bind(target).all();
     const have = new Set(tColors.map(r => r.color || ""));
     let order = have.size;
@@ -1852,6 +3851,10 @@ export async function mergeBlanks(db, { targetId, sourceIds }) {
       have.add(c.color || "");
     }
     await db.prepare("UPDATE OR IGNORE product_blank_links SET blankId=? WHERE blankId=?").bind(target, src).run();
+    // Reorder points (migrations/0074) move to the target's same color + size — the larger one wins.
+    await db.prepare(`INSERT INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity, reorderPoint)
+      SELECT ?, color, size, 0, 0, reorderPoint FROM blank_sizes WHERE blankId=? AND reorderPoint IS NOT NULL
+      ON CONFLICT(blankId, color, size) DO UPDATE SET reorderPoint = MAX(COALESCE(blank_sizes.reorderPoint, 0), excluded.reorderPoint)`).bind(target, src).run();
     await db.batch([
       db.prepare("DELETE FROM product_blank_links WHERE blankId=?").bind(src),
       db.prepare("DELETE FROM blank_sizes WHERE blankId=?").bind(src),
@@ -2157,11 +4160,107 @@ export async function deleteLocation(db, id) {
     "SELECT count(*) n FROM products p, json_each(p.locationsJson) je WHERE json_extract(je.value, '$.locationId') = ?"
   ).bind(n).first().catch(() => null);
   if (usedByProduct && Number(usedByProduct.n) > 0) throw new Error("This location is used by a product's design options — change that product first");
+  const usedByFixed = await db.prepare(
+    "SELECT count(*) n FROM products p, json_each(p.fixedTransfersJson) je WHERE json_extract(je.value, '$.locationId') = ?"
+  ).bind(n).first().catch(() => null);   // migrations/0068
+  if (usedByFixed && Number(usedByFixed.n) > 0) throw new Error("This location is used by a product's printed transfers — change that product first");
+  const usedByMockup = await db.prepare(
+    "SELECT count(*) n FROM products p, json_each(p.mockupGraphicsJson) je WHERE json_extract(je.value, '$.locationId') = ?"
+  ).bind(n).first().catch(() => null);   // migrations/0069
+  if (usedByMockup && Number(usedByMockup.n) > 0) throw new Error("This location is used by a product's embroidered graphics (for mockups) — change that product first");
   const usedByBlankImage = await db.prepare(
     "SELECT count(*) n FROM blank_colors bc, json_each(bc.imagesJson) je WHERE json_extract(je.value, '$.locationId') = ?"
   ).bind(n).first().catch(() => null);
   if (usedByBlankImage && Number(usedByBlankImage.n) > 0) throw new Error("This location tags a blank color image — remove that tag first");
   await db.prepare("DELETE FROM locations WHERE id=?").bind(n).run();
+}
+
+// ---- Product categories (migrations/0056) — global ---------------------------------
+// The managed list a product's `type` (and a blank's `productType`) is picked from. `key` is the
+// value stored in those columns and copied onto each order line; `name` is what the admin sees,
+// `plural` the storefront's section heading, and `packAs` which package-size limit the category
+// counts against when a box is chosen for shipping. Whether a product has sizes is NOT a property
+// of its category — that follows the product's own pricing (by size / one flat price).
+// The built-in list is what a database without the table behaves as (the three original
+// categories), so every reader works before the migration is applied.
+export const BUILT_IN_CATEGORIES = [
+  { key: "shirt", name: "Shirt", plural: "Shirts", packAs: "shirt", sortOrder: 1 },
+  { key: "sweatshirt", name: "Sweatshirt", plural: "Sweatshirts", packAs: "sweatshirt", sortOrder: 2 },
+  { key: "cap", name: "Cap", plural: "Caps", packAs: "cap", sortOrder: 3 },
+  { key: "other", name: "Other", plural: "Other", packAs: "other", sortOrder: 4 },
+];
+const PACK_AS = ["shirt", "sweatshirt", "cap", "other"];
+const CATEGORY_KEY_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+// "T Shirt" → "t-shirt": the key a new category gets from its name.
+export function categoryKeyFromName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+}
+
+export async function listProductCategories(db, { withCounts = false } = {}) {
+  let rows;
+  try { rows = (await db.prepare("SELECT key, name, plural, packAs, sortOrder FROM product_categories ORDER BY sortOrder, name").all()).results; }
+  catch (e) { if (/no such table/i.test(String(e && e.message))) return BUILT_IN_CATEGORIES.map(c => ({ ...c, productCount: 0, blankCount: 0 })); throw e; }
+  const cats = rows.map(r => ({ key: r.key, name: r.name || r.key, plural: r.plural || r.name || r.key,
+    packAs: PACK_AS.includes(r.packAs) ? r.packAs : "other", sortOrder: Number(r.sortOrder) || 0, productCount: 0, blankCount: 0 }));
+  if (withCounts) {
+    const [{ results: pc }, { results: bc }] = await Promise.all([
+      db.prepare("SELECT type k, count(*) n FROM products GROUP BY type").all(),
+      db.prepare("SELECT productType k, count(*) n FROM blanks GROUP BY productType").all(),
+    ]);
+    const byKey = Object.fromEntries(cats.map(c => [c.key, c]));
+    for (const r of pc) if (byKey[r.k]) byKey[r.k].productCount = Number(r.n) || 0;
+    for (const r of bc) if (byKey[r.k]) byKey[r.k].blankCount = Number(r.n) || 0;
+  }
+  return cats;
+}
+
+// { key: packAs } for the box chooser (functions/_lib/boxSize.js).
+export async function getCategoryPackMap(db) {
+  return Object.fromEntries((await listProductCategories(db)).map(c => [c.key, c.packAs]));
+}
+
+// Create (no `key`: it's made from the name) or update (by `key`, which never changes — products,
+// blanks and past order lines all hold it).
+export async function saveProductCategory(db, fields) {
+  const name = String((fields && fields.name) || "").trim().slice(0, 60);
+  if (!name) throw new Error("A category needs a name");
+  const plural = String((fields && fields.plural) || "").trim().slice(0, 60) || name;
+  const packAs = PACK_AS.includes(fields.packAs) ? fields.packAs : "other";
+  const sortOrder = Math.round(Number(fields.sortOrder) || 0);
+  const now = new Date().toISOString();
+  try {
+    if (fields.key) {
+      const key = String(fields.key);
+      const r = await db.prepare("UPDATE product_categories SET name=?, plural=?, packAs=?, sortOrder=?, updatedAt=? WHERE key=?")
+        .bind(name, plural, packAs, sortOrder, now, key).run();
+      if (!(r.meta && r.meta.changes)) throw new Error("That category no longer exists");
+      return key;
+    }
+    const key = categoryKeyFromName(name);
+    if (!CATEGORY_KEY_RE.test(key)) throw new Error("Use letters or numbers in the category's name");
+    if (await db.prepare("SELECT 1 ok FROM product_categories WHERE key=?").bind(key).first()) throw new Error(`There is already a category called "${name}"`);
+    const next = await db.prepare("SELECT COALESCE(MAX(sortOrder), 0) + 1 AS n FROM product_categories").first();
+    await db.prepare("INSERT INTO product_categories (key, name, plural, packAs, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(key, name, plural, packAs, fields.sortOrder != null && fields.sortOrder !== "" ? sortOrder : (Number(next && next.n) || 1), now, now).run();
+    return key;
+  } catch (e) {
+    if (/UNIQUE/i.test(String(e && e.message))) throw new Error(`There is already a category called "${name}"`);
+    throw e;
+  }
+}
+
+// Refused while any product or blank is filed under it (past order lines keep their copy either way).
+export async function deleteProductCategory(db, key) {
+  const k = String(key || "");
+  const p = Number((await db.prepare("SELECT count(*) n FROM products WHERE type=?").bind(k).first()).n) || 0;
+  const b = Number((await db.prepare("SELECT count(*) n FROM blanks WHERE productType=?").bind(k).first()).n) || 0;
+  if (p || b) {
+    const parts = [p ? `${p} product${p === 1 ? "" : "s"}` : "", b ? `${b} blank${b === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
+    throw new Error(`This category is used by ${parts} — move ${p + b === 1 ? "it" : "them"} to another category first`);
+  }
+  const left = Number((await db.prepare("SELECT count(*) n FROM product_categories WHERE key<>?").bind(k).first()).n) || 0;
+  if (!left) throw new Error("Keep at least one category");
+  await db.prepare("DELETE FROM product_categories WHERE key=?").bind(k).run();
 }
 
 // ---- Designs (migrations/0024) — per-org, one design per product ----------------
@@ -2241,6 +4340,10 @@ export async function saveDesign(db, orgId, fields) {
       isGlobal = fields.isGlobal ? 1 : 0;
       if (!isGlobal && Number(cur.isGlobal) && await designUsedByOtherShops_(db, cur.id, cur.orgId))
         throw new Error("Other shops' products use this global design — remove it there before making it shop-only");
+      if (!isGlobal && Number(cur.isGlobal)) {   // a global graphic may only use a global design (migrations/0078)
+        const g = await db.prepare("SELECT name FROM graphics WHERE designId=? AND isGlobal=1 LIMIT 1").bind(cur.id).first().catch(() => null);
+        if (g) throw new Error(`The global graphic “${g.name}” uses this design — unlink it there (or make that graphic shop-only) before making the design shop-only`);
+      }
     }
     await db.prepare(`UPDATE designs SET name=?, notes=?, stabilizer=?, hoopId=?, updatedAt=?${cur.isGlobal !== undefined ? ", isGlobal=?" : ""} WHERE id=?`)
       .bind(...[name, notes, stabilizer, hoopId, now].concat(cur.isGlobal !== undefined ? [isGlobal] : []), Number(fields.id)).run();
@@ -2283,7 +4386,8 @@ export async function deleteDesign(db, id) {
 const parseDesignVersion_ = (r) => ({ id: Number(r.id), designId: Number(r.designId),
   designFileKey: r.designFileKey || "", designFileName: r.designFileName || "", designFileExt: r.designFileExt || "",
   machineFileKey: r.machineFileKey || "", machineFileName: r.machineFileName || "", machineFileExt: r.machineFileExt || "",
-  threadColors: tryParse_(r.threadColorsJson, []), notes: r.notes || "", uploadedAt: r.uploadedAt });
+  threadColors: tryParse_(r.threadColorsJson, []), notes: r.notes || "", uploadedAt: r.uploadedAt,
+  stitchCount: r.stitchCount == null ? null : Number(r.stitchCount) });
 
 export async function listDesignVersions(db, designId) {
   const { results } = await db.prepare("SELECT * FROM design_versions WHERE designId=? ORDER BY uploadedAt DESC, id DESC").bind(Number(designId)).all();
@@ -2299,7 +4403,9 @@ export async function addDesignVersion(db, designId, fields) {
     String(fields.designFileExt || "").slice(0, 10), String(fields.machineFileKey || ""), String(fields.machineFileName || "").slice(0, 200),
     String(fields.machineFileExt || "").slice(0, 10), JSON.stringify(fields.threadColors || []),
     String(fields.notes || "").slice(0, 2000), fields.uploadedAt || now, now).run();
-  return Number(r.meta && r.meta.last_row_id) || 0;
+  const id = Number(r.meta && r.meta.last_row_id) || 0;
+  await setStitchCount_(db, "design_versions", id, fields.stitchCount);
+  return id;
 }
 
 // Update ONLY the thread-color map of an existing version (colors can be corrected on any
@@ -2337,7 +4443,8 @@ export async function deleteOrderItemFile(db, id) {
 const parseOrderItemDesign_ = (r) => ({ id: Number(r.id), itemId: Number(r.itemId),
   designFileKey: r.designFileKey || "", designFileName: r.designFileName || "", designFileExt: r.designFileExt || "",
   machineFileKey: r.machineFileKey || "", machineFileName: r.machineFileName || "", machineFileExt: r.machineFileExt || "",
-  threadColors: tryParse_(r.threadColorsJson, []), notes: r.notes || "", uploadedAt: r.uploadedAt, location: r.location || "" });
+  threadColors: tryParse_(r.threadColorsJson, []), notes: r.notes || "", uploadedAt: r.uploadedAt, location: r.location || "",
+  stitchCount: r.stitchCount == null ? null : Number(r.stitchCount) });
 
 export async function listOrderItemDesigns(db, itemId) {
   const { results } = await db.prepare("SELECT * FROM order_item_designs WHERE itemId=? ORDER BY uploadedAt DESC, id DESC").bind(Number(itemId)).all();
@@ -2356,7 +4463,9 @@ export async function addOrderItemDesign(db, itemId, fields) {
     String(fields.designFileExt || "").slice(0, 10), String(fields.machineFileKey || ""), String(fields.machineFileName || "").slice(0, 200),
     String(fields.machineFileExt || "").slice(0, 10), JSON.stringify(fields.threadColors || []),
     String(fields.notes || "").slice(0, 2000), now, now, ...(location ? [location] : [])).run();
-  return Number(r.meta && r.meta.last_row_id) || 0;
+  const id = Number(r.meta && r.meta.last_row_id) || 0;
+  await setStitchCount_(db, "order_item_designs", id, fields.stitchCount);
+  return id;
 }
 
 // Does order_item_designs have its `location` column (migrations/0055)? Cached per database.
@@ -2393,7 +4502,8 @@ function parseMachine_(row, hoopIds, needles) {
     ipAddress: row.ipAddress || "", embDir: row.embDir || "/EMB",
     macAddress: row.macAddress || "", verifiedAt: row.verifiedAt || "",
     currentHoopId: row.currentHoopId == null ? null : Number(row.currentHoopId),
-    notes: row.notes || "", hoopIds: hoopIds || [], needles: needles || {} };
+    notes: row.notes || "", hoopIds: hoopIds || [], needles: needles || {},
+    stitchCount: Number(row.stitchCount) || 0, runSeconds: Number(row.runSeconds) || 0, counterUpdatedAt: row.counterUpdatedAt || "" };
 }
 
 // The MAC is the machine's stable identity; normalize for comparison (lowercase, no separators)
@@ -2412,11 +4522,19 @@ async function machineHoopsAndNeedles_(db, machineId) {
   return { hoopIds: hoopRows.map(r => Number(r.hoopId)), needles };
 }
 
+// Each machine carries its maintenance tasks with their status (migrations/0071) and `maintenanceDue` — the tasks
+// due or due soon, for the Run Order warning.
 export async function listMachines(db) {
   const { results } = await db.prepare("SELECT * FROM machines ORDER BY name").all();
+  let tasks = [];
+  try { tasks = await listMaintenanceTasks(db); } catch (e) { /* a database before 0070 */ }
   return Promise.all(results.map(async (row) => {
     const { hoopIds, needles } = await machineHoopsAndNeedles_(db, row.id);
-    return parseMachine_(row, hoopIds, needles);
+    const m = parseMachine_(row, hoopIds, needles);
+    m.maintenance = tasks.filter(t => t.machineId === m.id);
+    m.maintenanceDue = m.maintenance.filter(t => t.status === "due" || t.status === "soon")
+      .map(t => ({ id: t.id, name: t.name, status: t.status, pct: t.pct }));
+    return m;
   }));
 }
 
@@ -2521,6 +4639,7 @@ function parseQueueRow_(r) {
     productId: r.productId,
     itemName: r.itemName, itemSize: r.itemSize || "", activeItemCount: Number(r.activeItemCount) || 1,
     placedAt: r.placedAt, dueDate: r.dueDate || "",
+    noBlankNeeded: !!Number(r.noBlankNeeded),   // migrations/0057: made from shop supplies, no blank
     blank: r.blankId == null ? null : { id: Number(r.blankId), name: r.blankName || "", brand: r.blankBrand || "",
       color: r.blankColor || "", productType: r.blankProductType || "", size: r.blankSize || "" },
     design: r.designId == null ? null : { id: Number(r.designId), name: r.designName || "", stabilizer: r.stabilizer || "",
@@ -2568,15 +4687,20 @@ const CUSTOM_EMBROIDERY_SQL_ = `EXISTS (SELECT 1 FROM order_items cx WHERE cx.or
 // (order_items.configJson) arrived in migrations/0036; an older database gets the expressions without
 // the custom-design part. Checked once per database (orderItemsHasConfigCol_).
 async function stageSql_(db) {
-  if (!(await orderItemsHasConfigCol_(db))) return { approval: NEEDS_DESIGN_APPROVAL_SQL_, digitizing: NEEDS_DIGITIZING_SQL_ };
+  // A line filled from finished stock (migrations/0060) is already made: it needs no digitizing or approval.
+  const fs = await hasFromStockColumn_(db);
+  const skipStock = (sql) => fs ? sql.replace(/ax\.cancelDate IS NULL/g, "ax.cancelDate IS NULL AND COALESCE(ax.fromStock, 0) = 0")
+    .replace(/dx\.cancelDate IS NULL/g, "dx.cancelDate IS NULL AND COALESCE(dx.fromStock, 0) = 0") : sql;
+  if (!(await orderItemsHasConfigCol_(db))) return { approval: skipStock(NEEDS_DESIGN_APPROVAL_SQL_), digitizing: skipStock(NEEDS_DIGITIZING_SQL_) };
   return {
-    approval: `(${featureOnSql_("designVerification")} AND (${FREE_FORM_TEXT_SQL_} OR ${CUSTOM_EMBROIDERY_SQL_}))`,
-    digitizing: `(${NEEDS_DIGITIZING_SQL_} OR (${featureOnSql_("production")} AND ${CUSTOM_EMBROIDERY_SQL_}))`,
+    approval: `(${featureOnSql_("designVerification")} AND (${skipStock(FREE_FORM_TEXT_SQL_)} OR ${CUSTOM_EMBROIDERY_SQL_}))`,
+    digitizing: `(${skipStock(NEEDS_DIGITIZING_SQL_)} OR (${featureOnSql_("production")} AND ${CUSTOM_EMBROIDERY_SQL_}))`,
   };
 }
 
 export async function getProductionQueue(db) {
   const stage = await stageSql_(db);
+  const nb = await noBlankLine_(db), fs = await fromStockLine_(db);
   const { results } = await db.prepare(`
     SELECT oi.id AS itemId, oi.orderId, oi.orgId, o.customerName, o.placedAt, o.dueDate, oi.qty,
            COALESCE(oi.manufacturedQty,0) AS manufacturedQty, oi.productId,
@@ -2586,6 +4710,7 @@ export async function getProductionQueue(db) {
            b.name AS blankName, b.brand AS blankBrand, b.productType AS blankProductType,
            p.designId, d.name AS designName, d.stabilizer, d.hoopId, h.name AS hoopName,
            dv.threadColorsJson, dv.machineFileKey, dv.machineFileName,
+           ${nb("oi")} AS noBlankNeeded,
            (SELECT count(*) FROM order_items oi2 WHERE oi2.orderId = oi.orderId AND oi2.cancelDate IS NULL) AS activeItemCount
     FROM order_items oi
     JOIN orders o ON o.orderId = oi.orderId
@@ -2602,10 +4727,13 @@ export async function getProductionQueue(db) {
     )
     WHERE oi.cancelDate IS NULL
       AND o.paid = 1 AND o.isTest = 0 AND o.voidedAt IS NULL
-      AND COALESCE(oi.blankReceivedAt, o.blankReceivedAt) IS NOT NULL AND o.manufacturedAt IS NULL
+      AND (COALESCE(oi.blankReceivedAt, o.blankReceivedAt) IS NOT NULL OR ${nb("oi")})   -- no blank to wait for (0057)
+      AND o.manufacturedAt IS NULL
+      AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL   -- shipped / delivered / completed: nothing left to make
       AND (o.designApprovedAt IS NOT NULL OR (NOT ${stage.approval}
            AND (o.digitizingCompleteAt IS NOT NULL OR NOT ${stage.digitizing})))
       AND COALESCE(oi.manufacturedQty,0) < oi.qty
+      AND NOT ${fs("oi")}   -- filled from finished stock (0060): nothing to run
     ORDER BY (o.dueDate IS NULL), o.dueDate, blankProductType, blankName, oi.size, o.placedAt
   `).all();
   const jobs = results.map(parseQueueRow_);
@@ -2731,7 +4859,7 @@ async function hoopingContext_(db, itemIds) {
 // a real hooping — such a line with a transfer (a reorder QR) is transfer-only.
 function lineIsEmbroidered_(it, steps) {
   if (!it) return true;
-  if (it.configurable && it.config && !it.config.plain) return steps.length > 0;
+  if (it.configurable && it.config && !it.config.plain && (it.config.locations || []).some(l => l && !l.auto && !l.fixed && l.location !== "reorderqr")) return steps.length > 0;
   // An ordinary line made from the customer's own design (migrations/0054): only what its plan holds.
   if (plainCustom_(it)) return steps.length > 0;
   return steps.some(st => st.designId != null || st.kind === "itemDesign" || st.blocked) || !it.noDesignNeeded;
@@ -2772,10 +4900,17 @@ function planHoopings_(ctx, it) {
       threadColors: d ? d.threadColors : [], machineFileKey: d ? d.machineFileKey : "", machineFileName: d ? d.machineFileName : "",
       blocked: d ? "" : `Upload the digitized stitch file for the customer's design${where ? " at " + where : ""} first (Edit items → Files → Order design)` };
   };
-  if (it.configurable && it.config && !it.config.plain) {
+  // A configurable line with no options picked at all (a product offering colors only, decorated by its own designs)
+  // is planned from the product's designs below, like an ordinary line.
+  const picked = it.config && (it.config.locations || []).some(l => l && !l.auto && !l.fixed && l.location !== "reorderqr");
+  if (it.configurable && it.config && !it.config.plain && picked) {
     for (const l of (it.config.locations || [])) {
       if (l.custom && l.kind === "embroidery") { steps.push(customStep("Customer design: " + (l.label || l.location), [], String(l.location), l.label || l.location)); continue; }
-      if (l.kind !== "embroidery" || !Number(l.designId)) continue;
+      if (l.kind !== "embroidery") continue;
+      // A graphic can be sold before its stitch file exists; the piece just can't be run until one is linked.
+      if (!Number(l.designId)) { steps.push({ label: l.label || l.location, kind: "design", designId: null, designName: l.graphicName || "", versionId: null,
+        itemDesignId: null, stabilizer: "", hoopIds: [], hoopNames: [], threadColors: [], machineFileKey: "", machineFileName: "",
+        blocked: `No stitch file linked to “${l.graphicName || l.label || "this graphic"}” yet — link a design to the graphic (Graphics screen), then Update from catalog on the order` }); continue; }
       const d = ctx.designs[Number(l.designId)];
       if (d) steps.push(fromDesign(d, l.label || l.location, "design", d.hoopIds));
       else steps.push({ label: l.label || l.location, kind: "design", designId: Number(l.designId), designName: l.graphicName || "", versionId: null,
@@ -3097,15 +5232,20 @@ async function blankShipmentsByOrder_(db, scope) {
 // first, undated after all dated, then oldest-placed. blankReceived lets the UI flag what's ready.
 export async function getPaidUnrunOrders(db) {
   const orders = await loadOrders_(db,
-    `o.paid = 1 AND o.isTest = 0 AND o.voidedAt IS NULL AND o.manufacturedAt IS NULL AND o.completedAt IS NULL
+    `o.paid = 1 AND o.isTest = 0 AND o.voidedAt IS NULL AND o.manufacturedAt IS NULL AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL
      AND EXISTS (SELECT 1 FROM order_items ai WHERE ai.orderId = o.orderId AND ai.cancelDate IS NULL)`,
     [], "(o.dueDate IS NULL) ASC, o.dueDate ASC, placedAt ASC");
   const orgNames = {};
   for (const org of await getAllOrgs(db)) orgNames[org.orgId] = org.name || org.orgId;
+  // Whose waiting blanks the stock on hand covers — soonest due first, the same order as the list.
+  const stock = await getBlankStockCoverage(db, orders.filter(o => !o.blankOrderedAt).map(o => o.orderId));
   return orders.map(o => ({
     orderId: o.orderId, orgId: o.orgId, orgName: orgNames[o.orgId] || o.orgId,
     customerName: o.customerName, placedAt: o.placedAt, dueDate: o.dueDate || "",
     blankReceived: !!o.blankReceivedAt, blankOrdered: !!o.blankOrderedAt,
+    blanksInStock: !o.blankOrderedAt && !!(stock[o.orderId] && stock[o.orderId].covered),
+    needsBlanks: o.needsBlanks !== false,   // false: nothing on it uses a blank (migrations/0057)
+    allFromStock: !!o.allFromStock,         // every line comes from finished stock (migrations/0060)
     items: o.items.filter(it => !it.cancelDate).map(it => ({ name: it.name, size: it.size, qty: it.qty })),
   }));
 }
@@ -3130,16 +5270,20 @@ async function blankScalarColor_(db, blankId) {
 // The INSERT for one movement as a prepared statement (not run), so callers can put it in a
 // db.batch() with the stock update it belongs to — one transaction, never half-applied.
 // m.blankName must already be resolved (blankName_).
+// m.reason (migrations/0060): a write-off's reason (WRITEOFF_REASONS), or 'finished' on a consume
+// that moved the blank into finished stock. Only written when given.
 function movementStmt_(db, m) {
   const now = new Date().toISOString();
+  const withReason = !!m.reason;
   return db.prepare(
-    `INSERT INTO inventory_movements (blankId, blankName, color, size, qtyDelta, unitCostCents, kind, orderId, itemId, vendor, vendorRef, note, occurredAt, createdAt, vendorChargedTax, accountId, paidPersonally, receiptKey, receiptName)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO inventory_movements (blankId, blankName, color, size, qtyDelta, unitCostCents, kind, orderId, itemId, vendor, vendorRef, note, occurredAt, createdAt, vendorChargedTax, accountId, paidPersonally, receiptKey, receiptName, receiptGroup${withReason ? ", reason" : ""})
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${withReason ? ", ?" : ""})`
   ).bind(Number(m.blankId), m.blankName || "", m.color || "", m.size || "", Math.trunc(m.qtyDelta),
     Math.max(0, Math.round(Number(m.unitCostCents) || 0)), m.kind, m.orderId || null, m.itemId || null,
     String(m.vendor || "").slice(0, 100), String(m.vendorRef || "").slice(0, 100), String(m.note || "").slice(0, 300),
     m.occurredAt || now, now, m.vendorChargedTax ? 1 : 0, m.accountId ? Number(m.accountId) : null, m.paidPersonally ? 1 : 0,
-    String(m.receiptKey || "").slice(0, 300), String(m.receiptName || "").slice(0, 200));
+    String(m.receiptKey || "").slice(0, 300), String(m.receiptName || "").slice(0, 200), m.receiptGroup ? String(m.receiptGroup).slice(0, 64) : null,
+    ...(withReason ? [String(m.reason).slice(0, 20)] : []));
 }
 
 async function insertMovement_(db, m) {
@@ -3181,7 +5325,7 @@ export function landedCostLines(sizes, extraCents = 0) {
 }
 
 // Returns the new purchase movements' ids (one per size received).
-export async function receiveBlanks(db, { blankId, lines, vendor, vendorRef, receivedAt, vendorChargedTax, accountId, paidPersonally, note, receiptKey, receiptName }) {
+export async function receiveBlanks(db, { blankId, lines, vendor, vendorRef, receivedAt, vendorChargedTax, accountId, paidPersonally, note, receiptKey, receiptName, receiptGroup }) {
   const name = await blankName_(db, blankId);
   const defColor = await blankScalarColor_(db, blankId);
   const ids = [];
@@ -3198,7 +5342,7 @@ export async function receiveBlanks(db, { blankId, lines, vendor, vendorRef, rec
     const res = await db.batch([
       movementStmt_(db, { blankId, blankName: name, color, size, qtyDelta: qty, unitCostCents: costCents, kind: "purchase",
         vendor, vendorRef, note: note || "Received", occurredAt: receivedAt, vendorChargedTax: !!vendorChargedTax,
-        accountId: paidPersonally ? null : (accountId || null), paidPersonally: !!paidPersonally, receiptKey, receiptName }),
+        accountId: paidPersonally ? null : (accountId || null), paidPersonally: !!paidPersonally, receiptKey, receiptName, receiptGroup }),
       db.prepare(
         `INSERT INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(blankId, color, size) DO UPDATE SET
@@ -3214,17 +5358,18 @@ export async function receiveBlanks(db, { blankId, lines, vendor, vendorRef, rec
 
 // Blanks removed from stock without a sale — damaged, lost/miscounted, or used for
 // testing/samples/shop scrap (qty > 0 = units removed), at the blank's current average
-// cost. Reduces ending inventory the same way any write-off does (Schedule C Part III),
-// so it flows into COGS through the inventory formula regardless of reason; `note`
-// records which for reporting.
-export async function writeOffBlanks(db, { blankId, color, size, qty, note, occurredAt }) {
+// cost. Reduces ending inventory the same way any write-off does (Schedule C Part III).
+// `reason` (migrations/0060, WRITEOFF_REASONS) lets the Inventory & COGS report show testing use
+// apart from damage and loss; `note` keeps the wording.
+export const WRITEOFF_REASONS = ["testing", "damaged", "lost", "other"];
+export async function writeOffBlanks(db, { blankId, color, size, qty, note, occurredAt, reason }) {
   const q = Math.floor(Number(qty) || 0);
   if (q <= 0) return;
   const clr = color == null ? await blankScalarColor_(db, blankId) : String(color);
   const cur = await db.prepare("SELECT purchasePriceCents FROM blank_sizes WHERE blankId=? AND color=? AND size=?").bind(Number(blankId), clr, size).first();
   await db.batch([
     movementStmt_(db, { blankId, blankName: await blankName_(db, blankId), color: clr, size, qtyDelta: -q, unitCostCents: cur ? cur.purchasePriceCents : 0,
-      kind: "writeoff", note: note || "Write-off", occurredAt }),
+      kind: "writeoff", note: note || "Write-off", occurredAt, reason: WRITEOFF_REASONS.includes(reason) ? reason : "other" }),
     db.prepare("UPDATE blank_sizes SET quantity = quantity - ? WHERE blankId=? AND color=? AND size=?").bind(q, Number(blankId), clr, size),
   ]);
 }
@@ -3257,6 +5402,26 @@ async function makeItemPieces_(db, item, fromQty, toQty) {
     "SELECT blankId, blankColor, blankSize FROM product_blank_links WHERE orgId = ? AND productId = ? AND productColor = ? AND productSize = ?"
   ).bind(item.orgId, item.productId, productColor, item.size).first();
   const stmts = [];
+  // A line filled from finished stock (migrations/0060) is PULLED instead: the pieces leave finished stock
+  // at its average cost — that's the line's cost of goods — and no blank is used.
+  if (item.fromStock && Number(item.fromStock)) {
+    const p = await db.prepare("SELECT name, pricingMode FROM products WHERE orgId = ? AND productId = ?").bind(item.orgId, item.productId).first();
+    const sz = stockSize_(p && p.pricingMode, item.size), now = new Date().toISOString();
+    const avgSql = "MAX(0, COALESCE((SELECT avgCostCents FROM ready_to_ship WHERE orgId = ? AND productId = ? AND size = ?), 0))", ab = [item.orgId, item.productId, sz];
+    stmts.push(db.prepare(
+      `INSERT INTO finished_goods_movements (orgId, productId, productName, color, size, qtyDelta, unitCostCents, kind, orderId, itemId, note, occurredAt, createdAt)
+       SELECT ?, ?, ?, '', ?, ?, ${avgSql}, 'sell', ?, ?, ?, ?, ? WHERE ${stillAt}`
+    ).bind(item.orgId, item.productId, (p && p.name) || item.productId, sz, -pieces, ...ab, item.orderId, id, ("Pulled for order " + item.orderId).slice(0, 300), now, now, id, fromQty));
+    stmts.push(db.prepare(
+      `UPDATE order_items SET cogsCents = (CASE WHEN cogsSource='consumed' THEN COALESCE(cogsCents,0) ELSE 0 END) + ? * ${avgSql}, cogsSource = 'consumed'
+       WHERE id = ? AND cancelDate IS NULL AND COALESCE(manufacturedQty,0) = ?`).bind(pieces, ...ab, id, fromQty));
+    stmts.push(db.prepare(`UPDATE ready_to_ship SET quantity = quantity - ?, updatedAt = ? WHERE orgId = ? AND productId = ? AND size = ? AND ${stillAt}`)
+      .bind(pieces, now, ...ab, id, fromQty));
+    stmts.push(db.prepare("UPDATE order_items SET manufacturedQty = ? WHERE id = ? AND cancelDate IS NULL AND COALESCE(manufacturedQty,0) = ?").bind(toQty, id, fromQty));
+    const res = await db.batch(stmts);
+    const claimed = Number(res.at(-1) && res.at(-1).meta && res.at(-1).meta.changes) === 1;
+    return { claimed, consumed: claimed };
+  }
   const linked = !!(link && link.blankId != null);
   if (linked) {
     const blankId = Number(link.blankId), color = link.blankColor || "", size = link.blankSize || "";
@@ -3289,14 +5454,16 @@ async function makeItemPieces_(db, item, fromQty, toQty) {
 // The garment color an order line consumes stock in: a configurable line's chosen
 // config.garmentColor, else '' (a classic single-color product). Used to resolve the color-aware
 // product_blank_links row (migrations/0037).
+export const itemColorOf_ = (row) => itemColor_(row);   // for supplierOrders.js
 function itemColor_(row) {
   const cfg = tryParse_(row.configJson, null);
   return cfg && cfg.garmentColor ? String(cfg.garmentColor) : "";
 }
 
 export async function consumeBlanksForOrder(db, orderId) {
+  const fs = await hasFromStockColumn_(db);
   const { results: items } = await db.prepare(
-    `SELECT id, orderId, orgId, productId, size, qty, configJson, COALESCE(manufacturedQty,0) AS manufacturedQty
+    `SELECT id, orderId, orgId, productId, size, qty, configJson, COALESCE(manufacturedQty,0) AS manufacturedQty${fs ? ", fromStock" : ""}
      FROM order_items WHERE orderId = ? AND cancelDate IS NULL`
   ).bind(orderId).all();
   let consumed = 0;
@@ -3318,7 +5485,7 @@ export async function consumeBlanksForOrder(db, orderId) {
 export async function markItemPieceManufactured(db, orderId, itemId) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const item = await db.prepare(
-      `SELECT id, orderId, orgId, productId, size, qty, configJson, COALESCE(manufacturedQty,0) AS manufacturedQty, cancelDate
+      `SELECT id, orderId, orgId, productId, size, qty, configJson, COALESCE(manufacturedQty,0) AS manufacturedQty, cancelDate${(await hasFromStockColumn_(db)) ? ", fromStock" : ""}
        FROM order_items WHERE id = ? AND orderId = ?`
     ).bind(Number(itemId), orderId).first();
     if (!item) throw new Error("Line item not found");
@@ -3338,14 +5505,35 @@ export async function markItemPieceManufactured(db, orderId, itemId) {
   throw new Error("This line is being updated by another request — refresh and try again");
 }
 
+// A local sale is handed over on the spot (migrations/0060): its lines filled from finished stock are
+// pulled at once (their cost of goods recorded), without making anything else on the order. When every
+// active line is from stock, the order is made too. Returns the number of lines pulled.
+export async function pullStockLines(db, orderId) {
+  if (!(await hasFromStockColumn_(db))) return 0;
+  const { results: items } = await db.prepare(
+    `SELECT id, orderId, orgId, productId, size, qty, configJson, COALESCE(manufacturedQty,0) AS manufacturedQty, fromStock
+     FROM order_items WHERE orderId = ? AND cancelDate IS NULL AND fromStock = 1`).bind(orderId).all();
+  let n = 0;
+  for (const it of items) {
+    const qty = Math.max(1, Number(it.qty) || 1), made = Math.max(0, Number(it.manufacturedQty) || 0);
+    if (made < qty && (await makeItemPieces_(db, { ...it, color: "" }, made, qty)).claimed) n++;
+  }
+  if (n) await maybeCompleteManufacture_(db, orderId);
+  return n;
+}
+
 // Stamp orders.manufacturedAt once every active line is fully made; no-op (and returns false)
 // while any active line still has pieces left. Idempotent — never moves an existing timestamp.
 async function maybeCompleteManufacture_(db, orderId) {
+  // Lines filled from finished stock (migrations/0060) aren't run: once every MADE line is done, they're
+  // pulled from stock here, so an order mixing both completes when its last piece is made on Run Order.
+  const fs = await hasFromStockColumn_(db);
   const row = await db.prepare(
     `SELECT COUNT(*) AS remaining FROM order_items
-     WHERE orderId = ? AND cancelDate IS NULL AND COALESCE(manufacturedQty,0) < qty`
+     WHERE orderId = ? AND cancelDate IS NULL AND COALESCE(manufacturedQty,0) < qty${fs ? " AND COALESCE(fromStock,0) = 0" : ""}`
   ).bind(orderId).first();
   if (Number(row && row.remaining) > 0) return false;
+  if (fs) await consumeBlanksForOrder(db, orderId);   // pulls whatever stock lines are left (the made ones are skipped)
   await db.prepare("UPDATE orders SET manufacturedAt = COALESCE(manufacturedAt, ?) WHERE orderId = ?")
     .bind(new Date().toISOString(), orderId).run();
   return true;
@@ -3515,9 +5703,12 @@ async function afterHoopingDone_(db, run) {
 }
 
 // "Mark done (no timing)" for one hooping: recorded done at once (timed = 0), then as above.
+// Its design's stitches still go on the machine's counter, with run time estimated from the design's timed runs
+// (migrations/0071) — `args.readStitches` / `args.actor` as for completeProductionRun.
 export async function markHoopingDone(db, args) {
   const started = await startHooping(db, Object.assign({}, args, { untimed: true }));
-  return Object.assign({ pieceNo: started.pieceNo, stepNo: started.stepNo },
+  const counted = started && started.runId ? await countRunOnMachine_(db, started.runId, { kind: "run", readStitches: args.readStitches, actor: args.actor }) : null;
+  return Object.assign({ pieceNo: started.pieceNo, stepNo: started.stepNo, counted },
     await afterHoopingDone_(db, { orderId: args.orderId, itemId: args.itemId, pieceNo: started.pieceNo, stepCount: started.stepCount }));
 }
 
@@ -3555,8 +5746,10 @@ const avgRun_ = (rows) => { const ms = rows.map(r => Math.max(0, Date.parse(r.fi
 // What the finish prompt shows at the top: when this run started, and how long this design usually
 // takes — on the machine it's running on, and on any machine (timed, finished runs only).
 export async function getRunStats(db, runId) {
-  const run = await db.prepare("SELECT id, status, startedAt, designId, designName, machineId, machineName, stepLabel FROM production_runs WHERE id=?").bind(Number(runId)).first();
+  const run = await db.prepare("SELECT * FROM production_runs WHERE id=?").bind(Number(runId)).first();
   if (!run) throw new Error("Run not found");
+  let stitchCount = null;
+  try { stitchCount = await runDesignStitches_(db, run); } catch (e) { /* a database before 0070 */ }
   let rows = [];
   if (run.designId != null) {
     rows = (await db.prepare(
@@ -3564,7 +5757,7 @@ export async function getRunStats(db, runId) {
        WHERE designId = ? AND status = 'done' AND finishedAt IS NOT NULL AND COALESCE(timed, 1) = 1 AND id <> ?`).bind(Number(run.designId), Number(run.id)).all()).results || [];
   }
   return {
-    runId: Number(run.id), status: run.status, startedAt: run.startedAt, designName: run.designName || "", machineName: run.machineName || "", stepLabel: run.stepLabel || "",
+    runId: Number(run.id), status: run.status, startedAt: run.startedAt, designName: run.designName || "", machineName: run.machineName || "", stepLabel: run.stepLabel || "", stitchCount,
     onMachine: avgRun_(rows.filter(r => run.machineId != null && Number(r.machineId) === Number(run.machineId))),
     allMachines: avgRun_(rows),
   };
@@ -3585,11 +5778,15 @@ export async function completeProductionRun(db, runId, opts = {}) {
   const flip = await db.prepare("UPDATE production_runs SET finishedAt=?, status='done', issuesJson=?, issueNote=? WHERE id=? AND status='running'")
     .bind(finishedAt, JSON.stringify(issues), note, Number(runId)).run();
   if (Number(flip && flip.meta && flip.meta.changes) !== 1) throw new Error("That job is not running");
-  return Object.assign({ pieceNo: run.pieceNo == null ? null : Number(run.pieceNo), stepNo: run.stepNo == null ? null : Number(run.stepNo), issues, issueNote: note, finishedAt },
+  // The run's stitches and time go on its machine's counters (migrations/0071) — only after the flip, so once.
+  const counted = await countRunOnMachine_(db, run.id, { kind: "run", readStitches: opts.readStitches, actor: opts.actor });
+  return Object.assign({ pieceNo: run.pieceNo == null ? null : Number(run.pieceNo), stepNo: run.stepNo == null ? null : Number(run.stepNo), issues, issueNote: note, finishedAt, counted },
     await afterHoopingDone_(db, run));
 }
 
-export async function abortProductionRun(db, runId, { abortReasonId, abortNote } = {}) {
+// `stitchesRun` (optional, migrations/0071): how many stitches it got through, if the operator read it off the
+// machine — added to the machine's counter with the time it ran.
+export async function abortProductionRun(db, runId, { abortReasonId, abortNote, stitchesRun, actor } = {}) {
   const run = await db.prepare("SELECT id, status FROM production_runs WHERE id=?").bind(Number(runId)).first();
   if (!run) throw new Error("Run not found");
   if (run.status !== "running") throw new Error("That job is not running");
@@ -3598,9 +5795,262 @@ export async function abortProductionRun(db, runId, { abortReasonId, abortNote }
     const rr = await db.prepare("SELECT label FROM run_abort_reasons WHERE id=?").bind(Number(abortReasonId)).first();
     label = (rr && rr.label) || "";
   }
-  await db.prepare("UPDATE production_runs SET finishedAt=?, status='aborted', abortReasonId=?, abortReasonLabel=?, abortNote=? WHERE id=?")
+  const flip = await db.prepare("UPDATE production_runs SET finishedAt=?, status='aborted', abortReasonId=?, abortReasonLabel=?, abortNote=? WHERE id=? AND status='running'")
     .bind(new Date().toISOString(), abortReasonId != null && abortReasonId !== "" ? Number(abortReasonId) : null,
       label, String(abortNote || "").slice(0, 500), Number(runId)).run();
+  if (Number(flip && flip.meta && flip.meta.changes) !== 1) throw new Error("That job is not running");
+  return { counted: await countRunOnMachine_(db, Number(runId), { kind: "abort", stitches: cleanStitchCount(stitchesRun) || 0, actor }) };
+}
+
+// ---- Machine counters & maintenance (migrations/0071) -------------------------------------------
+// A machine keeps two counters: its stitch counter (kept in step with the number on the machine's display by readings
+// typed on the Machines page) and its run time. Every finished run adds its design's stitches and its time; an untimed
+// "Mark done" adds the stitches and an ESTIMATE of the time (the design's average timed run on that machine, else on
+// any machine — none if it was never timed); an aborted run adds the time it ran and the stitches the operator read
+// off the machine, if any. Each change is a machine_counter_events row; machines.stitchCount / runSeconds are its cache.
+// Maintenance tasks are due every N run hours and/or every N stitches since they were last done, whichever comes first.
+
+const STITCH_COUNT_MAX_ = 1e10;
+// A whole number of stitches ≥ 0, or null (blank / not a number / too big).
+export function cleanStitchCount(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(String(v).replace(/[,\s]/g, ""));
+  if (!Number.isFinite(n) || n < 0 || n > STITCH_COUNT_MAX_ || Math.floor(n) !== n) return null;
+  return n;
+}
+async function setStitchCount_(db, table, id, value) {
+  const n = cleanStitchCount(value);
+  if (n == null || !id) return;
+  try { await db.prepare(`UPDATE ${table === "order_item_designs" ? "order_item_designs" : "design_versions"} SET stitchCount=? WHERE id=?`).bind(n, Number(id)).run(); }
+  catch (e) { /* a database before 0070 */ }
+}
+
+// The stitches of the design a run ran: its order-specific design, else its design version. When the count isn't
+// known yet, `readStitches({machineFileKey, machineFileExt, machineFileName})` (the API passes one that reads the
+// DESIGNS bucket) may read it, and it's kept on the design row for next time. null = unknown.
+async function runDesignStitches_(db, run, readStitches) {
+  const from = run.itemDesignId != null ? { table: "order_item_designs", id: Number(run.itemDesignId) }
+    : run.designVersionId != null ? { table: "design_versions", id: Number(run.designVersionId) } : null;
+  if (!from) return null;
+  const row = await db.prepare(`SELECT id, stitchCount, machineFileKey, machineFileName, machineFileExt FROM ${from.table} WHERE id=?`).bind(from.id).first();
+  if (!row) return null;
+  if (row.stitchCount != null) return Number(row.stitchCount);
+  if (typeof readStitches !== "function" || !row.machineFileKey) return null;
+  let n = null;
+  try { n = cleanStitchCount(await readStitches({ machineFileKey: row.machineFileKey, machineFileName: row.machineFileName || "", machineFileExt: row.machineFileExt || "" })); }
+  catch (e) { console.error("Reading a stitch count failed:", e && e.message); }
+  if (n != null) await setStitchCount_(db, from.table, from.id, n);
+  return n;
+}
+
+// How long a design usually runs on a machine (else on any machine), from its timed, finished runs. 0 = never timed.
+async function designAvgSeconds_(db, designId, machineId, exceptRunId) {
+  if (designId == null) return 0;
+  const { results } = await db.prepare(
+    `SELECT machineId, startedAt, finishedAt FROM production_runs
+     WHERE designId=? AND status='done' AND finishedAt IS NOT NULL AND COALESCE(timed, 1) = 1 AND id <> ?`).bind(Number(designId), Number(exceptRunId) || 0).all();
+  const on = avgRun_((results || []).filter(r => machineId != null && Number(r.machineId) === Number(machineId)));
+  const all = on.runs ? on : avgRun_(results || []);
+  return all.runs ? Math.round(all.avgMs / 1000) : 0;
+}
+
+// Adds one finished / aborted run to its machine's counters, once (a unique index on the event's runId). Never throws:
+// counting is bookkeeping and must not undo finishing a run. Returns {stitches, seconds, estimated, unknownStitches}
+// or null (no machine, already counted, or a database before 0070).
+async function countRunOnMachine_(db, runId, { kind = "run", stitches: givenStitches, readStitches, actor } = {}) {
+  try {
+    const run = await db.prepare(
+      `SELECT id, machineId, designId, designVersionId, itemDesignId, startedAt, finishedAt, status, COALESCE(timed, 1) AS timed
+       FROM production_runs WHERE id=?`).bind(Number(runId)).first();
+    if (!run) return null;
+    const design = await runDesignStitches_(db, run, readStitches);
+    if (run.machineId == null) {
+      await db.prepare("UPDATE production_runs SET stitchCount=? WHERE id=?").bind(design, run.id).run();
+      return null;
+    }
+    let stitches, seconds, estimated = 0;
+    const elapsed = Math.max(0, Math.round((Date.parse(run.finishedAt) - Date.parse(run.startedAt)) / 1000)) || 0;
+    if (kind === "abort") { stitches = Math.max(0, Number(givenStitches) || 0); seconds = elapsed; }
+    else {
+      stitches = design == null ? 0 : design;
+      if (Number(run.timed) === 1) seconds = elapsed;
+      else { seconds = await designAvgSeconds_(db, run.designId, run.machineId, run.id); estimated = 1; }
+    }
+    const now = new Date().toISOString(), mid = Number(run.machineId);
+    try {
+      await db.batch([
+        db.prepare(`INSERT INTO machine_counter_events (machineId, kind, runId, stitchesDelta, secondsDelta, stitchTotalAfter, secondsTotalAfter, estimated, note, actor, at)
+                    SELECT id, ?, ?, ?, ?, stitchCount + ?, runSeconds + ?, ?, ?, ?, ? FROM machines WHERE id=?`)
+          .bind(kind === "abort" ? "abort" : "run", run.id, stitches, seconds, stitches, seconds, estimated,
+            kind !== "abort" && design == null ? "Design stitch count not known" : "", String(actor || "").slice(0, 200), now, mid),
+        db.prepare("UPDATE machines SET stitchCount = stitchCount + ?, runSeconds = runSeconds + ?, counterUpdatedAt=? WHERE id=?").bind(stitches, seconds, now, mid),
+        db.prepare("UPDATE production_runs SET stitchCount=?, stitchesCounted=?, secondsCounted=?, estimated=? WHERE id=?").bind(design, stitches, seconds, estimated, run.id),
+      ]);
+    } catch (e) {
+      if (/UNIQUE constraint failed/i.test(String(e && e.message))) return null;   // already counted
+      throw e;
+    }
+    return { stitches, seconds, estimated: !!estimated, unknownStitches: kind !== "abort" && design == null };
+  } catch (e) {
+    console.error("Counting a run on its machine failed:", e && e.message);
+    return null;
+  }
+}
+
+// A reading typed from the machine's display: the counter becomes `reading` (the difference is the event — negative
+// when the machine was reset or the estimates ran ahead). `runHours` (optional) sets the run time the same way. A task
+// last done above the new reading is brought down to it, so "since last done" never goes negative after a reset.
+export async function setMachineStitchCount(db, machineId, { reading, runHours, note, actor } = {}) {
+  const m = await db.prepare("SELECT id, stitchCount, runSeconds FROM machines WHERE id=?").bind(Number(machineId)).first();
+  if (!m) throw new Error("Machine not found");
+  const stitches = cleanStitchCount(reading);
+  if (stitches == null) throw new Error("Type the stitch count shown on the machine (a whole number)");
+  let seconds = Number(m.runSeconds) || 0;
+  if (runHours !== undefined && runHours !== null && runHours !== "") {
+    const h = Number(runHours);
+    if (!Number.isFinite(h) || h < 0 || h > 1e6) throw new Error("Run hours must be a number of hours");
+    seconds = Math.round(h * 3600);
+  }
+  const ds = stitches - (Number(m.stitchCount) || 0), dsec = seconds - (Number(m.runSeconds) || 0), now = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT INTO machine_counter_events (machineId, kind, runId, stitchesDelta, secondsDelta, stitchTotalAfter, secondsTotalAfter, estimated, note, actor, at)
+                VALUES (?, 'reading', NULL, ?, ?, ?, ?, 0, ?, ?, ?)`)
+      .bind(m.id, ds, dsec, stitches, seconds, String(note || "Reading entered").slice(0, 300), String(actor || "").slice(0, 200), now),
+    db.prepare("UPDATE machines SET stitchCount=?, runSeconds=?, counterUpdatedAt=? WHERE id=?").bind(stitches, seconds, now, m.id),
+    db.prepare("UPDATE machine_maintenance_tasks SET lastDoneStitches = MIN(lastDoneStitches, ?), lastDoneSeconds = MIN(lastDoneSeconds, ?) WHERE machineId=?").bind(stitches, seconds, m.id),
+  ]);
+  return { stitchCount: stitches, runSeconds: seconds, stitchesDelta: ds, secondsDelta: dsec, before: { stitchCount: Number(m.stitchCount) || 0, runSeconds: Number(m.runSeconds) || 0 } };
+}
+
+const MAINT_SOON_ = 0.9;
+// Where a task stands on a machine: how much run time / how many stitches since it was last done, and the larger share
+// of its thresholds used. status: 'off' (inactive) | 'ok' | 'soon' (≥ 90%) | 'due' (≥ 100%).
+export function maintenanceStatus(task, machine) {
+  const usedSeconds = Math.max(0, (Number(machine && machine.runSeconds) || 0) - (Number(task.lastDoneSeconds) || 0));
+  const usedStitches = Math.max(0, (Number(machine && machine.stitchCount) || 0) - (Number(task.lastDoneStitches) || 0));
+  const parts = [];
+  if (task.everySeconds) parts.push(usedSeconds / Number(task.everySeconds));
+  if (task.everyStitches) parts.push(usedStitches / Number(task.everyStitches));
+  const pct = parts.length ? Math.max(...parts) : 0;
+  const status = !task.active ? "off" : pct >= 1 ? "due" : pct >= MAINT_SOON_ ? "soon" : "ok";
+  return { usedSeconds, usedStitches, pct: Math.round(pct * 1000) / 1000, status };
+}
+const parseMaintTask_ = (r) => ({ id: Number(r.id), machineId: Number(r.machineId), name: r.name || "",
+  everySeconds: r.everySeconds == null ? null : Number(r.everySeconds), everyStitches: r.everyStitches == null ? null : Number(r.everyStitches),
+  notes: r.notes || "", active: Number(r.active) === 1, sortOrder: Number(r.sortOrder) || 0, lastDoneAt: r.lastDoneAt || "",
+  lastDoneStitches: Number(r.lastDoneStitches) || 0, lastDoneSeconds: Number(r.lastDoneSeconds) || 0 });
+
+// Every task (or one machine's), each with its status against its machine's counters now.
+export async function listMaintenanceTasks(db, machineId) {
+  const where = machineId ? " WHERE t.machineId=?" : "";
+  const st = db.prepare(`SELECT t.*, m.stitchCount AS mStitches, m.runSeconds AS mSeconds, m.name AS machineName FROM machine_maintenance_tasks t
+                         JOIN machines m ON m.id = t.machineId${where} ORDER BY t.machineId, t.sortOrder, t.id`);
+  const { results } = await (machineId ? st.bind(Number(machineId)) : st).all();
+  return (results || []).map(r => { const t = parseMaintTask_(r); t.machineName = r.machineName || "";
+    return Object.assign(t, maintenanceStatus(t, { stitchCount: r.mStitches, runSeconds: r.mSeconds })); });
+}
+
+// Validates and saves one task. A new task starts counting from the machine's counters now.
+export async function saveMaintenanceTask(db, fields) {
+  const f = fields || {};
+  const name = String(f.name || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (!name) throw new Error("Give the task a name");
+  const hours = f.everyHours === "" || f.everyHours == null ? null : Number(f.everyHours);
+  if (hours != null && (!Number.isFinite(hours) || hours <= 0 || hours > 100000)) throw new Error("Run hours must be a number above 0");
+  const everySeconds = hours == null ? null : Math.max(1, Math.round(hours * 3600));
+  const everyStitches = f.everyStitches === "" || f.everyStitches == null ? null : cleanStitchCount(f.everyStitches);
+  if (f.everyStitches !== "" && f.everyStitches != null && !everyStitches) throw new Error("Stitches must be a whole number above 0");
+  if (!everySeconds && !everyStitches) throw new Error("Set run hours, stitches, or both");
+  const notes = String(f.notes || "").slice(0, 500), active = f.active === false || f.active === 0 ? 0 : 1;
+  const sortOrder = Math.floor(Number(f.sortOrder) || 0), now = new Date().toISOString();
+  if (f.id) {
+    const cur = await db.prepare("SELECT id FROM machine_maintenance_tasks WHERE id=?").bind(Number(f.id)).first();
+    if (!cur) throw new Error("Task not found");
+    await db.prepare("UPDATE machine_maintenance_tasks SET name=?, everySeconds=?, everyStitches=?, notes=?, active=?, sortOrder=?, updatedAt=? WHERE id=?")
+      .bind(name, everySeconds, everyStitches, notes, active, sortOrder, now, Number(f.id)).run();
+    return Number(f.id);
+  }
+  const m = await db.prepare("SELECT id, stitchCount, runSeconds FROM machines WHERE id=?").bind(Number(f.machineId)).first();
+  if (!m) throw new Error("Machine not found");
+  const r = await db.prepare(`INSERT INTO machine_maintenance_tasks (machineId, name, everySeconds, everyStitches, notes, active, sortOrder, lastDoneAt, lastDoneStitches, lastDoneSeconds, createdAt, updatedAt)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`)
+    .bind(m.id, name, everySeconds, everyStitches, notes, active, sortOrder, Number(m.stitchCount) || 0, Number(m.runSeconds) || 0, now, now).run();
+  return Number(r.meta && r.meta.last_row_id) || 0;
+}
+
+export async function deleteMaintenanceTask(db, id) {
+  const t = await db.prepare("SELECT * FROM machine_maintenance_tasks WHERE id=?").bind(Number(id)).first();
+  if (!t) throw new Error("Task not found");
+  await db.prepare("DELETE FROM machine_maintenance_tasks WHERE id=?").bind(Number(id)).run();
+  return parseMaintTask_(t);
+}
+
+// Records maintenance done: a log row with the machine's counters at that moment, and — for a listed task — the
+// task starts counting again from them. `taskId` empty + a `name` = other work (e.g. "Replaced the hook").
+export async function recordMaintenance(db, { machineId, taskId, name, note, doneAt, actor } = {}) {
+  const m = await db.prepare("SELECT id, name, stitchCount, runSeconds FROM machines WHERE id=?").bind(Number(machineId)).first();
+  if (!m) throw new Error("Machine not found");
+  let task = null;
+  if (taskId) {
+    task = await db.prepare("SELECT * FROM machine_maintenance_tasks WHERE id=? AND machineId=?").bind(Number(taskId), m.id).first();
+    if (!task) throw new Error("That task isn't on this machine");
+  }
+  const taskName = task ? task.name : String(name || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (!taskName) throw new Error("Say what was done");
+  const now = new Date();
+  let when = now.toISOString();
+  if (doneAt) {
+    const t = Date.parse(doneAt);
+    if (!Number.isFinite(t)) throw new Error("That date isn't valid");
+    if (t > now.getTime() + 60000) throw new Error("The date can't be in the future");
+    when = new Date(t).toISOString();
+  }
+  const stmts = [db.prepare(`INSERT INTO machine_maintenance_log (machineId, machineName, taskId, taskName, doneAt, stitchCountAt, runSecondsAt, note, actor, createdAt)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(m.id, m.name || "", task ? Number(task.id) : null, taskName, when, Number(m.stitchCount) || 0, Number(m.runSeconds) || 0,
+      String(note || "").slice(0, 1000), String(actor || "").slice(0, 200), now.toISOString())];
+  if (task) stmts.push(db.prepare("UPDATE machine_maintenance_tasks SET lastDoneAt=?, lastDoneStitches=?, lastDoneSeconds=?, updatedAt=? WHERE id=?")
+    .bind(when, Number(m.stitchCount) || 0, Number(m.runSeconds) || 0, now.toISOString(), Number(task.id)));
+  const res = await db.batch(stmts);
+  return { id: Number(res && res[0] && res[0].meta && res[0].meta.last_row_id) || 0, taskName, doneAt: when, stitchCountAt: Number(m.stitchCount) || 0, runSecondsAt: Number(m.runSeconds) || 0 };
+}
+
+// The maintenance log (newest first) and the counter changes, optionally for one machine and a date range.
+// `from` / `to` are exact ISO times (the admin sends its own day's bounds) or plain YYYY-MM-DD days (UTC).
+export async function getMaintenanceLog(db, { machineId, from, to } = {}) {
+  const lo = from ? String(from) : "0000", hi = to ? (String(to).includes("T") ? String(to) : String(to) + "T23:59:59.999Z") : "9999";
+  const mid = machineId ? Number(machineId) : null;
+  const { results: log } = await db.prepare(
+    `SELECT * FROM machine_maintenance_log WHERE doneAt >= ? AND doneAt <= ?${mid ? " AND machineId=?" : ""} ORDER BY doneAt DESC, id DESC LIMIT 1000`)
+    .bind(...[lo, hi, ...(mid ? [mid] : [])]).all();
+  const { results: ev } = await db.prepare(
+    `SELECT e.*, m.name AS machineName FROM machine_counter_events e LEFT JOIN machines m ON m.id = e.machineId
+     WHERE e.at >= ? AND e.at <= ?${mid ? " AND e.machineId=?" : ""} ORDER BY e.at DESC, e.id DESC LIMIT 5000`)
+    .bind(...[lo, hi, ...(mid ? [mid] : [])]).all();
+  return {
+    log: (log || []).map(r => ({ id: Number(r.id), machineId: Number(r.machineId), machineName: r.machineName || "", taskId: r.taskId == null ? null : Number(r.taskId),
+      taskName: r.taskName || "", doneAt: r.doneAt, stitchCountAt: Number(r.stitchCountAt) || 0, runSecondsAt: Number(r.runSecondsAt) || 0, note: r.note || "", actor: r.actor || "" })),
+    events: (ev || []).map(r => ({ id: Number(r.id), machineId: Number(r.machineId), machineName: r.machineName || "", kind: r.kind, runId: r.runId == null ? null : Number(r.runId),
+      stitchesDelta: Number(r.stitchesDelta) || 0, secondsDelta: Number(r.secondsDelta) || 0, stitchTotalAfter: Number(r.stitchTotalAfter) || 0,
+      secondsTotalAfter: Number(r.secondsTotalAfter) || 0, estimated: Number(r.estimated) === 1, note: r.note || "", actor: r.actor || "", at: r.at })),
+  };
+}
+
+// Design versions and order designs with a machine file but no stitch count yet (for the bulk read).
+export async function listDesignsMissingStitches(db, limit = 50) {
+  const n = Math.max(1, Math.min(200, Number(limit) || 50));
+  const { results: v } = await db.prepare("SELECT id, machineFileKey, machineFileName, machineFileExt FROM design_versions WHERE stitchCount IS NULL AND machineFileKey <> '' AND lower(machineFileExt) IN ('dst', 'dsb') ORDER BY id DESC LIMIT ?").bind(n).all();
+  const { results: o } = await db.prepare("SELECT id, machineFileKey, machineFileName, machineFileExt FROM order_item_designs WHERE stitchCount IS NULL AND machineFileKey <> '' AND lower(machineFileExt) IN ('dst', 'dsb') ORDER BY id DESC LIMIT ?").bind(n).all();
+  return [...(v || []).map(r => ({ table: "design_versions", ...r })), ...(o || []).map(r => ({ table: "order_item_designs", ...r }))];
+}
+export async function setDesignStitchCount(db, table, id, value) {
+  const n = cleanStitchCount(value);
+  if (n == null) throw new Error("Stitches must be a whole number");
+  const t = table === "order_item_designs" ? "order_item_designs" : "design_versions";
+  const row = await db.prepare(`SELECT id, stitchCount FROM ${t} WHERE id=?`).bind(Number(id)).first();
+  if (!row) throw new Error("Design version not found");
+  await db.prepare(`UPDATE ${t} SET stitchCount=? WHERE id=?`).bind(n, Number(id)).run();
+  return { from: row.stitchCount == null ? null : Number(row.stitchCount), to: n };
 }
 
 // Run-time report grouped by design (with a per-machine breakdown), over DONE runs in the range,
@@ -3612,7 +6062,7 @@ export async function getRunReportByDesign(db, { from, to } = {}) {
   const lo = from ? String(from) : "0000";
   const hi = to ? String(to) + "T23:59:59.999Z" : "9999";
   const { results: done } = await db.prepare(
-    `SELECT designId, designName, orgId, machineName, startedAt, finishedAt, issuesJson
+    `SELECT designId, designName, orgId, machineName, startedAt, finishedAt, issuesJson, stitchCount
      FROM production_runs WHERE status='done' AND finishedAt IS NOT NULL AND startedAt >= ? AND startedAt <= ?
        AND COALESCE(timed, 1) = 1`
   ).bind(lo, hi).all();
@@ -3625,19 +6075,26 @@ export async function getRunReportByDesign(db, { from, to } = {}) {
   const ensure = (r) => {
     const k = keyOf(r);
     if (!byDesign.has(k)) byDesign.set(k, { designId: r.designId == null ? null : Number(r.designId),
-      designName: r.designName || "(no design)", runs: 0, totalMs: 0, abortedCount: 0, issues: {}, runsWithIssues: 0, _byMachine: new Map() });
+      designName: r.designName || "(no design)", runs: 0, totalMs: 0, abortedCount: 0, issues: {}, runsWithIssues: 0, _byMachine: new Map(), ...stitchAcc_() });
     return byDesign.get(k);
   };
   const issuesOf = (r) => cleanRunIssues(tryParse_(r.issuesJson, {}), "").issues;
   const addIssues = (into, issues) => { for (const k of Object.keys(issues)) into[k] = (into[k] || 0) + issues[k]; };
   const issueTotals = {};
   let runsWithIssues = 0;
+  // Stitches (migrations/0071): over the timed runs whose design's stitch count is known — total, per run, per minute.
+  const stitchAcc_ = () => ({ stitches: 0, stitchRuns: 0, stitchMs: 0 });
+  const addStitches_ = (into, n, ms) => { if (n == null) return; into.stitches += Number(n) || 0; into.stitchRuns++; into.stitchMs += ms; };
+  const stitchOut_ = (a) => ({ stitches: a.stitches, avgStitches: a.stitchRuns ? Math.round(a.stitches / a.stitchRuns) : 0,
+    stitchesPerMin: a.stitchMs > 0 ? Math.round(a.stitches / (a.stitchMs / 60000)) : 0 });
+  const allStitches = stitchAcc_();
   for (const r of done) {
     const g = ensure(r); const ms = dur(r.startedAt, r.finishedAt);
     g.runs++; g.totalMs += ms;
     const mk = r.machineName || "(unassigned)";
-    const mm = g._byMachine.get(mk) || { machineName: mk, runs: 0, totalMs: 0, issues: {}, runsWithIssues: 0 };
+    const mm = g._byMachine.get(mk) || { machineName: mk, runs: 0, totalMs: 0, issues: {}, runsWithIssues: 0, ...stitchAcc_() };
     mm.runs++; mm.totalMs += ms; g._byMachine.set(mk, mm);
+    addStitches_(g, r.stitchCount, ms); addStitches_(mm, r.stitchCount, ms); addStitches_(allStitches, r.stitchCount, ms);
     const issues = issuesOf(r);
     if (Object.keys(issues).length) {
       addIssues(g.issues, issues); addIssues(mm.issues, issues); addIssues(issueTotals, issues);
@@ -3648,14 +6105,16 @@ export async function getRunReportByDesign(db, { from, to } = {}) {
   const designs = [...byDesign.values()].map(g => ({
     designId: g.designId, designName: g.designName, runs: g.runs, totalMs: g.totalMs,
     avgMs: g.runs ? Math.round(g.totalMs / g.runs) : 0, abortedCount: g.abortedCount,
-    issues: g.issues, runsWithIssues: g.runsWithIssues,
+    issues: g.issues, runsWithIssues: g.runsWithIssues, ...stitchOut_(g), runsNoStitches: g.runs - g.stitchRuns,
     byMachine: [...g._byMachine.values()].map(m => ({ machineName: m.machineName, runs: m.runs,
-      totalMs: m.totalMs, avgMs: m.runs ? Math.round(m.totalMs / m.runs) : 0, issues: m.issues, runsWithIssues: m.runsWithIssues }))
+      totalMs: m.totalMs, avgMs: m.runs ? Math.round(m.totalMs / m.runs) : 0, issues: m.issues, runsWithIssues: m.runsWithIssues,
+      ...stitchOut_(m), runsNoStitches: m.runs - m.stitchRuns }))
       .sort((a, b) => b.runs - a.runs),
   })).sort((a, b) => b.runs - a.runs);
   const { results: detailRows } = await db.prepare(
     `SELECT pr.id AS runId, pr.designName, pr.machineName, pr.orgId, org.name AS orgName, pr.orderId,
-            pr.startedAt, pr.finishedAt, pr.status, pr.abortReasonLabel, pr.abortNote, pr.stepLabel, pr.issuesJson, pr.issueNote
+            pr.startedAt, pr.finishedAt, pr.status, pr.abortReasonLabel, pr.abortNote, pr.stepLabel, pr.issuesJson, pr.issueNote,
+            pr.stitchCount, pr.stitchesCounted
      FROM production_runs pr LEFT JOIN orgs org ON org.orgId = pr.orgId
      WHERE pr.startedAt >= ? AND pr.startedAt <= ? AND COALESCE(pr.timed, 1) = 1 ORDER BY pr.startedAt DESC, pr.id DESC`
   ).bind(lo, hi).all();
@@ -3665,11 +6124,18 @@ export async function getRunReportByDesign(db, { from, to } = {}) {
     status: r.status, durationMs: r.finishedAt ? dur(r.startedAt, r.finishedAt) : null,
     abortReasonLabel: r.abortReasonLabel || "", abortNote: r.abortNote || "", stepLabel: r.stepLabel || "",
     issues: r.status === "done" ? issuesOf(r) : {}, issueNote: r.status === "done" ? (r.issueNote || "") : "",
+    stitchCount: r.stitchCount == null ? null : Number(r.stitchCount), stitchesCounted: r.stitchesCounted == null ? null : Number(r.stitchesCounted),
   }));
   // The free-text "other" details, newest first — the list at the bottom of the report.
   const otherNotes = detail.filter(x => x.issueNote).map(x => ({ runId: x.runId, startedAt: x.startedAt, designName: x.designName, machineName: x.machineName,
     orgName: x.orgName, orderId: x.orderId, stepLabel: x.stepLabel, count: x.issues.other || 1, note: x.issueNote }));
-  return { designs, detail, issueKinds: RUN_ISSUE_KINDS, issueTotals, runsWithIssues, doneRuns: done.length, otherNotes };
+  // Untimed hoopings ("Mark done (no timing)") aren't in the timings, but their stitches still ran.
+  const untimed = await db.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(stitchCount), 0) AS stitches FROM production_runs
+     WHERE status='done' AND COALESCE(timed, 1) = 0 AND startedAt >= ? AND startedAt <= ?`).bind(lo, hi).first();
+  const stitchSummary = Object.assign(stitchOut_(allStitches), { runsNoStitches: done.length - allStitches.stitchRuns,
+    untimedRuns: Number(untimed && untimed.n) || 0, untimedStitches: Number(untimed && untimed.stitches) || 0 });
+  return { designs, detail, issueKinds: RUN_ISSUE_KINDS, issueTotals, runsWithIssues, doneRuns: done.length, otherNotes, stitchSummary };
 }
 
 // ---- Catch-up: use blanks for orders that were made before stock was tracked ----
@@ -3680,6 +6146,7 @@ export async function getRunReportByDesign(db, { from, to } = {}) {
 // history in date order — so backdated receipts count. The plan is computed the same way for the
 // preview and for the apply, so what you approve is what gets written.
 export async function planBlankCatchUp(db) {
+  const fs = await fromStockLine_(db);   // a line filled from finished stock used no blank of its own (0060)
   // The link is resolved by the item's color too (migrations/0037): a configurable line's
   // config.garmentColor, else '' for a classic product.
   const ITEM_COLOR_SQL = "(CASE WHEN i.configJson LIKE '{%' THEN COALESCE(json_extract(i.configJson,'$.garmentColor'),'') ELSE '' END)";
@@ -3693,7 +6160,7 @@ export async function planBlankCatchUp(db) {
             AND l.productColor = ${ITEM_COLOR_SQL} AND l.productSize = i.size
      WHERE i.cancelDate IS NULL AND o.voidedAt IS NULL AND o.isTest = 0
        AND COALESCE(o.manufacturedAt, o.shippedAt, o.deliveredAt) IS NOT NULL
-       AND (i.cogsCents IS NULL OR i.cogsSource = 'estimate')
+       AND (i.cogsCents IS NULL OR i.cogsSource = 'estimate') AND NOT ${fs("i")}
      ORDER BY useDate, i.id`).all();
   if (!cands.length) return { lines: [], totalUnits: 0, totalCents: 0, replacedEstimateCents: 0, shortLines: 0 };
   const { results: mv } = await db.prepare(
@@ -3781,6 +6248,38 @@ async function recomputeBlankSizeFromHistory_(db, blankId, color, size) {
   ).bind(Number(blankId), String(color || ""), size, avg, qty).run();
 }
 
+// Re-works every size's average cost from its stock history (the same algorithm as above) and stores
+// it where it differs — for a stored figure that drifted (one typed into the old blank form). The
+// on-hand count is left alone. Returns [{color, size, from, to}] in dollars.
+export async function recomputeBlankAverageCosts(db, blankId) {
+  const id = Number(blankId);
+  const [{ results: sizes }, { results: moves }] = await Promise.all([
+    db.prepare("SELECT color, size, purchasePriceCents FROM blank_sizes WHERE blankId=?").bind(id).all(),
+    db.prepare("SELECT color, size, qtyDelta, unitCostCents, kind FROM inventory_movements WHERE blankId=? AND voidedAt IS NULL ORDER BY occurredAt, id").bind(id).all(),
+  ]);
+  const state = new Map();
+  for (const m of moves) {
+    const k = (m.color || "") + "|" + m.size;
+    const st = state.get(k) || { qty: 0, avg: 0 };
+    const d = Number(m.qtyDelta);
+    if (d > 0 && (m.kind === "purchase" || m.kind === "adjust")) {
+      const onHand = Math.max(0, st.qty);
+      st.avg = Math.round((onHand * st.avg + d * Number(m.unitCostCents)) / (onHand + d));
+    }
+    st.qty += d;
+    state.set(k, st);
+  }
+  const changed = [], stmts = [];
+  for (const r of sizes) {
+    const st = state.get((r.color || "") + "|" + r.size);
+    if (!st || st.avg === Number(r.purchasePriceCents)) continue;
+    changed.push({ color: r.color || "", size: r.size, from: fromCents(r.purchasePriceCents), to: fromCents(st.avg) });
+    stmts.push(db.prepare("UPDATE blank_sizes SET purchasePriceCents=? WHERE blankId=? AND color=? AND size=?").bind(st.avg, id, r.color || "", r.size));
+  }
+  if (stmts.length) await db.batch(stmts);
+  return changed;
+}
+
 export async function getInventoryMovementById(db, id) {
   const r = await db.prepare("SELECT * FROM inventory_movements WHERE id=?").bind(Number(id)).first();
   if (!r) return null;
@@ -3842,10 +6341,17 @@ export async function restoreInventoryMovement(db, id) {
 // Inventory on hand and its value at the END of a given moment (ISO), from
 // the movement history, using a running weighted-average cost per blank/size.
 // (Schedule C Part III: beginning and ending inventory.)
+// Each row says whether its blank is for testing / shop use (migrations/0060), and `groups` totals the two
+// blank groups — blanks for sale and blanks for testing — by today's flag on the blank.
 export async function getInventoryValuation(db, asOf) {
   const { results } = await db.prepare(
     "SELECT blankId, blankName, color, size, qtyDelta, unitCostCents, kind FROM inventory_movements WHERE occurredAt <= ? AND voidedAt IS NULL ORDER BY occurredAt, id"
   ).bind(asOf).all();
+  let testingIds = new Set();
+  try { testingIds = new Set((await db.prepare("SELECT id FROM blanks WHERE forTesting = 1").all()).results.map(r => Number(r.id))); }
+  catch (e) { if (!/no such column/i.test(String(e && e.message))) throw e; }
+  // Each blank by its CURRENT name; the name saved on its movements only for a blank since deleted.
+  const current = await currentBlankNames_(db);
   const state = new Map();
   for (const m of results) {
     const key = m.blankId + "|" + (m.color || "") + "|" + m.size;
@@ -3856,14 +6362,17 @@ export async function getInventoryValuation(db, asOf) {
       st.avg = Math.round((onHand * st.avg + d * Number(m.unitCostCents)) / (onHand + d));
     }
     st.qty += d;
-    st.name = m.blankName || st.name;
+    st.name = current.get(Number(m.blankId)) || m.blankName || st.name;
     state.set(key, st);
   }
   const rows = [...state.values()].filter(r => r.qty !== 0)
-    .map(r => ({ blankId: r.blankId, name: r.name, color: r.color, size: r.size, qty: r.qty, avgCost: fromCents(r.avg), value: fromCents(Math.max(0, r.qty) * r.avg) }))
+    .map(r => ({ blankId: r.blankId, name: r.name, color: r.color, size: r.size, qty: r.qty, avgCost: fromCents(r.avg), value: fromCents(Math.max(0, r.qty) * r.avg),
+      forTesting: testingIds.has(r.blankId) }))
     .sort((a, b) => (a.name + a.color + a.size).localeCompare(b.name + b.color + b.size));
+  const group = (list) => ({ units: list.reduce((s, r) => s + r.qty, 0), value: fromCents(list.reduce((s, r) => s + toCents(r.value), 0)) });
   return { asOf, rows, units: rows.reduce((s, r) => s + r.qty, 0),
-    value: fromCents(rows.reduce((s, r) => s + toCents(r.value), 0)) };
+    value: fromCents(rows.reduce((s, r) => s + toCents(r.value), 0)),
+    groups: { forSale: group(rows.filter(r => !r.forTesting)), testing: group(rows.filter(r => r.forTesting)) } };
 }
 
 // COGS for a period by month: blanks consumed (at average cost, by the
@@ -3874,20 +6383,48 @@ export async function getInventoryValuation(db, asOf) {
 // is an avoidable cost / possibly refundable from the vendor.
 export async function getTaxedResalePurchases(db, dateFrom, dateTo) {
   const { results } = await db.prepare(
-    `SELECT occurredAt, blankName, color, size, qtyDelta, unitCostCents, vendor, vendorRef FROM inventory_movements
+    `SELECT occurredAt, blankId, blankName, color, size, qtyDelta, unitCostCents, vendor, vendorRef FROM inventory_movements
      WHERE kind = 'purchase' AND vendorChargedTax = 1 AND voidedAt IS NULL AND occurredAt >= ? AND occurredAt <= ? ORDER BY occurredAt`
   ).bind(dateFrom, dateTo).all();
-  return results.map(r => ({ date: r.occurredAt, blank: r.blankName, color: r.color || "", size: r.size, qty: Number(r.qtyDelta),
+  const current = await currentBlankNames_(db);
+  return results.map(r => ({ date: r.occurredAt, blank: current.get(Number(r.blankId)) || r.blankName, color: r.color || "", size: r.size, qty: Number(r.qtyDelta),
     cost: fromCents(Number(r.qtyDelta) * Number(r.unitCostCents)), vendor: r.vendor || "", invoice: r.vendorRef || "" }));
 }
 
+// blankId → the name a blank goes by today (the same rule as blankName_).
+async function currentBlankNames_(db) {
+  const { results } = await db.prepare("SELECT id, name, brand, color FROM blanks").all();
+  return new Map(results.map(b => [Number(b.id), b.name || [b.brand, b.color].filter(Boolean).join(" ")]));
+}
+
 export async function getCogsReport(db, dateFrom, dateTo) {
-  const { results: mv } = await db.prepare(
-    `SELECT substr(occurredAt, 1, 7) AS month, kind, SUM(-qtyDelta * unitCostCents) AS outCents,
-            SUM(qtyDelta * unitCostCents) AS inCents, SUM(qtyDelta) AS units
-     FROM inventory_movements WHERE occurredAt >= ? AND occurredAt <= ? AND kind IN ('consume', 'purchase', 'writeoff') AND voidedAt IS NULL
-     GROUP BY month, kind`
-  ).bind(dateFrom, dateTo).all();
+  const nb = await noBlankLine_(db);
+  // By month, kind and reason (migrations/0060): a consume with reason 'finished' moved the blank into
+  // finished stock (not COGS); a write-off's reason splits testing use from damage / loss.
+  let mv;
+  try {
+    ({ results: mv } = await db.prepare(
+      `SELECT substr(occurredAt, 1, 7) AS month, kind, COALESCE(reason, '') AS reason, SUM(-qtyDelta * unitCostCents) AS outCents,
+              SUM(qtyDelta * unitCostCents) AS inCents, SUM(qtyDelta) AS units
+       FROM inventory_movements WHERE occurredAt >= ? AND occurredAt <= ? AND kind IN ('consume', 'purchase', 'writeoff', 'adjust') AND voidedAt IS NULL
+       GROUP BY month, kind, reason`
+    ).bind(dateFrom, dateTo).all());
+  } catch (e) {
+    if (!/no such column/i.test(String(e && e.message))) throw e;
+    ({ results: mv } = await db.prepare(
+      `SELECT substr(occurredAt, 1, 7) AS month, kind, '' AS reason, SUM(-qtyDelta * unitCostCents) AS outCents,
+              SUM(qtyDelta * unitCostCents) AS inCents, SUM(qtyDelta) AS units
+       FROM inventory_movements WHERE occurredAt >= ? AND occurredAt <= ? AND kind IN ('consume', 'purchase', 'writeoff', 'adjust') AND voidedAt IS NULL
+       GROUP BY month, kind`
+    ).bind(dateFrom, dateTo).all());
+  }
+  let fg = [];
+  try {
+    ({ results: fg } = await db.prepare(
+      `SELECT substr(occurredAt, 1, 7) AS month, kind, SUM(qtyDelta * unitCostCents) AS inCents, SUM(qtyDelta) AS units
+       FROM finished_goods_movements WHERE occurredAt >= ? AND occurredAt <= ? AND voidedAt IS NULL GROUP BY month, kind`
+    ).bind(dateFrom, dateTo).all());
+  } catch (e) { if (!/no such table/i.test(String(e && e.message))) throw e; }
   const { results: est } = await db.prepare(
     `SELECT substr(o.manufacturedAt, 1, 7) AS month, SUM(i.cogsCents) AS cents, SUM(i.qty) AS units
      FROM order_items i JOIN orders o ON o.orderId = i.orderId
@@ -3901,20 +6438,40 @@ export async function getCogsReport(db, dateFrom, dateTo) {
                       AND l.productSize = i.size) AS linkedNow
      FROM order_items i JOIN orders o ON o.orderId = i.orderId
      WHERE o.manufacturedAt >= ? AND o.manufacturedAt <= ? AND i.cancelDate IS NULL AND i.cogsCents IS NULL
-       AND o.isTest = 0 AND o.voidedAt IS NULL ORDER BY o.manufacturedAt`
+       AND o.isTest = 0 AND o.voidedAt IS NULL AND NOT ${nb("i")} ORDER BY o.manufacturedAt`
   ).bind(dateFrom, dateTo).all();
   const months = {};
-  const at = (m) => (months[m] = months[m] || { month: m, cogs: 0, estimated: 0, unitsUsed: 0, purchases: 0, writeoffs: 0 });
+  const at = (m) => (months[m] = months[m] || { month: m, cogsBlanks: 0, cogsFinished: 0, estimated: 0, unitsUsed: 0, purchases: 0,
+    toFinished: 0, writeoffsTesting: 0, writeoffsDamagedLost: 0, writeoffsOther: 0, corrections: 0 });
   for (const r of mv) {
     const m = at(r.month);
-    if (r.kind === "consume") { m.cogs += Number(r.outCents); m.unitsUsed += -Number(r.units); }
+    if (r.kind === "consume" && r.reason === "finished") m.toFinished += Number(r.outCents);
+    else if (r.kind === "consume") { m.cogsBlanks += Number(r.outCents); m.unitsUsed += -Number(r.units); }
     if (r.kind === "purchase") m.purchases += Number(r.inCents);
-    if (r.kind === "writeoff") m.writeoffs += Number(r.outCents);
+    if (r.kind === "adjust") m.corrections += Number(r.inCents);
+    if (r.kind === "writeoff") {
+      if (r.reason === "testing") m.writeoffsTesting += Number(r.outCents);
+      else if (r.reason === "damaged" || r.reason === "lost") m.writeoffsDamagedLost += Number(r.outCents);
+      else m.writeoffsOther += Number(r.outCents);
+    }
+  }
+  // Finished stock: `make` arrives from blanks (the same amount as toFinished above — it nets to $0),
+  // `sell` − `return` is cost of goods, `opening` / `adjust` are corrections.
+  for (const r of fg) {
+    const m = at(r.month);
+    if (r.kind === "sell" || r.kind === "return") { m.cogsFinished += -Number(r.inCents); m.unitsUsed += -Number(r.units); }
+    if (r.kind === "opening" || r.kind === "adjust") m.corrections += Number(r.inCents);
   }
   for (const r of est) { const m = at(r.month); m.estimated += Number(r.cents); m.unitsUsed += Number(r.units); }
-  const rows = Object.values(months).sort((a, b) => a.month.localeCompare(b.month)).map(m => ({
-    month: m.month, cogs: fromCents(m.cogs + m.estimated), estimatedPart: fromCents(m.estimated),
-    unitsUsed: m.unitsUsed, purchases: fromCents(m.purchases), writeoffs: fromCents(m.writeoffs) }));
+  const rows = Object.values(months).sort((a, b) => a.month.localeCompare(b.month)).map(m => {
+    const writeoffs = m.writeoffsTesting + m.writeoffsDamagedLost + m.writeoffsOther;
+    return {
+      month: m.month, cogs: fromCents(m.cogsBlanks + m.cogsFinished + m.estimated), estimatedPart: fromCents(m.estimated),
+      cogsBlanks: fromCents(m.cogsBlanks), cogsFinished: fromCents(m.cogsFinished),
+      unitsUsed: m.unitsUsed, purchases: fromCents(m.purchases), writeoffs: fromCents(writeoffs),
+      writeoffsTesting: fromCents(m.writeoffsTesting), writeoffsDamagedLost: fromCents(m.writeoffsDamagedLost), writeoffsOther: fromCents(m.writeoffsOther),
+      toFinished: fromCents(m.toFinished), corrections: fromCents(m.corrections) };
+  });
   // Why each made line has no cost: `reason` "linkedNow" (its size IS linked now — it was made before
   // the link existed; "Use blanks for past orders" fixes it), "notLinked" (link the size first) or
   // "custom" (a custom line with no product — it can't be linked to a blank).
@@ -3978,12 +6535,13 @@ async function transferName_(db, id) {
 function transferMovementStmt_(db, m) {
   const now = new Date().toISOString();
   return db.prepare(
-    `INSERT INTO transfer_movements (transferId, transferName, qtyDelta, unitCostCents, kind, orderId, itemId, vendor, vendorRef, note, pctOfSheet, occurredAt, createdAt, accountId, paidPersonally, receiptKey, receiptName)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO transfer_movements (transferId, transferName, qtyDelta, unitCostCents, kind, orderId, itemId, vendor, vendorRef, note, pctOfSheet, occurredAt, createdAt, accountId, paidPersonally, receiptKey, receiptName, receiptGroup)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(Number(m.transferId), m.transferName || "", Math.trunc(m.qtyDelta), Math.max(0, Math.round(Number(m.unitCostCents) || 0)),
     m.kind, m.orderId || null, m.itemId || null, String(m.vendor || "").slice(0, 100), String(m.vendorRef || "").slice(0, 100),
     String(m.note || "").slice(0, 300), m.pctOfSheet == null ? null : Number(m.pctOfSheet), m.occurredAt || now, now,
-    m.accountId ? Number(m.accountId) : null, m.paidPersonally ? 1 : 0, String(m.receiptKey || "").slice(0, 300), String(m.receiptName || "").slice(0, 200));
+    m.accountId ? Number(m.accountId) : null, m.paidPersonally ? 1 : 0, String(m.receiptKey || "").slice(0, 300), String(m.receiptName || "").slice(0, 200),
+    m.receiptGroup ? String(m.receiptGroup).slice(0, 64) : null);
 }
 
 // How a transfer sheet's cost divides: each row gets its own percentage of the sheet, and the two parts
@@ -4003,7 +6561,7 @@ export function transferSheetShares(pcts, writeoffPct, personalPct, totalCents) 
 // that doesn't divide evenly becomes two unit costs a cent apart — same trick as landedCostLines).
 // Each part writes a `purchase` movement and updates the item's weighted-average cost + quantity in
 // one batch (atomic, race-safe), exactly like receiveBlanks. rows: [{transferId, count, pctOfSheet}].
-export async function receiveTransferSheet(db, { rows, totalCents, vendor, vendorRef, receivedAt, accountId, paidPersonally, note, receiptKey, receiptName, writeoffPct = 0, personalPct = 0 }) {
+export async function receiveTransferSheet(db, { rows, totalCents, vendor, vendorRef, receivedAt, accountId, paidPersonally, note, receiptKey, receiptName, receiptGroup, writeoffPct = 0, personalPct = 0 }) {
   const clean = (rows || []).map(r => ({ transferId: Number(r.transferId), count: Math.floor(Number(r.count) || 0), pct: Math.max(0, Number(r.pctOfSheet) || 0) }))
     .filter(r => r.transferId && r.count > 0);
   if (!clean.length) return [];
@@ -4022,7 +6580,7 @@ export async function receiveTransferSheet(db, { rows, totalCents, vendor, vendo
       const res = await db.batch([
         transferMovementStmt_(db, { transferId: r.transferId, transferName: name, qtyDelta: p.qty, unitCostCents: p.unit, kind: "purchase",
           vendor, vendorRef, note: note || "Received", pctOfSheet: r.pct, occurredAt: receivedAt,
-          accountId: paidPersonally ? null : (accountId || null), paidPersonally: !!paidPersonally, receiptKey, receiptName }),
+          accountId: paidPersonally ? null : (accountId || null), paidPersonally: !!paidPersonally, receiptKey, receiptName, receiptGroup }),
         db.prepare(
           `UPDATE transfers SET
              purchasePriceCents = CAST(ROUND((MAX(quantity, 0) * purchasePriceCents + ? * ?) * 1.0 / (MAX(quantity, 0) + ?)) AS INTEGER),
@@ -4074,8 +6632,8 @@ async function consumeTransfersForItem_(db, item, transferIds) {
 // pre-0036 schema. Called when a line reaches its full manufacturedQty.
 async function consumeLineTransfersOnce_(db, orderId, itemId) {
   try {
-    const item = await db.prepare("SELECT id, orderId, qty, configJson FROM order_items WHERE id=?").bind(Number(itemId)).first();
-    const cfg = item && tryParse_(item.configJson, null);
+    const item = await db.prepare("SELECT * FROM order_items WHERE id=?").bind(Number(itemId)).first();
+    const cfg = item && !Number(item.fromStock) && tryParse_(item.configJson, null);   // a stock line used no transfers (0060)
     if (!cfg) return;
     const transferIds = (cfg.locations || []).filter(l => l.kind === "transfer" && Number(l.transferId)).map(l => Number(l.transferId));
     if (!transferIds.length) return;
@@ -4217,12 +6775,47 @@ function parseGraphic_(r) {
     designId: r.designId == null ? null : Number(r.designId), transferId: r.transferId == null ? null : Number(r.transferId),
     tier: r.tier || null, inkColors: tryParse_(r.inkColorsJson, []) || [], imageUrl: r.imageUrl || "", thumbUrl: r.thumbUrl || "",
     allowedLocations: tryParse_(r.allowedLocationsJson, []) || [], allowedGarmentColors: tryParse_(r.allowedGarmentColorsJson, []) || [],
-    visible: !!r.visible, sortOrder: Number(r.sortOrder) || 0 };
+    visible: !!r.visible, sortOrder: Number(r.sortOrder) || 0, isGlobal: !!Number(r.isGlobal) };
+}
+// A shop may use its own graphics and every global one (migrations/0078).
+const graphicUsableBy_ = (g, orgId) => !!g && (g.orgId === orgId || !!Number(g.isGlobal));
+
+// The shop's own graphics, then every global graphic (migrations/0078). A database before 0077 lists the shop's own.
+export async function listGraphics(db, orgId) {
+  let results;
+  try { ({ results } = await db.prepare("SELECT * FROM graphics WHERE orgId=? OR isGlobal=1 ORDER BY isGlobal, sortOrder, name").bind(orgId).all()); }
+  catch (e) {
+    if (!/no such column/i.test(String(e && e.message))) throw e;
+    ({ results } = await db.prepare("SELECT * FROM graphics WHERE orgId=? ORDER BY sortOrder, name").bind(orgId).all());
+  }
+  return results.map(parseGraphic_);
 }
 
-export async function listGraphics(db, orgId) {
-  const { results } = await db.prepare("SELECT * FROM graphics WHERE orgId=? ORDER BY sortOrder, name").bind(orgId).all();
-  return results.map(parseGraphic_);
+// Other shops' products using a graphic — a global graphic can't be made shop-only while any do.
+async function graphicUsedByOtherShops_(db, id, homeOrgId) {
+  const gid = Number(id);
+  const { results } = await db.prepare("SELECT locationsJson, fixedTransfersJson, mockupGraphicsJson FROM products WHERE orgId<>?").bind(homeOrgId).all().catch(() => ({ results: [] }));
+  return results.filter(p => (tryParse_(p.locationsJson, []) || []).some(l => ((l && l.graphicIds) || []).map(Number).includes(gid))
+    || (tryParse_(p.fixedTransfersJson, []) || []).some(f => Number(f && f.graphicId) === gid)
+    || (tryParse_(p.mockupGraphicsJson, []) || []).some(f => Number(f && f.graphicId) === gid)).length;
+}
+// Why a graphic can't be global / saved as asked, or "": a global graphic may only use a global design and a transfer
+// open to every shop; a global one can't be made shop-only while other shops' products use it.
+export async function graphicGlobalProblem(db, cur, g) {
+  const isGlobal = g.isGlobal !== undefined ? !!g.isGlobal : !!(cur && cur.isGlobal);
+  if (isGlobal) {
+    if (g.kind === "embroidery" && g.designId != null && g.designId !== "") {
+      const d = await db.prepare("SELECT isGlobal FROM designs WHERE id=?").bind(Number(g.designId)).first().catch(() => null);
+      if (!d || !Number(d.isGlobal)) return "A global graphic can only use a global design — make the design global first, or leave it unlinked.";
+    }
+    if (g.kind !== "embroidery" && g.transferId != null && g.transferId !== "") {
+      const t = await db.prepare("SELECT orgIdsJson FROM transfers WHERE id=?").bind(Number(g.transferId)).first().catch(() => null);
+      if (!t || (tryParse_(t.orgIdsJson, []) || []).length) return "A global graphic can only use a transfer every shop can use — open the transfer to every shop first, or leave it unlinked.";
+    }
+  }
+  if (!isGlobal && cur && cur.isGlobal && await graphicUsedByOtherShops_(db, cur.id, cur.orgId))
+    return "Other shops' products use this global graphic — remove it there before making it shop-only.";
+  return "";
 }
 
 export async function getGraphic(db, id) {
@@ -4249,7 +6842,9 @@ export async function createGraphic(db, orgId, g) {
        allowedLocationsJson, allowedGarmentColorsJson, visible, sortOrder, createdAt, updatedAt)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(orgId, ...graphicBinds_(g), now, now).run();
-  return Number(r.meta && r.meta.last_row_id) || 0;
+  const id = Number(r.meta && r.meta.last_row_id) || 0;
+  if (g.isGlobal && id) await db.prepare("UPDATE graphics SET isGlobal=1 WHERE id=?").bind(id).run();
+  return id;
 }
 
 export async function updateGraphic(db, id, g) {
@@ -4257,6 +6852,7 @@ export async function updateGraphic(db, id, g) {
     `UPDATE graphics SET name=?, kind=?, designId=?, transferId=?, tier=?, inkColorsJson=?, imageUrl=?, thumbUrl=?,
        allowedLocationsJson=?, allowedGarmentColorsJson=?, visible=?, sortOrder=?, updatedAt=? WHERE id=?`
   ).bind(...graphicBinds_(g), new Date().toISOString(), Number(id)).run();
+  if (g.isGlobal !== undefined) await db.prepare("UPDATE graphics SET isGlobal=? WHERE id=?").bind(g.isGlobal ? 1 : 0, Number(id)).run();
 }
 
 // Switch a graphic off (or back on) for ONE color of ONE product — the mockup table's "don't offer
@@ -4278,7 +6874,8 @@ export async function deleteGraphic(db, id) {
   const gid = Number(id);
   const g = await db.prepare("SELECT orgId FROM graphics WHERE id=?").bind(gid).first();
   if (!g) return;
-  const { results: prods } = await db.prepare("SELECT locationsJson FROM products WHERE orgId=? AND configurable=1").bind(g.orgId).all().catch(() => ({ results: [] }));
+  // Every shop's products: a global graphic (migrations/0078) can be on any of them.
+  const { results: prods } = await db.prepare("SELECT locationsJson FROM products WHERE configurable=1").all().catch(() => ({ results: [] }));
   for (const p of prods) {
     for (const loc of (tryParse_(p.locationsJson, []) || [])) {
       if ((loc.graphicIds || []).map(Number).includes(gid)) throw new Error("A product's option menu uses this graphic — remove it there first");
@@ -4286,6 +6883,12 @@ export async function deleteGraphic(db, id) {
   }
   const org = await db.prepare("SELECT COUNT(*) n FROM orgs WHERE reorderQrGraphicId=?").bind(gid).first().catch(() => null);
   if (org && Number(org.n) > 0) throw new Error("An org's Reorder QR default uses this graphic — change that first");
+  const fixed = await db.prepare("SELECT COUNT(*) n FROM products p, json_each(p.fixedTransfersJson) je WHERE json_extract(je.value, '$.graphicId') = ?")
+    .bind(gid).first().catch(() => null);   // migrations/0068
+  if (fixed && Number(fixed.n) > 0) throw new Error("A product's printed transfers use this graphic — remove it there first");
+  const mock = await db.prepare("SELECT COUNT(*) n FROM products p, json_each(p.mockupGraphicsJson) je WHERE json_extract(je.value, '$.graphicId') = ?")
+    .bind(gid).first().catch(() => null);   // migrations/0069
+  if (mock && Number(mock.n) > 0) throw new Error("A product's embroidered graphics (for mockups) use this graphic — remove it there first");
   await db.prepare("DELETE FROM graphics WHERE id=?").bind(gid).run();
 }
 
@@ -4335,17 +6938,19 @@ function resolveReorderQr_(productReorderQr, orgDefault) {
 // ---- Run Transfer Sheets queue / gang sheet (migrations/0036) -------------
 // Lines carrying a transfer application (a customer's transfer option, or the reorder QR — which a
 // plain product can carry too, migrations/0048), on real/paid/active orders.
-// "ready" = blank received AND transfer received; "waiting" = missing either.
+// "ready" = blank received AND transfers in hand (transfersInHand_: used, marked, or covered by stock);
+// "waiting" = missing either.
 // Two kinds of line (`hasEmbroidery`, from the same hooping plan Run Order uses):
 //   * transfer-only — listed until it's made; "Mark made" here makes the line.
 //   * also embroidered — it's on Run Order too. Finishing the embroidery there makes the piece; it
 //     stays listed HERE until its transfers are marked applied (transfersAppliedAt), even after the
 //     embroidery is done, until the order ships. `embroideryDone` says where the other half is.
 export async function getTransferQueue(db) {
+  const nb = await noBlankLine_(db), fs = await fromStockLine_(db);
   const { results } = await db.prepare(
     `SELECT i.id AS itemId, i.orderId, i.orgId, i.name AS itemName, i.size AS itemSize, i.qty, i.configJson,
             COALESCE(i.manufacturedQty,0) AS manufacturedQty, i.transfersAppliedAt, o.manufacturedAt AS orderMadeAt,
-            i.transferReceivedAt, COALESCE(i.blankReceivedAt, o.blankReceivedAt) AS blankReceivedAt,
+            i.transferReceivedAt, COALESCE(i.blankReceivedAt, o.blankReceivedAt) AS blankReceivedAt, ${nb("i")} AS noBlank,
             org.name AS orgName, o.customerName, o.dueDate,
             l.blankId, l.blankSize, b.name AS blankName, COALESCE(NULLIF(l.blankColor, ''), b.color) AS blankColor
      FROM order_items i
@@ -4356,9 +6961,11 @@ export async function getTransferQueue(db) {
      LEFT JOIN product_blank_links l ON l.orgId = i.orgId AND l.productId = i.productId AND l.productSize = i.size
             AND l.productColor = (CASE WHEN i.configJson LIKE '{%' THEN COALESCE(json_extract(i.configJson,'$.garmentColor'),'') ELSE '' END)
      LEFT JOIN blanks b ON b.id = l.blankId
-     WHERE i.cancelDate IS NULL AND o.paid = 1 AND o.isTest = 0 AND o.voidedAt IS NULL AND i.configJson <> ''
-       AND ((o.manufacturedAt IS NULL AND COALESCE(i.manufacturedQty,0) < i.qty)
-         OR (i.transfersAppliedAt IS NULL AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL))
+     WHERE i.cancelDate IS NULL AND o.paid = 1 AND o.isTest = 0 AND o.voidedAt IS NULL AND i.configJson <> '' AND NOT ${fs("i")}
+       -- An order that has shipped, been delivered or been completed has nothing left to press, even if it
+       -- was never marked made (production had a delivered + completed order listed with 30 pieces).
+       AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL
+       AND ((o.manufacturedAt IS NULL AND COALESCE(i.manufacturedQty,0) < i.qty) OR i.transfersAppliedAt IS NULL)
      ORDER BY (o.dueDate IS NULL), o.dueDate, o.placedAt`
   ).all();
   const rows = [];
@@ -4368,26 +6975,88 @@ export async function getTransferQueue(db) {
     if (transfers.length) rows.push({ r, cfg, transfers });   // embroidery-only lines belong to Run Order alone
   }
   const embroidered = await linesWithEmbroidery_(db, rows.map(x => Number(x.r.itemId)));
+  const live = rows.filter(({ r }) => {
+    const made = !!r.orderMadeAt || Number(r.manufacturedQty) >= (Number(r.qty) || 1);
+    return embroidered.has(Number(r.itemId)) ? !r.transfersAppliedAt : !made;
+  });
+  const have = await transfersInHand_(db, live);
   const ready = [], waiting = [];
-  for (const { r, cfg, transfers } of rows) {
+  for (const { r, cfg, transfers } of live) {
     const hasEmbroidery = embroidered.has(Number(r.itemId));
     const made = !!r.orderMadeAt || Number(r.manufacturedQty) >= (Number(r.qty) || 1);
-    if (hasEmbroidery ? !!r.transfersAppliedAt : made) continue;
+    const h = have.get(Number(r.itemId));
     const card = {
       itemId: Number(r.itemId), orderId: r.orderId, orgId: r.orgId, orgName: r.orgName || r.orgId,
       customerName: r.customerName, itemName: r.itemName, itemSize: r.itemSize || "", qty: Number(r.qty) || 1,
       dueDate: r.dueDate || "", garmentColor: cfg.garmentColor || "",
       blank: r.blankId == null ? null : { id: Number(r.blankId), name: r.blankName || "", color: r.blankColor || "", size: r.blankSize || "" },
-      transfers: transfers.map(t => ({ location: t.label || t.location, graphicName: t.graphicName, ink: t.ink || "",
+      transfers: transfers.map((t, i) => ({ location: t.label || t.location, graphicName: t.graphicName, ink: t.ink || "",
         imageUrl: t.imageUrl || "", thumbUrl: t.thumbUrl || "", auto: !!t.auto,
+        transferId: Number(t.transferId) || null, inStock: !!h.inStock[i],
         // The customer's own image (migrations/0054), in the private bucket — the page asks for a signed link.
         ...(t.custom ? { custom: true, fileKey: t.fileKey || "", fileName: t.fileName || "" } : {}) })),
-      blankReceived: !!r.blankReceivedAt, transferReceived: !!r.transferReceivedAt,
+      blankReceived: !!r.blankReceivedAt || !!Number(r.noBlank),
+      // In hand when its transfers were already used (the line was made), it was marked received by hand,
+      // or transfer stock covers every application on it (see transfersInHand_).
+      transferReceived: !!h.source, transferSource: h.source, transferShort: h.short,
       hasEmbroidery, embroideryDone: hasEmbroidery && made,
     };
     (card.blankReceived && card.transferReceived ? ready : waiting).push(card);
   }
   return { ready, waiting };
+}
+
+// Whether each queued line has its transfers in hand, worked out from transfer stock rather than only the
+// "Mark transfer received" flag (which receiving a sheet never set, so lines filled from stock sat under
+// "Waiting" forever). Per line: `source` = "used" (a consume movement exists — the line was made and its
+// transfers came out of stock), "marked" (the flag), "stock" (stock covers every application) or "" (not in
+// hand); `inStock[i]` per transfer entry; `short` = what's missing. Stock is shared out like blanks' Use from
+// stock: lines marked received hold theirs first (that sheet was bought for them), then the rest in queue
+// order (soonest due first), so two lines are never promised the same transfers. A customer's own image, or
+// an entry with no transfer linked, has no stock to draw on — only the flag covers it.
+async function transfersInHand_(db, rows) {
+  const out = new Map();
+  const ids = rows.map(x => Number(x.r.itemId));
+  const used = new Set(), stock = new Map();
+  try {
+    for (let i = 0; i < ids.length; i += 90) {
+      const chunk = ids.slice(i, i + 90);
+      const { results } = await db.prepare(`SELECT DISTINCT itemId FROM transfer_movements WHERE kind='consume' AND itemId IN (${chunk.map(() => "?").join(",")})`).bind(...chunk).all();
+      for (const m of results) used.add(Number(m.itemId));
+    }
+    const { results } = await db.prepare("SELECT id, name, quantity FROM transfers").all();
+    for (const t of results) stock.set(Number(t.id), { name: t.name || "", free: Number(t.quantity) || 0 });
+  } catch (e) { if (!/no such (table|column)/i.test(String(e && e.message))) throw e; }
+  const need = (x) => Math.max(1, Number(x.r.qty) || 1);
+  const take = (x, i) => {   // one transfer entry's applications for this line, from what's still free
+    const t = x.transfers[i], s = t.custom ? null : stock.get(Number(t.transferId));
+    if (!s || s.free < need(x)) return false;
+    s.free -= need(x);
+    return true;
+  };
+  for (const x of rows) {
+    const id = Number(x.r.itemId);
+    if (used.has(id)) out.set(id, { source: "used", inStock: x.transfers.map(() => false), short: [] });
+  }
+  for (const x of rows) {   // marked received: holds its transfers first
+    const id = Number(x.r.itemId);
+    if (out.has(id) || !x.r.transferReceivedAt) continue;
+    out.set(id, { source: "marked", inStock: x.transfers.map((t, i) => take(x, i)), short: [] });
+  }
+  for (const x of rows) {   // the rest, soonest due first (the query's order)
+    const id = Number(x.r.itemId);
+    if (out.has(id)) continue;
+    const inStock = x.transfers.map((t, i) => take(x, i));
+    const short = [];
+    x.transfers.forEach((t, i) => {
+      if (inStock[i]) return;
+      const s = t.custom ? null : stock.get(Number(t.transferId));
+      short.push(t.custom ? { name: "Customer design", custom: true } : !s ? { name: t.graphicName || "Transfer", unlinked: true }
+        : { name: s.name, free: Math.max(0, s.free), needed: need(x) });
+    });
+    out.set(id, { source: short.length ? "" : "stock", inStock, short });
+  }
+  return out;
 }
 
 // Which of these line items have embroidery to run (at least one hooping in Run Order's plan).
@@ -4420,12 +7089,16 @@ export async function lineHasEmbroidery(db, itemId) {
 }
 
 // Totals transfer applications (customer options + reorder QR) by graphic × ink × garment size over
-// every line still on Run Transfer Sheets (ready or waiting) — for building gang sheets.
+// every line still on Run Transfer Sheets — for building gang sheets. Only what still has to be printed:
+// a line whose transfers are in hand (used, marked received, or covered by stock) is left out, and on a
+// line that's partly covered only the entries stock doesn't cover count.
 export async function getGangSheet(db) {
   const q = await getTransferQueue(db);
   const map = new Map();
   for (const c of q.ready.concat(q.waiting)) {
+    if (c.transferReceived) continue;
     for (const t of c.transfers) {
+      if (t.inStock) continue;
       // A customer's own image is its own art: keyed by its file, so two customers' designs never add up.
       const key = [t.custom ? "custom:" + (t.fileKey || c.itemId) : t.graphicName, t.ink || "", c.itemSize || ""].join("|");
       const row = map.get(key) || { graphic: t.custom ? "Customer design — " + c.customerName + " (" + c.orderId + ")" : t.graphicName,
@@ -4514,17 +7187,20 @@ export async function deleteBlankLink(db, orgId, productId, a, b) {
 // same rule as the per-shop breakdown on Orders), and counted so the screen can say how many.
 // Lines with no blank link are returned separately rather than silently dropped. Read-only.
 export async function getBlanksToOrder(db, { includeUnpaid = false } = {}) {
+  const nb = await noBlankLine_(db);
   const [{ results: lines }, { results: links }, { results: blanks }, { results: sizes }] = await Promise.all([
     db.prepare(
       `SELECT oi.id, oi.orderId, oi.orgId, oi.productId, oi.name, oi.size, oi.qty, COALESCE(oi.manufacturedQty, 0) AS made, oi.configJson,
               COALESCE(oi.blankOrderedAt, o.blankOrderedAt) AS orderedAt, COALESCE(oi.blankReceivedAt, o.blankReceivedAt) AS receivedAt,
               o.paid, o.customerName
        FROM order_items oi JOIN orders o ON o.orderId = oi.orderId
-       WHERE oi.cancelDate IS NULL AND o.voidedAt IS NULL AND o.isTest = 0 AND o.completedAt IS NULL AND o.manufacturedAt IS NULL
+       WHERE oi.cancelDate IS NULL AND o.voidedAt IS NULL AND o.isTest = 0 AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL AND o.manufacturedAt IS NULL
+         AND NOT ${nb("oi")}   -- made with no blank (migrations/0057): nothing to buy
        ORDER BY o.placedAt, oi.id`).all(),
     db.prepare("SELECT orgId, productId, productColor, productSize, blankId, blankColor, blankSize FROM product_blank_links").all(),
-    db.prepare("SELECT id, name, vendor, brand, sku, productType FROM blanks").all(),
-    db.prepare("SELECT blankId, color, size, quantity, purchasePriceCents FROM blank_sizes").all(),
+    // SELECT * so a database without the later columns (vendorConnectionId 0064, vendorPriceCents 0061) still works.
+    db.prepare("SELECT * FROM blanks").all(),
+    db.prepare("SELECT * FROM blank_sizes").all(),
   ]);
   const linkAt = new Map(links.map(l => [[l.orgId, l.productId, l.productColor || "", l.productSize || ""].join("\u0001"), l]));
   const blankAt = new Map(blanks.map(b => [Number(b.id), b]));
@@ -4551,22 +7227,330 @@ export async function getBlanksToOrder(db, { includeUnpaid = false } = {}) {
       const sz = sizeAt.get(key);
       row = { blankId: Number(blank.id), vendor: blank.vendor || "", blank: blank.name || "", brand: blank.brand || "", sku: blank.sku || "", productType: blank.productType || "",
         color: link.blankColor || "", size: link.blankSize || "", needed: 0, reserved: 0,
-        onHand: sz ? Number(sz.quantity) || 0 : 0, price: sz ? fromCents(sz.purchasePriceCents) : 0, orders: [] };
+        onHand: sz ? Number(sz.quantity) || 0 : 0, price: sz ? fromCents(sz.purchasePriceCents) : 0,
+        vendorPrice: sz && sz.vendorPriceCents != null ? fromCents(sz.vendorPriceCents) : null,
+        vendorConnectionId: blank.vendorConnectionId != null ? Number(blank.vendorConnectionId) : null, orders: [], items: [] };
       rows.set(key, row);
     }
     if (state === "received") row.reserved += left;
-    else { row.needed += left; if (!row.orders.includes(ln.orderId)) row.orders.push(ln.orderId); }
+    else { row.needed += left; if (!row.orders.includes(ln.orderId)) row.orders.push(ln.orderId); row.items.push(Number(ln.id)); (row.productKeys = row.productKeys || new Set()).add(ln.orgId + "|" + ln.productId); }
+  }
+  // Reorder points (migrations/0074): a size below its "keep at least N" is listed even with no order waiting on it.
+  // `restockOnOrder` is restock already ordered and not yet in (restockOnOrder_). The screen works out the restock to
+  // add (blanksToOrderRow_ — it depends on "use stock on hand first"); a row is sent when it could need some.
+  const inbound = await restockOnOrder_(db);
+  for (const sz of sizes) {
+    if (sz.reorderPoint == null) continue;
+    const key = [sz.blankId, sz.color || "", sz.size || ""].join("\u0001");
+    const blank = blankAt.get(Number(sz.blankId));
+    if (!blank) continue;
+    let row = rows.get(key);
+    if (!row) {
+      row = { blankId: Number(blank.id), vendor: blank.vendor || "", blank: blank.name || "", brand: blank.brand || "", sku: blank.sku || "", productType: blank.productType || "",
+        color: sz.color || "", size: sz.size || "", needed: 0, reserved: 0, onHand: Number(sz.quantity) || 0, price: fromCents(sz.purchasePriceCents),
+        vendorPrice: sz.vendorPriceCents != null ? fromCents(sz.vendorPriceCents) : null,
+        vendorConnectionId: blank.vendorConnectionId != null ? Number(blank.vendorConnectionId) : null, orders: [], items: [] };
+      rows.set(key, row);
+    }
+    row.reorderPoint = Number(sz.reorderPoint);
+    row.restockOnOrder = inbound.get(key) || 0;
+  }
+  // Restricted brands (migrations/0075): the rule, and per product the line's pieces are for, its supplier approval —
+  // {"<orgId>|<productId>": maxQty (null = any amount) | false (none)}. The screen totals the pieces per style.
+  const brandRules = await getBrandRules(db).catch(() => null);
+  const approvals = await activeBrandApprovals_(db);
+  for (const row of rows.values()) {
+    const rule = brandRuleFor_(brandRules, row.brand);
+    row.brandRule = rule ? { brand: rule.brand, threshold: rule.threshold, mustDecorate: rule.mustDecorate, largeNeedsApproval: rule.largeNeedsApproval, note: rule.note } : null;
+    row.approvals = {};
+    for (const pk of row.productKeys || []) {
+      const a = rule ? approvals.get(pk + "|" + brandKey_(rule.brand)) : null;
+      row.approvals[pk] = a ? a.maxQty : false;
+    }
+    delete row.productKeys;
   }
   // Only rows something still has to be bought for; grouped by supplier.
   const bySupplier = new Map();
   for (const row of rows.values()) {
-    if (!row.needed) continue;
+    if (!row.needed && !(row.reorderPoint != null && reorderShortfall_(row) > 0)) continue;
     (bySupplier.get(row.vendor) || bySupplier.set(row.vendor, []).get(row.vendor)).push(row);
   }
   const suppliers = [...bySupplier].map(([vendor, list]) => ({ vendor, rows: list }))
     .sort((a, b) => (a.vendor === "") - (b.vendor === "") || a.vendor.localeCompare(b.vendor));
   return { suppliers, unlinked, onOrderPieces, unpaidPieces, unpaidOrders: unpaidOrders.size, includeUnpaid: !!includeUnpaid, generatedAt: new Date().toISOString() };
 }
+
+// How far a Blanks to Order row is below its reorder point once its waiting orders are filled from stock: keep −
+// (free stock left + restock already on order). The most a row can need — the screen recomputes it for its options.
+function reorderShortfall_(row) {
+  const left = Math.max(0, (Number(row.onHand) || 0) - (Number(row.reserved) || 0) - (Number(row.needed) || 0)) + (Number(row.restockOnOrder) || 0);
+  return Math.max(0, (Number(row.reorderPoint) || 0) - left);
+}
+
+// Restock already ordered and not yet in: {"<blankId>\u0001<color>\u0001<size>" → pieces} (Map). Counted from
+//   - placed supplier orders (migrations/0072; not cancelled): each line's `restockQty` — what it bought beyond the
+//     order lines it was for — and
+//   - restock orders placed by hand (blank_restock_orders, migrations/0074; not cancelled),
+// from the last 45 days. A line stops counting once a purchase of that blank / color / size is recorded after the
+// order (it's in stock then). Read-only; an older database without the tables just has nothing on order.
+const RESTOCK_ON_ORDER_DAYS = 45;
+async function restockOnOrder_(db, nowMs = Date.now()) {
+  const since = new Date(nowMs - RESTOCK_ON_ORDER_DAYS * 86400000).toISOString();
+  const orders = [];
+  try {
+    const { results } = await db.prepare("SELECT * FROM supplier_orders WHERE status='placed' AND COALESCE(placedAt, createdAt) >= ?").bind(since).all();
+    for (const o of results) if (!o.cancelledAt) orders.push({ at: o.placedAt || o.createdAt, lines: (tryParse_(o.linesJson, []) || []).map(l => ({ ...l, qty: Number(l.restockQty) || 0 })) });
+  } catch (e) { /* no supplier_orders table yet */ }
+  try {
+    const { results } = await db.prepare("SELECT * FROM blank_restock_orders WHERE voidedAt IS NULL AND createdAt >= ?").bind(since).all();
+    for (const o of results) orders.push({ at: o.createdAt, lines: tryParse_(o.linesJson, []) || [] });
+  } catch (e) { /* no blank_restock_orders table yet */ }
+  const out = new Map();
+  if (!orders.length) return out;
+  const { results: bought } = await db.prepare(
+    "SELECT blankId, color, size, MAX(createdAt) AS last FROM inventory_movements WHERE kind='purchase' AND voidedAt IS NULL AND createdAt >= ? GROUP BY blankId, color, size").bind(since).all();
+  const lastBuy = new Map(bought.map(r => [[r.blankId, r.color || "", r.size || ""].join("\u0001"), r.last]));
+  for (const o of orders) for (const l of o.lines) {
+    const qty = Math.max(0, Math.floor(Number(l && l.qty) || 0));
+    if (!qty || !l.blankId) continue;
+    const key = [Number(l.blankId), l.color || "", l.size || ""].join("\u0001");
+    if (lastBuy.has(key) && String(lastBuy.get(key)) > String(o.at)) continue;   // arrived
+    out.set(key, (out.get(key) || 0) + qty);
+  }
+  return out;
+}
+
+// Sizes below their reorder point, for the Blanks screen: {"<blankId>|<color>|<size>": {keep, free, onOrder}} —
+// free = on hand − set aside − needed by unordered paid order lines, plus restock on order.
+export async function getBlankLowStock(db) {
+  const bto = await getBlanksToOrder(db, { includeUnpaid: false });
+  const out = {};
+  for (const sup of bto.suppliers) for (const r of sup.rows) {
+    if (r.reorderPoint == null) continue;
+    const short = reorderShortfall_(r);
+    if (short > 0) out[[r.blankId, r.color, r.size].join("|")] = { keep: r.reorderPoint, free: r.reorderPoint - short, onOrder: r.restockOnOrder || 0 };
+  }
+  return out;
+}
+
+// Pieces of each blank / color / size used since `sinceIso`: {"<blankId>\u0001<color>\u0001<size>" → pieces} (Map),
+// from `consume` movements (made for an order, or for stock), voided ones left out. What "Get me to free shipping"
+// ranks suggestions by.
+export async function getBlankUsage(db, sinceIso) {
+  const { results } = await db.prepare(
+    `SELECT blankId, color, size, SUM(-qtyDelta) AS used FROM inventory_movements
+     WHERE kind='consume' AND voidedAt IS NULL AND occurredAt >= ? GROUP BY blankId, color, size`).bind(String(sinceIso)).all();
+  return new Map(results.filter(r => Number(r.used) > 0).map(r => [[Number(r.blankId), r.color || "", r.size || ""].join("\u0001"), Number(r.used)]));
+}
+
+// ---- Free shipping per vendor (2026-10) ------------------------------------------------------------------------
+// A supplier ships free over a dollar amount (SanMar, S&S: $200, their published thresholds) or a piece count. Kept per vendor
+// NAME — the blank's Vendor field, which Blanks to Order groups by — so it works with or without a vendor connection.
+// global_settings 'vendorShipping' = {"<key>": {name, overCents, minQty}} (key = letters and digits, lower case); a
+// vendor with no entry uses VENDOR_SHIPPING_DEFAULTS. 0 / null on both = no free shipping.
+export const vendorShippingKey_ = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+export const VENDOR_SHIPPING_DEFAULTS = {
+  sanmar: { name: "SanMar", overCents: 20000, minQty: null },
+  ss: { name: "S&S", overCents: 20000, minQty: null }, ssactivewear: { name: "S&S", overCents: 20000, minQty: null },
+};
+export async function getVendorShipping(db) {
+  const row = await db.prepare("SELECT value FROM global_settings WHERE key='vendorShipping'").first();
+  const v = row ? tryParse_(row.value, {}) : {};
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+// {overCents, minQty, isDefault} for a vendor name, or null when it has no free shipping.
+export function vendorShippingFor(saved, vendor) {
+  const key = vendorShippingKey_(vendor);
+  if (!key) return null;
+  const own = saved && Object.prototype.hasOwnProperty.call(saved, key) ? saved[key] : null;
+  const e = own || VENDOR_SHIPPING_DEFAULTS[key];
+  if (!e) return null;
+  const overCents = Number(e.overCents) > 0 ? Math.round(Number(e.overCents)) : null, minQty = Number(e.minQty) > 0 ? Math.floor(Number(e.minQty)) : null;
+  return overCents || minQty ? { overCents, minQty, isDefault: !own } : null;
+}
+// Sets one vendor's free shipping: `over` in dollars and/or `minQty` pieces (blank / 0 = not that kind); `reset`
+// goes back to the default. Returns {before, after} for the audit.
+export async function setVendorShipping(db, vendor, { over, minQty, reset } = {}) {
+  const key = vendorShippingKey_(vendor);
+  if (!key) throw Object.assign(new Error("Name the vendor."), { userFacing: true });
+  const blankOrNum = (v, max, label) => {
+    if (v === undefined || v === null || v === "") return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > max) throw Object.assign(new Error(`${label} must be a number from 0 to ${max.toLocaleString("en-US")}.`), { userFacing: true });
+    return n;
+  };
+  const dollars = blankOrNum(over, 100000, "Free shipping over $"), pieces = blankOrNum(minQty, 100000, "Free shipping at pieces");
+  const saved = await getVendorShipping(db);
+  const before = vendorShippingFor(saved, vendor);
+  if (reset) delete saved[key];
+  else saved[key] = { name: String(vendor).trim().slice(0, 80), overCents: dollars ? toCents(dollars) : null, minQty: pieces ? Math.floor(pieces) : null };
+  await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES ('vendorShipping', ?)").bind(JSON.stringify(saved)).run();
+  return { before, after: vendorShippingFor(saved, vendor) };
+}
+
+// "Get me to free shipping" — what could be added to an order from `vendor`: every size of every blank whose Vendor
+// is that vendor (same name, letters and digits only), with its price (vendor price, else average cost), free stock
+// (on hand − set aside − needed by unordered paid order lines + restock on order), reorder point and use in the last
+// 90 / 365 days. The browser picks from these (fillToFreeShipping_ in admin.js). Read-only.
+export async function getFreeShippingCandidates(db, vendor, nowMs = Date.now()) {
+  const key = vendorShippingKey_(vendor);
+  const [bto, u90, u365, { results: blanks }, { results: sizes }] = await Promise.all([
+    getBlanksToOrder(db, { includeUnpaid: false }),
+    getBlankUsage(db, new Date(nowMs - 90 * 86400000).toISOString()),
+    getBlankUsage(db, new Date(nowMs - 365 * 86400000).toISOString()),
+    db.prepare("SELECT * FROM blanks").all(),
+    db.prepare("SELECT * FROM blank_sizes").all(),
+  ]);
+  const reserved = await getBlankReservations(db);
+  const inbound = await restockOnOrder_(db, nowMs);
+  const needed = new Map();
+  for (const sup of bto.suppliers) for (const r of sup.rows) needed.set([r.blankId, r.color, r.size].join("\u0001"), r.needed);
+  const mine = new Map(blanks.filter(b => key && vendorShippingKey_(b.vendor) === key).map(b => [Number(b.id), b]));
+  const out = [];
+  for (const sz of sizes) {
+    const b = mine.get(Number(sz.blankId));
+    if (!b) continue;
+    const k = [Number(sz.blankId), sz.color || "", sz.size || ""].join("\u0001");
+    const res = Number(reserved[[sz.blankId, sz.color || "", sz.size || ""].join("|")]) || 0;
+    const price = sz.vendorPriceCents != null ? Number(sz.vendorPriceCents) : Number(sz.purchasePriceCents) || 0;
+    out.push({ blankId: Number(b.id), blank: b.name || "", brand: b.brand || "", sku: b.sku || "", vendor: b.vendor || "", forTesting: !!b.forTesting,
+      vendorConnectionId: b.vendorConnectionId != null ? Number(b.vendorConnectionId) : null,
+      color: sz.color || "", size: sz.size || "", price: price / 100, onHand: Number(sz.quantity) || 0, reserved: res, needed: needed.get(k) || 0,
+      onOrder: inbound.get(k) || 0, reorderPoint: sz.reorderPoint == null ? null : Number(sz.reorderPoint), used90: u90.get(k) || 0, used365: u365.get(k) || 0 });
+  }
+  return out;
+}
+
+// Restock orders placed by hand (migrations/0074) — recorded from "Get me to free shipping" so the restock isn't
+// suggested again while it's on its way. lines = [{blankId, color, size, qty}].
+export async function recordRestockOrder(db, { vendor, reference, lines, actor }) {
+  const clean = (Array.isArray(lines) ? lines : []).slice(0, 200).map(l => ({ blankId: Number(l && l.blankId) || 0, color: String((l && l.color) || "").slice(0, 80),
+    size: String((l && l.size) || "").slice(0, 20), qty: Math.floor(Number(l && l.qty) || 0) })).filter(l => l.blankId > 0 && l.qty > 0 && l.qty <= 100000);
+  if (!clean.length) throw Object.assign(new Error("Nothing to record — every line needs a blank and a quantity."), { userFacing: true });
+  const now = new Date().toISOString();
+  const r = await db.prepare("INSERT INTO blank_restock_orders (vendor, reference, linesJson, createdAt, createdBy) VALUES (?, ?, ?, ?, ?)")
+    .bind(String(vendor || "").slice(0, 80), String(reference || "").slice(0, 80), JSON.stringify(clean), now, String(actor || "").slice(0, 120)).run();
+  return { id: Number(r.meta && r.meta.last_row_id), lines: clean };
+}
+export async function listRestockOrders(db, { days = RESTOCK_ON_ORDER_DAYS } = {}) {
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const { results } = await db.prepare("SELECT * FROM blank_restock_orders WHERE voidedAt IS NULL AND createdAt >= ? ORDER BY createdAt DESC").bind(since).all();
+  const arrived = await restockOnOrder_(db);
+  return results.map(o => {
+    const lines = tryParse_(o.linesJson, []) || [];
+    return { id: Number(o.id), vendor: o.vendor || "", reference: o.reference || "", createdAt: o.createdAt, createdBy: o.createdBy || "", lines,
+      pieces: lines.reduce((n, l) => n + (Number(l.qty) || 0), 0), waiting: lines.some(l => arrived.has([Number(l.blankId), l.color || "", l.size || ""].join("\u0001"))) };
+  });
+}
+export async function cancelRestockOrder(db, id) {
+  const r = await db.prepare("UPDATE blank_restock_orders SET voidedAt=? WHERE id=? AND voidedAt IS NULL").bind(new Date().toISOString(), Number(id)).run();
+  return !!(r.meta && r.meta.changes);
+}
+
+// Blanks SET ASIDE for orders: {"<blankId>|<color>|<size>": pieces} — what's still to make on active
+// lines whose blanks are in (received, or taken with Use from stock) on real, open orders. They're still
+// on the shelf (stock comes out when the pieces are made, makeItemPieces_ / consumeBlanksForOrder), but
+// promised: Blanks to Order's `reserved`, the stock coverage below and the Blanks screen all use this.
+export async function getBlankReservations(db) {
+  const nb = await noBlankLine_(db);
+  const [{ results: lines }, { results: links }] = await Promise.all([
+    db.prepare(
+      `SELECT oi.orgId, oi.productId, oi.size, oi.qty, COALESCE(oi.manufacturedQty, 0) AS made, oi.configJson
+       FROM order_items oi JOIN orders o ON o.orderId = oi.orderId
+       WHERE oi.cancelDate IS NULL AND o.voidedAt IS NULL AND o.isTest = 0 AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL AND o.manufacturedAt IS NULL
+         AND COALESCE(oi.blankReceivedAt, o.blankReceivedAt) IS NOT NULL AND NOT ${nb("oi")}`).all(),
+    db.prepare("SELECT orgId, productId, productColor, productSize, blankId, blankColor, blankSize FROM product_blank_links").all(),
+  ]);
+  const linkAt = new Map(links.map(l => [[l.orgId, l.productId, l.productColor || "", l.productSize || ""].join("\u0001"), l]));
+  const out = {};
+  for (const ln of lines) {
+    const left = (Number(ln.qty) || 0) - (Number(ln.made) || 0);
+    const link = left > 0 && ln.productId ? linkAt.get([ln.orgId, ln.productId, itemColor_(ln), ln.size || ""].join("\u0001")) : null;
+    if (!link) continue;
+    const key = [link.blankId, link.blankColor || "", link.blankSize || ""].join("|");
+    out[key] = (out[key] || 0) + left;
+  }
+  return out;
+}
+
+// ---- Blanks from stock -----------------------------------------------------------------
+// An order's blanks can come off the shelf instead of from a supplier. A line WAITING on its blank (not
+// ordered, not received, pieces left to make) is covered when the stock on hand of the blank / color /
+// size it's linked to, less what's already spoken for — pieces still to make on lines whose blanks are
+// in (Blanks to Order's `reserved`) — is enough. Orders are served in the order given (`orderIds`, e.g.
+// soonest due first) and only whole orders take stock, so two orders are never both told the same caps
+// are theirs. Returns {orderId: {covered, lines: [{itemId, name, qty, blank, color, size, free}],
+// unlinked}} for the given orders that have a waiting line. Read-only.
+export async function getBlankStockCoverage(db, orderIds) {
+  const want = [...new Set((orderIds || []).map(String))];
+  if (!want.length) return {};
+  const nb = await noBlankLine_(db);
+  const [{ results: lines }, { results: links }, { results: blanks }, { results: sizes }, reserved] = await Promise.all([
+    db.prepare(
+      `SELECT oi.id, oi.orderId, oi.orgId, oi.productId, oi.name, oi.size, oi.qty, COALESCE(oi.manufacturedQty, 0) AS made, oi.configJson
+       FROM order_items oi JOIN orders o ON o.orderId = oi.orderId
+       WHERE oi.cancelDate IS NULL AND o.voidedAt IS NULL AND o.isTest = 0 AND o.completedAt IS NULL AND o.shippedAt IS NULL AND o.deliveredAt IS NULL AND o.manufacturedAt IS NULL
+         AND COALESCE(oi.blankOrderedAt, o.blankOrderedAt) IS NULL AND COALESCE(oi.blankReceivedAt, o.blankReceivedAt) IS NULL
+         AND NOT ${nb("oi")}
+       ORDER BY oi.id`).all(),
+    db.prepare("SELECT orgId, productId, productColor, productSize, blankId, blankColor, blankSize FROM product_blank_links").all(),
+    db.prepare("SELECT id, name FROM blanks").all(),
+    db.prepare("SELECT blankId, color, size, quantity FROM blank_sizes").all(),
+    getBlankReservations(db),
+  ]);
+  const linkAt = new Map(links.map(l => [[l.orgId, l.productId, l.productColor || "", l.productSize || ""].join("\u0001"), l]));
+  const blankName = new Map(blanks.map(b => [Number(b.id), b.name || ""]));
+  // Free = on hand less what's set aside for orders whose blanks are in (getBlankReservations).
+  const free = new Map(sizes.map(sz => [[sz.blankId, sz.color || "", sz.size || ""].join("|"),
+    Math.max(0, Number(sz.quantity) || 0) - (reserved[[sz.blankId, sz.color || "", sz.size || ""].join("|")] || 0)]));
+  const waiting = {};
+  for (const ln of lines) {   // lines still waiting on their blank: not ordered, not received
+    const left = (Number(ln.qty) || 0) - (Number(ln.made) || 0);
+    if (left <= 0) continue;
+    const link = ln.productId ? linkAt.get([ln.orgId, ln.productId, itemColor_(ln), ln.size || ""].join("\u0001")) : null;
+    const key = link ? [link.blankId, link.blankColor || "", link.blankSize || ""].join("|") : null;
+    (waiting[ln.orderId] = waiting[ln.orderId] || []).push({ ln, link, key, left });
+  }
+  const out = {};
+  for (const orderId of want) {
+    const list = waiting[orderId];
+    if (!list) continue;
+    const need = new Map();
+    for (const w of list) if (w.key) need.set(w.key, (need.get(w.key) || 0) + w.left);
+    const unlinked = list.filter(w => !w.key).length;
+    const covered = !unlinked && [...need].every(([k, n]) => (free.get(k) || 0) >= n);
+    out[orderId] = { covered, unlinked, lines: list.map(w => ({ itemId: Number(w.ln.id), name: w.ln.name || "", qty: w.left,
+      blank: w.link ? blankName.get(Number(w.link.blankId)) || "" : "", color: w.link ? w.link.blankColor || "" : "", size: w.link ? w.link.blankSize || "" : "",
+      free: w.key ? Math.max(0, free.get(w.key) || 0) : 0 })) };
+    if (covered) for (const [k, n] of need) free.set(k, free.get(k) - n);   // these are this order's now
+  }
+  return out;
+}
+
+// Orders → stage "Blanks from stock" / Run Order → "Use from stock": the order's waiting lines are
+// marked ordered AND received now, from "In stock", when the stock on hand covers every one of them
+// (getBlankStockCoverage, this order served first). The blanks are then spoken for — Blanks to Order
+// stops offering them to other orders — and are used up from stock when the order is made, exactly
+// as blanks bought for it would be. Nothing is written when something is short or not linked to a
+// blank (a userFacing error says what). Returns {lines}.
+export async function useBlanksFromStock(db, orderId) {
+  const cov = (await getBlankStockCoverage(db, [orderId]))[orderId];
+  if (!cov) throw pricingError_("Nothing on this order is waiting for its blanks.");
+  if (cov.unlinked) throw pricingError_(`${cov.unlinked} item${cov.unlinked === 1 ? " isn't" : "s aren't"} linked to a blank — link ${cov.unlinked === 1 ? "it" : "them"} on the product, or mark the blanks ordered.`);
+  if (!cov.covered) {
+    const need = {};
+    for (const l of cov.lines) { const k = [l.blank, l.color, l.size].join(" · "); need[k] = need[k] || { n: 0, free: l.free }; need[k].n += l.qty; }
+    const short = Object.entries(need).filter(([, v]) => v.n > v.free).map(([k, v]) => `${k}: need ${v.n}, ${v.free} free in stock`);
+    throw pricingError_("Not enough in stock — " + short.join("; ") + ". Order the rest instead.");
+  }
+  const now = new Date().toISOString();
+  await db.batch(cov.lines.map(l => db.prepare(
+    `UPDATE order_items SET blankOrderedAt=COALESCE(blankOrderedAt, ?), blankReceivedAt=COALESCE(blankReceivedAt, ?), blankVendor='In stock', blankCondition='Good'
+     WHERE id=? AND orderId=? AND cancelDate IS NULL AND blankReceivedAt IS NULL`).bind(now, now, l.itemId, orderId)));
+  await recomputeOrderBlankStatus_(db, orderId);
+  return { lines: cov.lines };
+}
+
 
 // ---- CSV import: blanks and products ------------------------------------------------------------
 // Blanks → Import CSV (one row per vendor style, a cost column per size) and a shop's Products →
@@ -4589,6 +7573,15 @@ function importMultiInsert_(db, head, rowSql, tail, rows, perStmt) {
   return out;
 }
 const IMPORT_PRODUCT_ID_RE_ = /^[a-z0-9-]{1,40}$/;   // same rule as catalogValidation's PRODUCT_ID_RE
+
+// Two vendor names for the same vendor: "S&S" and "S&S Activewear", "SanMar" and "Sanmar Corp" — letters and
+// digits only, one a prefix of the other (at least 2 characters).
+function sameVendor_(a, b) {
+  const k = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const x = k(a), y = k(b);
+  if (!x || !y) return x === y;
+  return x === y || (Math.min(x.length, y.length) >= 2 && (x.startsWith(y) || y.startsWith(x)));
+}
 
 const importRow_ = (raw) => {
   const o = {};
@@ -4620,15 +7613,24 @@ const importBool_ = (v, dflt) => {
 };
 const importMoneyText_ = (n) => "$" + Number(n).toFixed(2);
 
-// A vendor/catalog category ("Shirts", "Hoodies & Layers", "Headwear") → this site's product type.
-// "" when it can't tell. "sweat…" is checked before "shirt" so "Sweatshirts" lands right.
-export function importTypeFromCategory(category) {
+// A vendor/catalog category ("Shirts", "Hoodies & Layers", "Headwear") → one of this site's
+// categories (its key). A category's own key, name or storefront heading wins ("Patch", "T Shirts",
+// "hoodie"); otherwise the vendor's wording is guessed into shirt / sweatshirt / cap — "sweat…" is
+// checked before "shirt" so "Sweatshirts" lands right — and the guess only counts if that category
+// still exists. "" when it can't tell. `categories` defaults to the built-in list.
+export function importTypeFromCategory(category, categories) {
+  const cats = categories && categories.length ? categories : BUILT_IN_CATEGORIES;
   const c = String(category || "").trim().toLowerCase();
-  if (["shirt", "sweatshirt", "cap", "other"].includes(c)) return c;
-  if (/hood|sweat|fleece|layer|pullover|crew|quarter|zip|jacket|outerwear/.test(c)) return "sweatshirt";
-  if (/\bcaps?\b|\bhats?\b|beanie|visor|headwear/.test(c)) return "cap";
-  if (/shirt|polo|\btees?\b|\btops?\b/.test(c)) return "shirt";
-  return "";
+  if (!c) return "";
+  const norm = (v) => String(v || "").trim().toLowerCase();
+  const own = cats.find(k => k.key === c || norm(k.name) === c || norm(k.plural) === c || k.key === categoryKeyFromName(c));
+  if (own) return own.key;
+  const has = (key) => cats.some(k => k.key === key);
+  let guess = "";
+  if (/hood|sweat|fleece|layer|pullover|crew|quarter|zip|jacket|outerwear/.test(c)) guess = "sweatshirt";
+  else if (/\bcaps?\b|\bhats?\b|beanie|visor|headwear/.test(c)) guess = "cap";
+  else if (/shirt|polo|\btees?\b|\btops?\b/.test(c)) guess = "shirt";
+  return guess && has(guess) ? guess : "";
 }
 
 // Makes sure a blank has the given colors and sizes WITHOUT touching stock: missing colors and
@@ -4643,9 +7645,9 @@ async function ensureBlankColorSizes_(db, blankId, addColors, sizeCosts, opts = 
   const id = Number(blankId);
   const [{ results: cRows }, { results: sRows }] = await Promise.all([
     db.prepare("SELECT color, sortOrder FROM blank_colors WHERE blankId=? ORDER BY sortOrder, color").bind(id).all(),
-    db.prepare("SELECT color, size, quantity, purchasePriceCents FROM blank_sizes WHERE blankId=? ORDER BY color, id").bind(id).all(),
+    db.prepare("SELECT color, size, quantity, purchasePriceCents, vendorPriceCents FROM blank_sizes WHERE blankId=? ORDER BY color, id").bind(id).all(),
   ]);
-  const info = { addedColors: [], addedSizes: 0, costUpdated: 0, costKept: 0, droppedPlaceholder: false, colors: [], sizes: [] };
+  const info = { addedColors: [], addedSizes: 0, costUpdated: 0, costKept: 0, vendorPriceSet: 0, droppedPlaceholder: false, colors: [], sizes: [] };
   let colorNames = [];
   const haveColor = new Map();   // lower-case → the name as stored
   const note = (c) => { const k = String(c || "").toLowerCase(); if (!haveColor.has(k)) { haveColor.set(k, c || ""); colorNames.push(c || ""); } };
@@ -4681,7 +7683,11 @@ async function ensureBlankColorSizes_(db, blankId, addColors, sizeCosts, opts = 
   const costOf = (size) => (sizeCosts && sizeCosts.has(size)) ? Math.max(0, toCents(sizeCosts.get(size))) : (knownCost.get(size) || 0);
   const rowAt = new Map(sRows.map(r => [(r.color || "") + "|" + r.size, r]));
   const finalColors = [...colorNames, ...toAdd];
+  const priceRows = [];   // the file's costs are the vendor's prices (migrations/0062): [blankId, color, size, to, from, at, actor, note]
+  // A row for ONE color (the CSV's `color` column) only touches that color; otherwise every color.
+  const only = opts.onlyColors ? new Set(opts.onlyColors.map(c => String(c || "").toLowerCase())) : null;
   for (const color of finalColors) {
+    if (only && !only.has(String(color || "").toLowerCase())) continue;
     const isNew = toAdd.includes(color);
     if (isNew || !inCatalog.has(color)) {
       colorIns.push([id, color, ++maxSort, now, now]);
@@ -4690,6 +7696,10 @@ async function ensureBlankColorSizes_(db, blankId, addColors, sizeCosts, opts = 
     for (const size of sizeList) {
       const cur = isNew ? null : rowAt.get(color + "|" + size);
       const cents = costOf(size);
+      if (sizeCosts && sizeCosts.has(size)) {
+        const was = cur && cur.vendorPriceCents != null ? Number(cur.vendorPriceCents) : null;
+        if (was !== cents) { priceRows.push([id, color, size, cents, was, now, String(opts.actor || "").slice(0, 120), "CSV import"]); info.vendorPriceSet++; }
+      }
       if (!cur) {
         sizeIns.push([id, color, size, cents]);
         info.addedSizes++;
@@ -4707,6 +7717,11 @@ async function ensureBlankColorSizes_(db, blankId, addColors, sizeCosts, opts = 
       ...importMultiInsert_(db, "INSERT OR IGNORE INTO blank_colors (blankId, color, imagesJson, sortOrder, createdAt, updatedAt)", "(?, ?, '[]', ?, ?, ?)", "", colorIns, 19),
       ...importMultiInsert_(db, "INSERT OR IGNORE INTO blank_sizes (blankId, color, size, purchasePriceCents, quantity)", "(?, ?, ?, ?, 0)", "", sizeIns, 24),
       ...updates,
+      // Vendor prices, per color and size (each row in priceRows is one that changed), then the history.
+      ...priceRows.map(r => db.prepare("UPDATE blank_sizes SET vendorPriceCents=?, vendorPriceAt=? WHERE blankId=? AND color=? AND size=?")
+        .bind(r[3], now, id, r[1], r[2])),
+      ...importMultiInsert_(db, "INSERT INTO blank_vendor_prices (blankId, color, size, priceCents, previousCents, enteredAt, actor, note)", "(?, ?, ?, ?, ?, ?, ?, ?)", "", priceRows, 12),
+      ...(priceRows.length ? [db.prepare("UPDATE blanks SET pricesCheckedAt=? WHERE id=?").bind(now, id)] : []),
     ];
     if (all.length) await db.batch(all);
   }
@@ -4734,6 +7749,7 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
   const bySku = new Map();
   for (const b of blankRows) { const k = String(b.sku || "").trim().toLowerCase(); if (k) (bySku.get(k) || bySku.set(k, []).get(k)).push(b); }
   const needleTypes = await listNeedleTypes(db);
+  const categories = await listProductCategories(db);
   const findNeedle = (name) => {
     const n = name.toLowerCase();
     return needleTypes.find(t => t.name.toLowerCase() === n)
@@ -4748,15 +7764,25 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const style = (r.style || r.sku || r.blank_style || "").slice(0, 100);
+    // An optional `color` column: the row prices just that color, so a style can take one row per color.
+    const rowColor = String(r.color || "").trim().slice(0, 80);
     const res = { row: rowOffset + i + 2, style, name: "", action: "skip", problems: [], notes: [], sizes: [], colors: [] };
     out.push(res);
     if (!style) { res.problems.push("No style — every row needs one"); skipped++; continue; }
-    if (seen.has(style.toLowerCase())) { res.problems.push("This style is in the file more than once"); skipped++; continue; }
-    seen.add(style.toLowerCase());
+    const seenKey = style.toLowerCase() + (rowColor ? "|" + rowColor.toLowerCase() : "");
+    if (seen.has(seenKey) || (!rowColor && [...seen].some(k => k.startsWith(style.toLowerCase() + "|"))) || (rowColor && seen.has(style.toLowerCase()))) {
+      res.problems.push(rowColor ? "This style and color are in the file more than once" : "This style is in the file more than once"); skipped++; continue;
+    }
+    seen.add(seenKey);
     const name = (r.name || [r.brand, style].filter(Boolean).join(" ")).slice(0, 200);
     res.name = name;
-    let type = importTypeFromCategory(r.category || r.type);
-    if (!type) { type = "other"; if (r.category) res.notes.push(`Category "${r.category}" isn't one this site knows — filed under Other`); }
+    let type = importTypeFromCategory(r.category || r.type, categories);
+    if (!type) {
+      // Not one of the site's categories: file it under Other (or, if that was deleted, the last one).
+      const fallback = categories.find(c => c.key === "other") || categories[categories.length - 1];
+      type = fallback ? fallback.key : "other";
+      if (r.category) res.notes.push(`Category "${r.category}" isn't one this site knows — filed under ${fallback ? fallback.name : "Other"}`);
+    }
 
     const sizeCosts = new Map();
     for (const k of Object.keys(r)) {
@@ -4768,7 +7794,7 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
     }
     if (!sizeCosts.size && !res.problems.length) res.problems.push("No size costs — fill at least one cost_<size> column (e.g. cost_M, or cost_OSFA for one size)");
     res.sizes = [...sizeCosts.keys()];
-    const colors = importList_(r.colors || r.all_colors);
+    const colors = rowColor ? [rowColor] : importList_(r.colors || r.all_colors);
     res.colors = colors;
 
     let needleTypeId, needleName = "";
@@ -4781,8 +7807,12 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
 
     const matches = bySku.get(style.toLowerCase()) || [];
     const vendor = (r.supplier || r.vendor || "").slice(0, 100);
-    const existing = matches.find(b => String(b.vendor || "").toLowerCase() === vendor.toLowerCase()) || matches[0] || null;
-    if (matches.length > 1) res.notes.push(`${matches.length} blanks already use this style — updating ${existing && existing.vendor ? "the " + existing.vendor + " one" : "the first"}`);
+    // Matched on vendor + style: a blank of this style from ANOTHER vendor is never updated (or re-vendored).
+    // With no vendor in the file, the first blank of the style is used, as before.
+    const sameVendor = matches.filter(b => sameVendor_(b.vendor, vendor));
+    const existing = vendor ? (sameVendor[0] || null) : (matches[0] || null);
+    if (vendor && !existing && matches.length) res.notes.push(`A blank with this style is from ${matches.map(b => b.vendor || "no vendor").join(", ")} — this makes a separate ${vendor} blank`);
+    if ((vendor ? sameVendor : matches).length > 1) res.notes.push(`${(vendor ? sameVendor : matches).length} blanks already use this style — updating ${existing && existing.vendor ? "the " + existing.vendor + " one" : "the first"}`);
     if (res.problems.length) { skipped++; continue; }
     res.action = existing ? "update" : "create";
     const notes = importBlankNotes_(r);
@@ -4795,17 +7825,25 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
 
     if (!existing) {
       if (!dryRun) {
-        const sizes = [...sizeCosts].map(([size, cost]) => ({ size, purchasePrice: cost, quantity: 0 }));
+        const sizes = [...sizeCosts].map(([size, cost]) => ({ size, purchasePrice: cost, vendorPrice: cost, quantity: 0 }));
         const fields = { name, productType: type, vendor, brand: (r.brand || "").slice(0, 100), sku: style, color: "", notes,
           colors: (colors.length ? colors : [""]).map(color => ({ color, sizes })) };
         if (needleTypeId !== undefined) fields.needleTypeId = needleTypeId;
-        res.id = (await createBlank(db, fields)).id;
+        res.id = (await createBlank(db, fields, undefined, { actor: opts.actor, note: "CSV import" })).id;
       }
+      // Later rows of the same style (one per color) add to this blank rather than make another.
+      const made = { id: res.id || -(i + 1), sku: style, vendor, notes };
+      (bySku.get(style.toLowerCase()) || bySku.set(style.toLowerCase(), []).get(style.toLowerCase())).push(made);
       created++;
       continue;
     }
 
     // Existing blank: refresh its catalog fields, add what's missing, never touch stock.
+    if (Number(existing.id) < 0) {   // made by an earlier row of this dry run
+      res.notes.push("Adds to the blank the row above creates");
+      updated++;
+      continue;
+    }
     res.id = Number(existing.id);
     const keepNotes = !!existing.notes && !IMPORT_NOTE_RE_.test(existing.notes);
     if (keepNotes && notes && notes !== existing.notes) res.notes.push("Its notes were typed by hand — left as they are");
@@ -4814,7 +7852,8 @@ export async function importBlanksCsv(db, rawRows, opts = {}) {
         .bind(name, type, vendor, (r.brand || "").slice(0, 100), keepNotes ? existing.notes : notes, new Date().toISOString(), Number(existing.id)).run();
       if (needleTypeId !== undefined) await setBlankNeedleType_(db, Number(existing.id), { needleTypeId });
     }
-    const did = await ensureBlankColorSizes_(db, existing.id, colors, sizeCosts, { dryRun });
+    const did = await ensureBlankColorSizes_(db, existing.id, colors, sizeCosts, { dryRun, actor: opts.actor, onlyColors: rowColor ? [rowColor] : null });
+    if (did.vendorPriceSet) res.notes.push(`Sets the vendor price on ${did.vendorPriceSet} size row${did.vendorPriceSet === 1 ? "" : "s"}`);
     if (did.addedColors.length) res.notes.push(`Adds ${did.addedColors.length} color${did.addedColors.length === 1 ? "" : "s"}`);
     if (did.addedSizes) res.notes.push(`Adds ${did.addedSizes} size row${did.addedSizes === 1 ? "" : "s"}`);
     if (did.costUpdated) res.notes.push(`Updates the cost on ${did.costUpdated} size row${did.costUpdated === 1 ? "" : "s"} with no stock`);
@@ -4842,6 +7881,8 @@ export async function importProductsCsv(db, orgId, rawRows, opts = {}) {
   const blankBySku = new Map();
   for (const b of blankRows) { const k = String(b.sku || "").trim().toLowerCase(); if (k && !blankBySku.has(k)) blankBySku.set(k, b); }
   const locations = await listLocations(db);
+  const categories = await listProductCategories(db);
+  const packAsOf = Object.fromEntries(categories.map(c => [c.key, c.packAs]));
   const graphicIds = (opts.graphicIds || []).map(Number).filter(Boolean);
   let nextSort = existingProducts.reduce((m, p) => Math.max(m, Number(p.sortOrder) || 0), 0) + 1;
   const out = [], seen = new Set((opts.seen || []).map(x => String(x).toLowerCase())), newLocations = [];
@@ -4861,8 +7902,8 @@ export async function importProductsCsv(db, orgId, rawRows, opts = {}) {
     if (seen.has(productId)) { res.problems.push("This SKU is in the file more than once"); skipped++; continue; }
     seen.add(productId);
     if (!res.name) res.problems.push("No name");
-    const type = importTypeFromCategory(r.category || r.type);
-    if (!type || type === "other") res.problems.push(`Category "${r.category || ""}" isn't a shirt, hoodie/sweatshirt or cap`);
+    const type = importTypeFromCategory(r.category || r.type, categories);
+    if (!type) res.problems.push(`Category "${r.category || ""}" isn't one of this site's categories (${categories.map(c => c.name).join(", ")})`);
     const price = importMoney_(r.price);
     if (price == null) res.problems.push("No price");
     else if (Number.isNaN(price)) res.problems.push(`Price isn't a number ("${r.price}")`);
@@ -4876,9 +7917,13 @@ export async function importProductsCsv(db, orgId, rawRows, opts = {}) {
       upcharges[importSize_(m[1])] = amt;
     }
     const oneSize = sizes.length <= 1 && (!sizes.length || /^(OSFA|OS|ONE SIZE|ONESIZE)$/.test(sizes[0]));
-    const flat = type === "cap" || (oneSize && type !== "shirt" && type !== "sweatshirt");
+    // One flat price or a price per size: a category that packs like a cap is always one size; one
+    // that packs like a shirt or sweatshirt is a garment and needs its sizes; anything else (a
+    // patch, …) is flat when the row lists no sizes, or just OSFA.
+    const packs = packAsOf[type] || "other";
+    const flat = packs === "cap" || (oneSize && packs !== "shirt" && packs !== "sweatshirt");
     if (!flat && !sizes.length) res.problems.push("No sizes — list them separated by | (S|M|L|XL)");
-    if (type === "cap" && sizes.length > 1) res.notes.push("Caps are sold as one size — the size list is ignored");
+    if (packs === "cap" && sizes.length > 1) res.notes.push("Caps are sold as one size — the size list is ignored");
     const sizePricing = {};
     if (!flat && price != null && !Number.isNaN(price)) {
       for (const sz of sizes) sizePricing[sz] = Math.round((price + (upcharges[sz] || 0)) * 100) / 100;
@@ -4928,6 +7973,29 @@ export async function importProductsCsv(db, orgId, rawRows, opts = {}) {
     // Locations the product already has that the file doesn't mention stay (with their graphics).
     if (ex) for (const x of (ex.locations || [])) if (!locEntries.some(e => e.key === x.key)) locEntries.push(x);
 
+    // Color price groups (migrations/0064): color_groups "Heathers: Oxford Heather, Ash | White: White" and
+    // color_group_upcharges "Heathers:2.00|White:-1.00", added to each size's price (like size_upcharges).
+    let colorGroupsCents;
+    if (r.color_groups) {
+      const ups = {};
+      for (const part of importList_(r.color_group_upcharges)) {
+        const m = part.match(/^(.+?)\s*[:=]\s*(-?\$?[\d.,]+)$/);
+        const amt = m ? Number(m[2].replace(/[$,]/g, "")) : NaN;
+        if (!m || !Number.isFinite(amt)) { res.problems.push(`Color group upcharge "${part}" should look like Heathers:2.00`); continue; }
+        ups[m[1].trim().toLowerCase()] = amt;
+      }
+      const groups = [];
+      for (const part of importList_(r.color_groups, 600)) {
+        const cut = part.indexOf(":");
+        if (cut < 1) { res.problems.push(`Color group "${part}" should look like Heathers: Oxford Heather, Ash`); continue; }
+        const label = part.slice(0, cut).trim(), up = ups[label.toLowerCase()] || 0;
+        const colors = part.slice(cut + 1).split(",").map(x => x.trim()).filter(Boolean).map(x => garmentColors.find(g => g.toLowerCase() === x.toLowerCase()) || x);
+        groups.push(flat ? { label, colors, flatPrice: price == null ? null : Math.round((price + up) * 100) / 100 }
+          : { label, colors, sizePricing: Object.fromEntries(Object.entries(sizePricing).map(([z, v]) => [z, Math.round((v + up) * 100) / 100])) });
+      }
+      const clean = cleanColorGroups_(groups, { pricingMode: flat ? "flat" : "sized", sizePricing, garmentColors });
+      if (clean.error) res.problems.push(clean.error); else { colorGroupsCents = clean.groups; res.notes.push(`${groups.length} color price group${groups.length === 1 ? "" : "s"}: ${groups.map(g => g.label).join(", ")}`); }
+    }
     if (res.problems.length) { skipped++; continue; }
     res.action = ex ? "update" : "create";
     const configurable = garmentColors.length > 0 || locEntries.length > 0 || !!(ex && ex.configurable);
@@ -4944,12 +8012,23 @@ export async function importProductsCsv(db, orgId, rawRows, opts = {}) {
     };
     // Optional: TRUE for a transfer-only (DTF) product, so the catalog check doesn't ask for a design.
     if (Object.prototype.hasOwnProperty.call(r, "no_design_needed") && r.no_design_needed !== "") p.noDesignNeeded = importBool_(r.no_design_needed, false);
-    if (!dryRun) { if (ex) await updateProduct(db, orgId, p); else await createProduct(db, orgId, p); }
+    // Optional: TRUE for a product made with no blank at all (a patch), so nothing asks for a blank link.
+    if (Object.prototype.hasOwnProperty.call(r, "no_blank_needed") && r.no_blank_needed !== "") p.noBlankNeeded = importBool_(r.no_blank_needed, false);
+    if (colorGroupsCents !== undefined) p.colorGroupsCents = colorGroupsCents;
+    if (!dryRun) {
+      if (ex) await updateProduct(db, orgId, p); else await createProduct(db, orgId, p);
+      // New prices are set against the blanks' vendor prices as they are now (migrations/0062).
+      if (ex) {
+        const after = parseProduct_(await db.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first());
+        const key = (x) => JSON.stringify([x.pricingMode, x.flatPrice, x.sizePricing, x.colorGroups]);
+        if (key(after) !== key(ex)) await confirmProductPrices(db, orgId, productId);
+      }
+    }
     if (ex) updated++; else created++;
 
     // Link every color × size to the blank.
     const style = r.blank_style || r.blank || r.blank_sku || "";
-    if (!style) { res.notes.push("No blank_style — not linked to a blank (stock and cost won't be tracked)"); continue; }
+    if (!style) { if (!p.noBlankNeeded && !(ex && ex.noBlankNeeded)) res.notes.push("No blank_style — not linked to a blank (stock and cost won't be tracked)"); continue; }
     const blank = blankBySku.get(style.toLowerCase());
     if (!blank) { res.blank = { style, found: false, links: 0 }; res.notes.push(`Blank "${style}" isn't in Blanks yet — import the blanks file first, then import this again to link it`); continue; }
     if (blank.productType && blank.productType !== type) res.notes.push(`Blank "${style}" is filed as ${blank.productType}, this product as ${type}`);
@@ -5051,8 +8130,9 @@ async function loadOrders_(db, where, binds, orderBy) {
   for (const r of orderRows) r.orderDesignsMissing = missing[r.orderId] || 0;
 
   const sub = `SELECT o.orderId FROM orders o WHERE ${where}`;
+  const nb = await noBlankLine_(db);
   const { results: itemRows } = await db.prepare(
-    `SELECT * FROM order_items WHERE orderId IN (${sub}) ORDER BY id`
+    `SELECT oi.*, ${nb("oi")} AS noBlank FROM order_items oi WHERE oi.orderId IN (${sub}) ORDER BY oi.id`
   ).bind(...binds).all();
 
   const { results: paymentRows } = await db.prepare(
@@ -5081,10 +8161,16 @@ async function loadOrders_(db, where, binds, orderBy) {
   // the edit modal loads them. Scoped by the SAME order subquery the joins above use, so a large
   // Orders page can't hit D1's bound-parameter cap. A pre-migration DB yields {} internally.
   const shipmentsByOrder = await blankShipmentsByOrder_(db, { sub, binds });
+  const invoices = await invoicesByOrder_(db, sub, binds);   // the invoice link emailed for it, if any (0053)
+  // Restricted brands it has a large number of, and whether the supplier approved the logo (migrations/0075).
+  let reviews = new Map();
+  try { reviews = brandReviewsForLines_(await brandContext_(db), itemRows); } catch (e) { console.error("brand review check failed:", e); }
 
   return orderRows.map((r) => {
     const o = parseOrder_(r, itemsByOrder[r.orderId] || [], paymentsByOrder[r.orderId] || [], labelsByOrder[r.orderId] || []);
     o.blankShipments = shipmentsByOrder[r.orderId] || [];
+    o.invoice = invoices[r.orderId] || null;
+    o.brandReview = reviews.get(r.orderId) || [];
     return o;
   });
 }
@@ -5094,8 +8180,9 @@ export async function getOrderById(db, orderId) {
   const row = await db.prepare(`SELECT o.*, ${stage.approval} AS needsDesignApproval, ${stage.digitizing} AS needsDigitizing FROM orders o WHERE o.orderId=?`).bind(orderId).first();
   if (!row) return null;
   row.orderDesignsMissing = (await orderDesignsMissingBy_(db, "o.orderId=?", [orderId]))[orderId] || 0;
+  const nb = await noBlankLine_(db);
   const { results: itemRows } = await db.prepare(
-    "SELECT * FROM order_items WHERE orderId=? ORDER BY id"
+    `SELECT oi.*, ${nb("oi")} AS noBlank FROM order_items oi WHERE oi.orderId=? ORDER BY oi.id`
   ).bind(orderId).all();
   const { results: paymentRows } = await db.prepare(
     "SELECT * FROM order_payments WHERE orderId=? ORDER BY receivedAt ASC"
@@ -5105,11 +8192,18 @@ export async function getOrderById(db, orderId) {
   ).bind(orderId).all();
   const order = parseOrder_(row, itemRows.map(parseItem_), paymentRows.map(parsePayment_), labelRows.map(parseLabel_));
   order.blankShipments = await getBlankShipmentsForOrder(db, orderId).catch(() => []);
+  order.invoice = (await invoicesByOrder_(db, "?", [orderId]))[orderId] || null;
+  try { order.brandReview = brandReviewsForLines_(await brandContext_(db), itemRows).get(orderId) || []; } catch (e) { order.brandReview = []; }
   return order;
 }
 
 // Atomic insert: order header + all items in one batch.
-export async function insertOrder(db, order, pricedItems) {
+// opts.fillFromStock (the storefront and local sales, migrations/0060): a line for a stocked product +
+// size is filled from the shop's finished stock when enough is AVAILABLE (on hand less set aside) — a
+// guarded UPDATE right after the line's INSERT, in the same batch, so two orders can't both get the last
+// piece. Only plain catalog lines qualify: not personalized, no color/graphic choices, no uploaded design,
+// and never on a test order.
+export async function insertOrder(db, order, pricedItems, opts = {}) {
   const stmts = [];
   // configJson is additive (migrations/0036); tolerate a pre-0036 schema (tests pin older subsets).
   let hasConfig = false;
@@ -5134,13 +8228,15 @@ export async function insertOrder(db, order, pricedItems) {
   ]);
   const taxExempt = orgRow && orgRow.taxExempt ? 1 : 0;
   const orderRateBps = Number(taxSettings.rateBps) || 0;
-  // Tax in the listed prices, or added to them: today's setting, kept on the order (migrations/0052).
+  // Tax in the listed prices, or added to them: today's setting, kept on the order (migrations/0057).
   const mode = taxMode_(order.taxMode || taxSettings.taxMode);
   const outOfState = isOutOfState(stateOf_(order.shippingAddress), taxSettings.jurisdiction);
   const lineRateBps = taxExempt || outOfState ? 0 : orderRateBps;
   // Each line's taxable flag: the catalog product's, or the caller's for a
   // custom (local-sale) line; default taxable.
-  const { results: prodRows } = await db.prepare("SELECT productId, taxable FROM products WHERE orgId=?").bind(order.orgId).all();
+  const { results: prodRows } = await db.prepare("SELECT * FROM products WHERE orgId=?").bind(order.orgId).all();
+  const productRow = Object.fromEntries(prodRows.map(r => [r.productId, r]));
+  const fillFromStock = !!opts.fillFromStock && !order.isTest && await hasFromStockColumn_(db);
   const productTaxable = Object.fromEntries(prodRows.map(r => [r.productId, !!r.taxable]));
   const lineTaxable = (it) => (it.productId && it.productId in productTaxable) ? productTaxable[it.productId] : it.taxable !== false;
 
@@ -5196,6 +8292,15 @@ export async function insertOrder(db, order, pricedItems) {
         SELECT max(id), ?, ?, ?, 'customer', ? FROM order_items WHERE orderId=?`)
         .bind(String(f.fileKey), String(f.fileName || "").slice(0, 120), String(f.fileExt || ""), order.placedAt || new Date().toISOString(), order.orderId));
     }
+    // Filled from finished stock when enough is available right now (this line isn't counted yet).
+    const prod = productRow[it.productId];
+    if (fillFromStock && prod && !Number(prod.configurable) && !it.personalized && !it.config && !(Array.isArray(it.customFiles) && it.customFiles.length)) {
+      const sz = stockSize_(prod.pricingMode, it.size), held = setAsideSql_(order.orgId, it.productId, prod.pricingMode, sz);
+      stmts.push(db.prepare(
+        `UPDATE order_items SET fromStock = 1 WHERE id = (SELECT max(id) FROM order_items WHERE orderId = ?)
+           AND COALESCE((SELECT quantity FROM ready_to_ship WHERE orgId = ? AND productId = ? AND size = ?), 0) - ${held.sql} >= ?`
+      ).bind(order.orderId, order.orgId, it.productId, sz, ...held.binds, qty));
+    }
   }
 
   await db.batch(stmts);
@@ -5243,7 +8348,7 @@ function manufacturedPrereq_(o) {
   const needsApproval = o.needsDesignApproval !== false, needsDigitizing = o.needsDigitizing !== false;
   if (needsApproval && !o.designApprovedAt) return [false, "the design isn't approved yet"];
   if (!needsApproval && needsDigitizing && !o.digitizingCompleteAt) return [false, "digitizing isn't complete yet"];
-  return [!!o.blankReceivedAt, "the blank hasn't been received yet"];
+  return [o.needsBlanks === false || !!o.blankReceivedAt, "the blank hasn't been received yet"];
 }
 
 export function stagePrereqError(o, stage) {
@@ -5254,6 +8359,8 @@ export function stagePrereqError(o, stage) {
     const n = Number(o.orderDesignsMissing);
     return `${n} order design${n === 1 ? " hasn't" : "s haven't"} been uploaded yet (Edit items → Files → Order design)`;
   }
+  // Nothing on the order uses a blank (every product is "No blank needed", migrations/0057).
+  if (["blankOrdered", "blankShipped", "blankReceived"].includes(stage) && o.needsBlanks === false) return "nothing on this order uses a blank";
   const need = {
     blankOrdered:       [o.paid, "the order isn't paid yet"],
     blankShipped:       [o.blankOrderedAt, "the blank hasn't been ordered yet"],
@@ -5275,12 +8382,13 @@ export function stagePrereqError(o, stage) {
 // Which active line items a per-item blank stage applies to: extras.itemIds if given, else all
 // active lines of the order. Returns an array of numeric ids.
 async function blankTargetItemIds_(db, orderId, extras) {
+  const nb = await noBlankLine_(db);
   if (Array.isArray(extras.itemIds) && extras.itemIds.length) {
     const want = new Set(extras.itemIds.map(Number).filter(Boolean));
-    const { results } = await db.prepare("SELECT id FROM order_items WHERE orderId=? AND cancelDate IS NULL").bind(orderId).all();
+    const { results } = await db.prepare(`SELECT oi.id FROM order_items oi WHERE oi.orderId=? AND oi.cancelDate IS NULL AND NOT ${nb("oi")}`).bind(orderId).all();
     return results.map(r => Number(r.id)).filter(id => want.has(id));
   }
-  const { results } = await db.prepare("SELECT id FROM order_items WHERE orderId=? AND cancelDate IS NULL").bind(orderId).all();
+  const { results } = await db.prepare(`SELECT oi.id FROM order_items oi WHERE oi.orderId=? AND oi.cancelDate IS NULL AND NOT ${nb("oi")}`).bind(orderId).all();
   return results.map(r => Number(r.id));
 }
 
@@ -5289,9 +8397,10 @@ async function blankTargetItemIds_(db, orderId, extras) {
 // orders.blankOrderedAt is set only when EVERY active line is ordered, blankReceivedAt only when
 // every active line is received; vendor/est-delivery/condition summarize the items.
 async function recomputeOrderBlankStatus_(db, orderId) {
+  const nb = await noBlankLine_(db);
   const { results: active } = await db.prepare(
-    `SELECT blankOrderedAt, blankReceivedAt, blankVendor, blankVendorOrderId, blankEstDelivery, blankCondition
-     FROM order_items WHERE orderId=? AND cancelDate IS NULL`).bind(orderId).all();
+    `SELECT oi.blankOrderedAt, oi.blankReceivedAt, oi.blankVendor, oi.blankVendorOrderId, oi.blankEstDelivery, oi.blankCondition
+     FROM order_items oi WHERE oi.orderId=? AND oi.cancelDate IS NULL AND NOT ${nb("oi")}`).bind(orderId).all();   // only lines that use a blank
   const n = active.length;
   const ordered = active.filter(r => r.blankOrderedAt);
   const received = active.filter(r => r.blankReceivedAt);
@@ -5480,6 +8589,7 @@ export async function cancelLineItem(db, itemId) {
   const lateCancel = !!(order && order.blankOrderedAt);
   await db.prepare("UPDATE order_items SET cancelDate=?, lateCancel=? WHERE id=?")
     .bind(now, lateCancel ? 1 : 0, itemId).run();
+  await returnFinishedStock_(db, item.orderId, itemId);   // a piece already pulled from stock goes back (0060)
   await refreshPaidStatus(db, item.orderId);
   return { lateCancel };
 }
@@ -5492,6 +8602,7 @@ export async function cancelLineItemWithReason(db, itemId, reason) {
   const lateCancel = !!(order && order.blankOrderedAt);
   await db.prepare("UPDATE order_items SET cancelDate=?, cancelReason=?, lateCancel=? WHERE id=?")
     .bind(now, reason || "", lateCancel ? 1 : 0, itemId).run();
+  await returnFinishedStock_(db, item.orderId, itemId);   // a piece already pulled from stock goes back (0060)
   await refreshPaidStatus(db, item.orderId);
   return { lateCancel };
 }
@@ -5535,6 +8646,21 @@ export async function updateOrderItem(db, id, { productId, name, type, size, qty
   // leaves a classic line's empty config alone.
   if (config !== undefined && await orderItemsHasConfigCol_(db)) {
     await db.prepare("UPDATE order_items SET configJson=? WHERE id=?").bind(config ? JSON.stringify(config) : "", Number(id)).run();
+  }
+  // A line filled from finished stock that hasn't been pulled yet is checked against stock again after
+  // the edit (another product, size or quantity) — still filled from stock only if enough is available.
+  if (await hasFromStockColumn_(db)) {
+    const row = await db.prepare("SELECT * FROM order_items WHERE id=?").bind(Number(id)).first();
+    if (row && Number(row.fromStock) && !Number(row.manufacturedQty)) {
+      await db.prepare("UPDATE order_items SET fromStock = 0 WHERE id = ?").bind(Number(id)).run();
+      const prod = row.productId ? await db.prepare("SELECT pricingMode, configurable FROM products WHERE orgId=? AND productId=?").bind(row.orgId, row.productId).first() : null;
+      if (prod && !Number(prod.configurable) && !Number(row.personalized) && !row.configJson) {
+        const sz = stockSize_(prod.pricingMode, row.size), held = setAsideSql_(row.orgId, row.productId, prod.pricingMode, sz);
+        await db.prepare(`UPDATE order_items SET fromStock = 1 WHERE id = ?
+            AND COALESCE((SELECT quantity FROM ready_to_ship WHERE orgId = ? AND productId = ? AND size = ?), 0) - ${held.sql} >= ?`)
+          .bind(Number(id), row.orgId, row.productId, sz, ...held.binds, Number(row.qty)).run();
+      }
+    }
   }
   await recomputeOrderTax_(db, item.orderId);
 }
@@ -5673,43 +8799,50 @@ export async function getOrderTotal(db, orderId) {
 
 // ---- Catalog data for getCatalogData() --------------------------------
 
+// One shop as the storefront needs it, from its rows (published, or live for a draft preview).
+async function catalogShopFromRows_(db, rows) {
+  const org = parseOrg_(rows.org);
+  const visible = rows.products.filter(p => Number(p.visible)).sort((a, b) => (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) || String(a.productId).localeCompare(String(b.productId)));
+  let products = await productsFromRows_(db, org.orgId, visible);
+  // Blank color images (migrations/0037): each product's linked blank colors' images, keyed by the product color the
+  // link is for, so the storefront can show the garment's photo per color. Images only — no stock reaches the catalog.
+  products = await attachBlankColorImages_(db, org.orgId, products);
+  // Per-location mockups (0042) — any product's: a plain product can have mockups of its printed transfers (0067).
+  products = await attachProductGraphicImages_(db, org.orgId, products);
+  products = await attachDecorations_(db, org.orgId, products);
+  if (!products.some(p => p.configurable)) return { ...org, products };
+  const { tiersCents } = await getTierPrices(db, org.orgId);
+  const graphics = (await listGraphics(db, org.orgId)).filter(g => g.visible).map(g => ({
+    id: g.id, name: g.name, kind: g.kind, tier: g.tier, addOnCents: g.tier ? (tiersCents[g.tier] || 0) : 0,
+    inkColors: g.inkColors, imageUrl: g.imageUrl, thumbUrl: g.thumbUrl,
+    allowedLocations: g.allowedLocations, allowedGarmentColors: g.allowedGarmentColors,
+  }));
+  return { ...org, products, graphics, tierPricesCents: tiersCents };
+}
+// A shop's DRAFT (its live rows), for the admin's signed preview link — never cached.
+export async function getDraftCatalogShop(db, orgId) {
+  const rows = await liveShopRows_(db, orgId);
+  return rows ? catalogShopFromRows_(db, rows) : null;
+}
 export async function getPublicCatalogData(db) {
-  const [orgs, baseSettings, salesTax, business, locale, features] = await Promise.all([
-    getAllOrgs(db),
+  // Each shop as PUBLISHED (migrations/0076): its snapshot rows, or its live rows if never published.
+  const shopRows = await Promise.all((await db.prepare("SELECT orgId FROM orgs ORDER BY orgId").all()).results.map(r => publishedShopRows_(db, r.orgId)));
+  const [baseSettings, salesTax, business, locale, features, categories] = await Promise.all([
     getGlobalSettings(db),
     getSalesTaxSettings(db),
     getBusinessProfile(db),
     getLocaleSettings(db),
     getFeatures(db),
+    listProductCategories(db),
   ]);
   const globalSettings = { ...baseSettings, salesTax };
 
-  // Build subdomainMap: { [subdomain]: orgId }
+  // Each shop with its visible products; configurable products also need the shop's visible graphics (option
+  // tiles, with the tier add-on resolved) + tier prices (migrations/0036), blank color images (0037) and mockups.
+  const orgsWithProducts = await Promise.all(shopRows.filter(Boolean).map(rows => catalogShopFromRows_(db, rows)));
+  // Build subdomainMap: { [subdomain]: orgId } — the published address.
   const subdomainMap = {};
-  for (const org of orgs) {
-    subdomainMap[org.subdomain] = org.orgId;
-  }
-
-  // Enrich each org with its visible products; configurable products also need the org's visible
-  // graphics (option tiles, with the tier add-on resolved) + tier prices (migrations/0036).
-  const orgsWithProducts = await Promise.all(
-    orgs.map(async (org) => {
-      let products = await getProductsByOrg(db, org.orgId, true);
-      // Blank color images (migrations/0037): each product's linked blank colors' images, keyed by
-      // the product color the link is for, so the storefront can show the garment's photo per color
-      // (preferred over a product's own images). Images only — no stock ever reaches the catalog.
-      products = await attachBlankColorImages_(db, org.orgId, products);
-      if (!products.some(p => p.configurable)) return { ...org, products };
-      products = await attachProductGraphicImages_(db, org.orgId, products);   // per-location mockups (0042)
-      const { tiersCents } = await getTierPrices(db, org.orgId);
-      const graphics = (await listGraphics(db, org.orgId)).filter(g => g.visible).map(g => ({
-        id: g.id, name: g.name, kind: g.kind, tier: g.tier, addOnCents: g.tier ? (tiersCents[g.tier] || 0) : 0,
-        inkColors: g.inkColors, imageUrl: g.imageUrl, thumbUrl: g.thumbUrl,
-        allowedLocations: g.allowedLocations, allowedGarmentColors: g.allowedGarmentColors,
-      }));
-      return { ...org, products, graphics, tierPricesCents: tiersCents };
-    })
-  );
+  for (const org of orgsWithProducts) subdomainMap[org.subdomain] = org.orgId;
 
   return {
     status: "ok",
@@ -5719,6 +8852,8 @@ export async function getPublicCatalogData(db) {
     business: publicBusinessProfile(business),   // name, contact and payment details shown to visitors
     locale: { country: locale.country },         // address format the storefront's forms use (Region)
     features,                                    // which optional parts of the site are on (Features)
+    // The storefront's sections, in order (migrations/0056): key + heading only.
+    categories: categories.map(c => ({ key: c.key, label: c.plural || c.name })),
     version: "d1", // static — the cache is keyed by global_settings.catalogVersion
   };
 }
@@ -5727,25 +8862,45 @@ export async function getPublicCatalogData(db) {
 // links to the linked blank colors' images (migrations/0037). Tolerates a pre-0037 DB (no
 // blank_colors / link color columns) by yielding no images.
 async function attachBlankColorImages_(db, orgId, products) {
-  let rows = [];
+  let rows = [], colorRows = [];
   try {
     const r = await db.prepare(
-      `SELECT l.productId, l.productColor, bc.imagesJson
+      `SELECT l.productId, l.productColor, l.blankId, bc.imagesJson
        FROM product_blank_links l JOIN blank_colors bc ON bc.blankId = l.blankId AND bc.color = l.blankColor
        WHERE l.orgId = ?`
     ).bind(orgId).all();
     rows = r.results || [];
+    // Every color of the blanks this shop's products are linked to — for a garment color with no links of its own.
+    colorRows = (await db.prepare(
+      `SELECT bc.blankId, bc.color, bc.imagesJson FROM blank_colors bc
+       WHERE bc.blankId IN (SELECT DISTINCT blankId FROM product_blank_links WHERE orgId = ?)`
+    ).bind(orgId).all()).results || [];
   } catch (e) { return products; }
   if (!rows.length) return products;
-  const byProduct = {};
+  const urlsOf = (json) => (tryParse_(json, []) || []).map(normBlankImage_).filter(Boolean).map(x => x.url);
+  const byProduct = {}, blanksOf = {};
   for (const r of rows) {
+    (blanksOf[r.productId] = blanksOf[r.productId] || new Set()).add(Number(r.blankId));
     // Images may be legacy bare strings or {url, locationId} (migrations/0041); the storefront color
     // preview just wants the URLs, so flatten to url strings here (the location-aware preview
     // uses the separate product_graphic_images table, not this map).
-    const imgs = (tryParse_(r.imagesJson, []) || []).map(normBlankImage_).filter(Boolean).map(x => x.url);
+    const imgs = urlsOf(r.imagesJson);
     if (!imgs.length) continue;
     const p = byProduct[r.productId] || (byProduct[r.productId] = {});
     if (!p[r.productColor || ""]) p[r.productColor || ""] = imgs;   // first non-empty wins per color
+  }
+  // A garment color that has no blank links (added to the product before its links were saved) still shows its
+  // photos: the same-named color (any case / spacing) on a blank the product is linked to.
+  const key = (c) => String(c || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  for (const p of products) {
+    const colors = (Array.isArray(p.garmentColors) ? p.garmentColors : []).map(c => typeof c === "object" && c ? c.color || c.name : c).filter(Boolean);
+    const ids = blanksOf[p.productId];
+    if (!colors.length || !ids) continue;
+    for (const c of colors) {
+      if (byProduct[p.productId] && byProduct[p.productId][c]) continue;
+      const hit = colorRows.find(r => ids.has(Number(r.blankId)) && key(r.color) === key(c) && urlsOf(r.imagesJson).length);
+      if (hit) (byProduct[p.productId] = byProduct[p.productId] || {})[c] = urlsOf(hit.imagesJson);
+    }
   }
   return products.map(p => byProduct[p.productId] ? { ...p, colorImages: byProduct[p.productId] } : p);
 }
@@ -5828,24 +8983,65 @@ export async function deleteProductGraphicImage(db, m) {
   ).bind(String(m.orgId || ""), String(m.productId || ""), Number(m.locationId) || 0, Number(m.graphicId) || 0, String(m.garmentColor || "")).run();
 }
 
-// Attaches `graphicImages` { "<locationId>|<graphicId>|<garmentColor>": imageUrl } to each
-// configurable product, for the storefront's live per-location preview (migrations/0042).
+// Attaches `graphicImages` { "<locationId>|<graphicId>|<garmentColor>": imageUrl } to every product that has
+// mockups, for the shop page (migrations/0042): a configurable product's live per-location preview, and the
+// pictures of its printed transfers (migrations/0068) — `fixedMockups` [{locationId, graphicId, label}] says which
+// keys those are (a plain product's are under garment color ""). One query per shop, whatever the number of products.
 async function attachProductGraphicImages_(db, orgId, products) {
-  const configurableIds = products.filter(p => p.configurable).map(p => p.productId);
-  if (!configurableIds.length) return products;
   let rows = [];
   try {
-    const placeholders = configurableIds.map(() => "?").join(",");
     const r = await db.prepare(
-      `SELECT productId, locationId, graphicId, garmentColor, imageUrl FROM product_graphic_images
-       WHERE orgId=? AND productId IN (${placeholders}) AND imageUrl <> ''`
-    ).bind(orgId, ...configurableIds).all();
+      "SELECT productId, locationId, graphicId, garmentColor, imageUrl FROM product_graphic_images WHERE orgId=? AND imageUrl <> ''"
+    ).bind(orgId).all();
     rows = r.results || [];
   } catch (e) { return products; }   // pre-migration DB
   if (!rows.length) return products;
   const byProduct = {};
   for (const r of rows) (byProduct[r.productId] = byProduct[r.productId] || {})[`${r.locationId}|${r.graphicId}|${r.garmentColor}`] = r.imageUrl;
-  return products.map(p => byProduct[p.productId] ? { ...p, graphicImages: byProduct[p.productId] } : p);
+  let names = null;
+  const locName = async (id) => { if (!names) { names = {}; try { for (const l of await listLocations(db)) names[Number(l.id)] = l.name; } catch (e) {} } return names[Number(id)] || ""; };
+  const out = [];
+  for (const p of products) {
+    const gi = byProduct[p.productId];
+    if (!gi) { out.push(p); continue; }
+    const fixedMockups = [];
+    // Printed transfers (0067) and embroidered graphics for mockups (0068): both always on the product.
+    for (const f of (p.mockupGraphics || []).concat(p.fixedTransfers || []))
+      if (f.locationId && f.graphicId && !fixedMockups.some(x => x.locationId === Number(f.locationId) && x.graphicId === Number(f.graphicId)))
+        fixedMockups.push({ locationId: Number(f.locationId), graphicId: Number(f.graphicId), label: await locName(f.locationId) });
+    out.push({ ...p, graphicImages: gi, ...(fixedMockups.length ? { fixedMockups } : {}) });
+  }
+  return out;
+}
+
+// What decorates each product, in words, for the shop page (2026-10): `decorations` [{kind: "Embroidered" | "Printed",
+// name, location}] — shown whether or not there's a picture of it. The embroidered graphics placed for mockups name the
+// embroidery where it sits (else the product's own designs with their placement), and its printed transfers what's
+// printed where. A configurable product's options are the customer's picks, so they aren't listed here.
+async function attachDecorations_(db, orgId, products) {
+  const has = (p) => (p.designs || []).length || p.designId || (p.fixedTransfers || []).length || (p.mockupGraphics || []).length;
+  if (!products.some(has)) return products;
+  const graphics = {}, designs = {}, locs = {};
+  try { for (const g of await listGraphics(db, orgId)) graphics[Number(g.id)] = g; } catch (e) {}
+  try { for (const d of await listDesigns(db, orgId)) designs[Number(d.id)] = d; } catch (e) {}
+  try { for (const l of await listLocations(db)) locs[Number(l.id)] = l.name; } catch (e) {}
+  return products.map(p => {
+    if (!has(p)) return p;
+    const out = [];
+    const add = (kind, name, location) => {
+      name = String(name || "").trim().slice(0, 120); location = String(location || "").trim().slice(0, 80);
+      if (!name || out.some(x => x.kind === kind && x.name === name && x.location === location)) return;
+      out.push({ kind, name, location });
+    };
+    const mock = (p.mockupGraphics || []).filter(m => graphics[Number(m.graphicId)]);
+    for (const m of mock) add("Embroidered", graphics[Number(m.graphicId)].name, locs[Number(m.locationId)]);
+    if (!mock.length && !Number(p.noDesignNeeded)) {
+      const ds = (p.designs || []).length ? p.designs : (p.designId ? [{ designId: p.designId, placement: "" }] : []);
+      for (const d of ds) { const x = designs[Number(d.designId)]; if (x) add("Embroidered", x.name, d.placement); }
+    }
+    for (const f of p.fixedTransfers || []) { const g = graphics[Number(f.graphicId)]; if (g) add("Printed", g.name, locs[Number(f.locationId)]); }
+    return out.length ? { ...p, decorations: out } : p;
+  });
 }
 
 // ---- Design verifications ----------------------------------------------
@@ -5856,6 +9052,57 @@ export async function createDesignVerification(db, { token, orgId, orderId, cust
     VALUES (?,?,?,?,?,?,?,?)`)
     .bind(token, orgId, orderId, customerEmail, customerName, message, imagesJson, sentAt)
     .run();
+}
+
+// ---- Order invoices (migrations/0053) — a link the customer opens to choose delivery and pay ----
+// One row per order; the token is the credential (the emailed link is /?invoice=<token>). Sending
+// again keeps the token, so an earlier email's link keeps working, and renews the 60 days.
+export const INVOICE_LINK_TTL_DAYS = 60;
+const parseInvoice_ = (r) => r ? ({ token: r.token, orderId: r.orderId, orgId: r.orgId, sentTo: r.sentTo || "", message: r.message || "",
+  allowDelivery: !!Number(r.allowDelivery), sentAt: r.sentAt || "", sendCount: Number(r.sendCount) || 1,
+  viewedAt: r.viewedAt || "", deliveryChosenAt: r.deliveryChosenAt || "", deliveryChoice: r.deliveryChoice || "" }) : null;
+export function invoiceExpired(inv, now = Date.now()) {
+  const sent = Date.parse((inv && inv.sentAt) || "");
+  return Number.isFinite(sent) && now - sent > INVOICE_LINK_TTL_DAYS * 24 * 3600 * 1000;
+}
+export async function getOrderInvoice(db, token) {
+  return parseInvoice_(await db.prepare("SELECT * FROM order_invoices WHERE token=?").bind(String(token || "")).first());
+}
+export async function getOrderInvoiceByOrder(db, orderId) {
+  return parseInvoice_(await db.prepare("SELECT * FROM order_invoices WHERE orderId=?").bind(String(orderId || "")).first());
+}
+// Creates the order's invoice, or — if it has one — updates who it went to, the note and whether
+// delivery can be chosen, counts the send and renews it. Returns the row (with its token).
+export async function sendOrderInvoice(db, { orderId, orgId, sentTo, message, allowDelivery }) {
+  const now = new Date().toISOString();
+  const msg = String(message || "").slice(0, 3000), to = String(sentTo || "").slice(0, 200);
+  const existing = await getOrderInvoiceByOrder(db, orderId);
+  if (existing) {
+    await db.prepare("UPDATE order_invoices SET sentTo=?, message=?, allowDelivery=?, sentAt=?, sendCount=sendCount+1 WHERE orderId=?")
+      .bind(to, msg, allowDelivery === false ? 0 : 1, now, orderId).run();
+  } else {
+    // 32 hex characters (122 random bits) — unguessable, like the design-verification tokens.
+    const token = crypto.randomUUID().replace(/-/g, "").toLowerCase();
+    await db.prepare("INSERT INTO order_invoices (token, orderId, orgId, sentTo, message, allowDelivery, sentAt) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(token, orderId, orgId, to, msg, allowDelivery === false ? 0 : 1, now).run();
+  }
+  return getOrderInvoiceByOrder(db, orderId);
+}
+export async function markInvoiceViewed(db, token) {
+  await db.prepare("UPDATE order_invoices SET viewedAt=? WHERE token=? AND viewedAt IS NULL").bind(new Date().toISOString(), token).run();
+}
+// `choice`: 'pickup' | 'option:<id>' | 'shipping' | 'shipping-quote'.
+export async function markInvoiceDeliveryChosen(db, token, choice) {
+  await db.prepare("UPDATE order_invoices SET deliveryChosenAt=?, deliveryChoice=? WHERE token=?").bind(new Date().toISOString(), String(choice || "").slice(0, 60), token).run();
+}
+// { orderId: {sentAt, sentTo, viewedAt, deliveryChosenAt} } for the orders a loader just read; {} on a
+// database without the table.
+async function invoicesByOrder_(db, sub, binds) {
+  try {
+    const { results } = await db.prepare(`SELECT orderId, sentAt, sentTo, viewedAt, deliveryChosenAt, deliveryChoice, sendCount FROM order_invoices WHERE orderId IN (${sub})`).bind(...binds).all();
+    return Object.fromEntries(results.map(r => [r.orderId, { sentAt: r.sentAt || "", sentTo: r.sentTo || "", viewedAt: r.viewedAt || "",
+      deliveryChosenAt: r.deliveryChosenAt || "", deliveryChoice: r.deliveryChoice || "", sendCount: Number(r.sendCount) || 1 }]));
+  } catch (e) { if (/no such table/i.test(String(e && e.message))) return {}; throw e; }
 }
 
 export async function getDesignVerification(db, token) {
@@ -5909,6 +9156,7 @@ export async function getLatestVerificationsByOrg(db, orgId) {
 export async function voidOrder(db, orderId, reason) {
   await db.prepare("UPDATE orders SET voidedAt = ?, voidReason = ? WHERE orderId = ? AND voidedAt IS NULL")
     .bind(new Date().toISOString(), String(reason || "").slice(0, 300), orderId).run();
+  await returnFinishedStock_(db, orderId, null);   // pieces already pulled from finished stock go back (0060)
 }
 
 // Voids a mistaken payment-ledger entry: stays visible, excluded from totals.
@@ -6022,7 +9270,10 @@ export async function getAccountantExport(db, dateFrom, dateTo) {
   const M = (m) => (months[m] = months[m] || { month: m, grossSales: 0, taxCollected: 0, netSales: 0, exemptSales: 0,
     shippingIncome: 0, taxRefunded: 0, refunds: 0, cardReceipts: 0, otherReceipts: 0, stripeFees: 0, postage: 0,
     cogs: 0, purchases: 0, writeoffs: 0, testCardCharges: 0, expensesDeductible: 0, capitalPurchases: 0, useTax: 0,
-    serviceIncome: 0, otherIncome: 0, interestIncome: 0, ownerContributions: 0, ownerDraws: 0 });
+    serviceIncome: 0, otherIncome: 0, interestIncome: 0, ownerContributions: 0, ownerDraws: 0,
+    // migrations/0060: where COGS came from, write-offs by reason, blanks decorated into finished stock
+    // (moves between inventory groups — not COGS), and count corrections.
+    cogsBlanks: 0, cogsFinished: 0, writeoffsTesting: 0, writeoffsDamagedLost: 0, writeoffsOther: 0, toFinishedStock: 0, inventoryCorrections: 0 });
   for (const r of taxRows) {
     const m = M(r.month);
     m.grossSales += toCents(r.grossSales); m.taxCollected += toCents(r.taxCollected);
@@ -6038,7 +9289,12 @@ export async function getAccountantExport(db, dateFrom, dateTo) {
     m.stripeFees += Number(p.feeCents);
   }
   for (const l of labels) if (!l.voidedAt && !l.isTest) M(monthOf(l.purchasedAt)).postage += Number(l.amountCents);
-  for (const r of cogs.rows) { const m = M(r.month); m.cogs += toCents(r.cogs); m.purchases += toCents(r.purchases); m.writeoffs += toCents(r.writeoffs); }
+  for (const r of cogs.rows) {
+    const m = M(r.month); m.cogs += toCents(r.cogs); m.purchases += toCents(r.purchases); m.writeoffs += toCents(r.writeoffs);
+    m.cogsBlanks += toCents(r.cogsBlanks || 0); m.cogsFinished += toCents(r.cogsFinished || 0);
+    m.writeoffsTesting += toCents(r.writeoffsTesting || 0); m.writeoffsDamagedLost += toCents(r.writeoffsDamagedLost || 0); m.writeoffsOther += toCents(r.writeoffsOther || 0);
+    m.toFinishedStock += toCents(r.toFinished || 0); m.inventoryCorrections += toCents(r.corrections || 0);
+  }
   const expenseRows = await listExpenses(db, dateFrom.slice(0, 10), dateTo.slice(0, 10), { includeDeleted: true });
   const useTaxRate = Number((await getSalesTaxSettings(db)).rateBps) || 0;
   const useTaxOf = (x) => x.useTaxDue ? Math.sign(toCents(x.amount)) * Math.round(Math.abs(toCents(x.amount)) * useTaxRate / 10000) : 0;   // a refund reverses to the cent
@@ -6060,8 +9316,19 @@ export async function getAccountantExport(db, dateFrom, dateTo) {
     .map(m => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, k === "month" ? v : fromCents(v)])));
 
   const status = (r) => r.voidedAt ? "void" : r.isTest ? "test" : "";
+  // Inventory by group at the start and end of the period (migrations/0060): blanks for sale, blanks for
+  // testing / shop use, finished stock (Schedule C Part III, beginning and ending inventory).
+  const before = new Date(new Date(dateFrom).getTime() - 1).toISOString();
+  const [b0, b1, f0, f1] = await Promise.all([getInventoryValuation(db, before), getInventoryValuation(db, dateTo),
+    getFinishedGoodsValuation(db, before), getFinishedGoodsValuation(db, dateTo)]);
+  const inventoryGroups = [
+    { group: "Blanks for sale", beginning: b0.groups.forSale.value, ending: b1.groups.forSale.value },
+    { group: "Blanks for testing / shop use", beginning: b0.groups.testing.value, ending: b1.groups.testing.value },
+    { group: "Finished stock", beginning: f0.value, ending: f1.value },
+  ];
   return {
     summary,
+    inventoryGroups,
     sales: lines.map(r => ({
       date: r.placedAt, orderId: r.orderId, orgId: r.orgId, customer: r.customerName, paymentMethod: r.paymentMethod,
       product: r.name, productId: r.productId, size: r.size, qty: Number(r.qty),
@@ -6234,8 +9501,8 @@ export async function saveExpense(db, id, x) {
     return Number(id);
   }
   const r = await db.prepare(`INSERT INTO expenses (expenseDate, description, categoryId, amountCents, vendor, businessUsePct,
-    receiptKey, receiptName, placedInService, depMethod, vendorChargedTax, accountId, paidPersonally, refundOfId, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(...vals, now, now).first();
+    receiptKey, receiptName, placedInService, depMethod, vendorChargedTax, accountId, paidPersonally, refundOfId, createdAt, updatedAt, receiptGroup) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+    .bind(...vals, now, now, x.receiptGroup ? String(x.receiptGroup).slice(0, 64) : null).first();
   return Number(r.id);
 }
 // How much of a purchase has already been refunded (positive cents), counting the live refund
@@ -6396,6 +9663,10 @@ export const MONEY_MOVE_SOURCES = [
      FROM expenses e WHERE e.deletedAt IS NULL AND e.accountId IS NOT NULL AND e.paidPersonally = 0`,
   `SELECT 'blanks' AS src, m.id AS srcId, m.accountId AS accountId, substr(m.occurredAt, 1, 10) AS d, -(m.qtyDelta * m.unitCostCents) AS c,
           'Blanks: ' || m.blankName || ' ' || m.size AS label FROM inventory_movements m WHERE m.kind = 'purchase' AND m.accountId IS NOT NULL AND m.paidPersonally = 0 AND m.voidedAt IS NULL`,
+  // Transfer sheets bought (the inventory part; a written-off or personal part is its own expense /
+  // owner draw), so the "Paid from" account moves and the purchase can be reconciled.
+  `SELECT 'transfer_sheet' AS src, m.id AS srcId, m.accountId AS accountId, substr(m.occurredAt, 1, 10) AS d, -(m.qtyDelta * m.unitCostCents) AS c,
+          'Transfers: ' || m.transferName AS label FROM transfer_movements m WHERE m.kind = 'purchase' AND m.accountId IS NOT NULL AND m.paidPersonally = 0 AND m.voidedAt IS NULL`,
   `SELECT 'postage' AS src, l.id AS srcId, l.accountId AS accountId, substr(l.purchasedAt, 1, 10) AS d, -l.amountCents AS c, 'Postage ' || l.orderId AS label
      FROM shipping_labels l WHERE l.voidedAt IS NULL AND l.accountId IS NOT NULL`,
   `SELECT 'income' AS src, i.id AS srcId, i.accountId AS accountId, i.incomeDate AS d, i.amountCents AS c, i.description AS label
@@ -6472,8 +9743,10 @@ export async function saveMoneyEntry(db, kind, id, x) {
       .bind(...vals, now, Number(id)).run();
     return Number(id);
   }
-  const r = await db.prepare(`INSERT INTO ${t.table} (${cols.join(", ")}, createdAt, updatedAt) VALUES (${cols.map(() => "?").join(", ")}, ?, ?) RETURNING id`)
-    .bind(...vals, now, now).first();
+  // The owner draw one receive wrote carries that receive's receiptGroup (migrations/0061).
+  const group = kind === "owner" && x.receiptGroup ? String(x.receiptGroup).slice(0, 64) : null;
+  const r = await db.prepare(`INSERT INTO ${t.table} (${cols.join(", ")}, createdAt, updatedAt${group ? ", receiptGroup" : ""}) VALUES (${cols.map(() => "?").join(", ")}, ?, ?${group ? ", ?" : ""}) RETURNING id`)
+    .bind(...vals, now, now, ...(group ? [group] : [])).first();
   return Number(r.id);
 }
 export async function deleteMoneyEntry(db, kind, id) {
@@ -6511,18 +9784,414 @@ export async function getMoneySummary(db, dateFrom, dateTo) {
     .bind(dateFrom, dateTo).all()).results;
   const personalExp = await q(`SELECT COALESCE(SUM(amountCents), 0) c FROM expenses WHERE deletedAt IS NULL AND paidPersonally = 1 AND expenseDate >= ? AND expenseDate <= ?`, dateFrom, dateTo);
   const personalBlanks = await q(`SELECT COALESCE(SUM(qtyDelta * unitCostCents), 0) c FROM inventory_movements WHERE kind = 'purchase' AND paidPersonally = 1 AND voidedAt IS NULL AND substr(occurredAt, 1, 10) >= ? AND substr(occurredAt, 1, 10) <= ?`, dateFrom, dateTo);
+  const personalTransfers = await q(`SELECT COALESCE(SUM(qtyDelta * unitCostCents), 0) c FROM transfer_movements WHERE kind = 'purchase' AND paidPersonally = 1 AND voidedAt IS NULL AND substr(occurredAt, 1, 10) >= ? AND substr(occurredAt, 1, 10) <= ?`, dateFrom, dateTo);
   const unassigned = await q(`SELECT
       (SELECT count(*) FROM expenses WHERE deletedAt IS NULL AND accountId IS NULL AND paidPersonally = 0) +
       (SELECT count(*) FROM inventory_movements WHERE kind = 'purchase' AND accountId IS NULL AND paidPersonally = 0 AND voidedAt IS NULL) +
+      (SELECT count(*) FROM transfer_movements WHERE kind = 'purchase' AND accountId IS NULL AND paidPersonally = 0 AND voidedAt IS NULL) +
       (SELECT count(*) FROM order_payments WHERE voidedAt IS NULL AND accountId IS NULL) AS n`);
   const cents = (arr, key) => Number((arr.find(r => r.type === key || r.kind === key) || {}).c || 0);
-  const contributed = cents(own, "contribution"), personal = Number(personalExp.c) + Number(personalBlanks.c);
+  const contributed = cents(own, "contribution"), personal = Number(personalExp.c) + Number(personalBlanks.c) + Number(personalTransfers.c);
   return {
     otherIncome: Object.fromEntries(Object.keys(OTHER_INCOME_TYPES).map(k => [k, fromCents(cents(byType, k))])),
     owner: { contributions: fromCents(contributed), paidPersonally: fromCents(personal), totalIn: fromCents(contributed + personal), draws: fromCents(cents(own, "draw")) },
     unassigned: Number(unassigned.n || 0),
     balances: await listAccounts(db, dateTo),
   };
+}
+
+// Stock bought — garment blanks and transfer sheets — for Accounts & money. Inventory, not expenses:
+// each becomes cost of goods sold as it's used. One row per receive (the rows one
+// Receive / Receive order / Receive sheet wrote together), with what was bought, the vendor and
+// invoice, where the money came from and the receipt. Voided entries are left out. The amount is the
+// inventory part only (incl. shipping spread into the cost); an R&D or personal part of the same order
+// is its own expense / owner draw. Dollars out, newest first.
+export async function listStockPurchases(db, dateFrom, dateTo) {
+  const read = async (sql) => { try { return (await db.prepare(sql).bind(dateFrom, dateTo).all()).results || []; } catch (e) { if (/no such (table|column)/i.test(String(e && e.message))) return []; throw e; } };
+  const blanks = await read(`SELECT id, blankName AS name, color, size, qtyDelta AS qty, unitCostCents, vendor, vendorRef, occurredAt, createdAt,
+      accountId, paidPersonally, receiptKey, receiptName, vendorChargedTax, receiptGroup FROM inventory_movements
+    WHERE kind = 'purchase' AND voidedAt IS NULL AND substr(occurredAt, 1, 10) >= ? AND substr(occurredAt, 1, 10) <= ? ORDER BY id`);
+  const transfers = await read(`SELECT id, transferName AS name, '' AS color, '' AS size, qtyDelta AS qty, unitCostCents, vendor, vendorRef, occurredAt, createdAt,
+      accountId, paidPersonally, receiptKey, receiptName, 0 AS vendorChargedTax, receiptGroup FROM transfer_movements
+    WHERE kind = 'purchase' AND voidedAt IS NULL AND substr(occurredAt, 1, 10) >= ? AND substr(occurredAt, 1, 10) <= ? ORDER BY id`);
+  const accounts = Object.fromEntries(((await db.prepare("SELECT id, name FROM accounts").all()).results || []).map(a => [a.id, a.name]));
+  const groups = [];
+  for (const [kind, rows] of [["blanks", blanks], ["transfers", transfers]]) {
+    const open = new Map();   // key → the group still taking rows
+    for (const r of rows) {
+      // Rows written by one receive share the date, vendor, invoice, payer and receipt, and were written
+      // within moments of each other (each line is its own write, so not to the millisecond); the same
+      // details written later are another purchase.
+      // (Records stamped with a receiptGroup — migrations/0061 — are exactly one receive, however close in time another is.)
+      const key = [r.occurredAt && String(r.occurredAt).slice(0, 10), r.vendor, r.vendorRef, r.accountId, r.paidPersonally, r.receiptKey, r.receiptGroup || ""].join("|");
+      const at = Date.parse(r.createdAt) || 0;
+      let g = open.get(key);
+      if (g && Math.abs(at - g.lastAt) > 10000) g = null;
+      if (!g) { groups.push(g = { kind, date: String(r.occurredAt || "").slice(0, 10), vendor: r.vendor || "", vendorRef: r.vendorRef || "",
+        accountId: r.accountId == null ? null : Number(r.accountId), accountName: r.accountId == null ? "" : (accounts[r.accountId] || ""),
+        paidPersonally: !!Number(r.paidPersonally), receiptKey: r.receiptKey || "", receiptName: r.receiptName || "",
+        vendorChargedTax: !!Number(r.vendorChargedTax), receiptGroup: r.receiptGroup || "", qty: 0, cents: 0, items: new Map(), ids: [], lastAt: at }); open.set(key, g); }
+      g.lastAt = at;
+      g.qty += Number(r.qty) || 0;
+      g.cents += (Number(r.qty) || 0) * (Number(r.unitCostCents) || 0);
+      g.ids.push(Number(r.id));
+      const item = [r.name, r.color].filter(Boolean).join(" · ");
+      const sizes = g.items.get(item) || new Map();
+      const sz = r.size || "";
+      sizes.set(sz, (sizes.get(sz) || 0) + (Number(r.qty) || 0));
+      g.items.set(item, sizes);
+    }
+  }
+  // The other parts of the same receive (R&D / written-off expense, personal-use draw), for the receipts that are linked.
+  const extras = new Map();
+  const wanted = [...new Set(groups.map(g => g.receiptGroup).filter(Boolean))];
+  for (let i = 0; i < wanted.length; i += 80) {
+    const chunk = wanted.slice(i, i + 80), ph = chunk.map(() => "?").join(",");
+    for (const [sql, label] of [[`SELECT receiptGroup AS g, amountCents AS c FROM expenses WHERE deletedAt IS NULL AND receiptGroup IN (${ph})`, "R&D / written-off expense"],
+                                [`SELECT receiptGroup AS g, amountCents AS c FROM owner_transactions WHERE deletedAt IS NULL AND receiptGroup IN (${ph})`, "Personal-use draw"]]) {
+      try { for (const e of (await db.prepare(sql).bind(...chunk).all()).results) { const a = extras.get(e.g) || []; a.push({ label, amount: fromCents(e.c) }); extras.set(e.g, a); } }
+      catch (e) { if (!/no such (table|column)/i.test(String(e && e.message))) throw e; }
+    }
+  }
+  return groups.map(g => ({ receiptGroup: g.receiptGroup, extras: extras.get(g.receiptGroup) || [],
+    kind: g.kind, date: g.date, vendor: g.vendor, vendorRef: g.vendorRef, accountId: g.accountId, accountName: g.accountName,
+    paidPersonally: g.paidPersonally, receiptKey: g.receiptKey, receiptName: g.receiptName, vendorChargedTax: g.vendorChargedTax, qty: g.qty, ids: g.ids,
+    total: fromCents(g.cents),
+    // "Gildan 64000 · Navy: S×4, M×6" — or "Crest ×25" for a transfer.
+    items: [...g.items.entries()].map(([name, sizes]) => {
+      const parts = [...sizes.entries()].map(([sz, q]) => (sz ? sz + "×" : "×") + q);
+      return sizes.size === 1 && !([...sizes.keys()][0]) ? `${name} ${parts[0]}` : `${name}: ${parts.join(", ")}`;
+    }) }))
+    .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.ids[0] - a.ids[0]);
+}
+
+// ---- Account viewer & receipts on money records (migrations/0061) ------------------------------
+// Which table holds the receipt (receiptKey / receiptName) for each kind of money movement, and how to tell
+// a live record from a voided / deleted one. A processing-fee row is its payment's; both sides of a transfer
+// are the one transfer record.
+const RECEIPT_TABLES_ = {
+  payment:        { table: "order_payments",      live: "voidedAt IS NULL" },
+  fee:            { table: "order_payments",      live: "voidedAt IS NULL" },
+  expense:        { table: "expenses",            live: "deletedAt IS NULL" },
+  blanks:         { table: "inventory_movements", live: "voidedAt IS NULL" },
+  transfer_sheet: { table: "transfer_movements",  live: "voidedAt IS NULL" },
+  postage:        { table: "shipping_labels",     live: "voidedAt IS NULL" },
+  income:         { table: "other_income",        live: "deletedAt IS NULL" },
+  owner:          { table: "owner_transactions",  live: "deletedAt IS NULL" },
+  transfer_in:    { table: "account_transfers",   live: "deletedAt IS NULL" },
+  transfer_out:   { table: "account_transfers",   live: "deletedAt IS NULL" },
+};
+const REGISTER_CATEGORY_ = { fee: "Processing fee", blanks: "Blanks", transfer_sheet: "Transfers (stock)", postage: "Postage", income: "Other income" };
+
+// ---- One charge per receipt (2026-10) ---------------------------------------------------------------
+// The records one stock receive wrote — a stock row per blank / color / size (or per transfer sheet line),
+// plus its R&D / written-off expense and personal-items draw when it has them — are ONE charge on the card
+// or bank statement. receiptGroups_ says which of the given money moves ({src, srcId}) belong together:
+// Map "src:srcId" → {group, kind, vendor, vendorRef, part}, `part` being the stock line's own wording
+// ("Gildan 64000 · Navy M ×6"). Receives stamped with a receiptGroup (migrations/0061) group by it. Older ones:
+// with an invoice # — same day, vendor, invoice # and payer, however far apart they were entered (one invoice
+// can be received in two sittings, e.g. a color added to the blank first, each with its own copy of the PDF);
+// without one — same day, vendor, payer and receipt file, written within 10 s of each other. An expense or
+// draw joins through a shared receiptGroup, or — for an older receive — by the wording Receive order gives
+// them ("R&D / testing — SanMar #SO-1", "Personal items — SanMar #SO-1"), same date and payer.
+// Moves of other kinds aren't in the map.
+async function receiptGroups_(db, moves) {
+  const out = new Map();
+  const ids = (src) => [...new Set(moves.filter(m => m.src === src).map(m => Number(m.srcId)))];
+  const read = async (sqlWith, sqlWithout, list) => {
+    const rows = [];
+    for (let i = 0; i < list.length; i += 80) {
+      const chunk = list.slice(i, i + 80), q = chunk.map(() => "?").join(",");
+      try { rows.push(...((await db.prepare(sqlWith(q)).bind(...chunk).all()).results || [])); }
+      catch (e) { if (!/no such column/i.test(String(e && e.message))) throw e; rows.push(...((await db.prepare(sqlWithout(q)).bind(...chunk).all()).results || [])); }
+    }
+    return rows;
+  };
+  for (const [src, table, nameCol, colorCol, kind] of [["blanks", "inventory_movements", "blankName", "color", "blanks"], ["transfer_sheet", "transfer_movements", "transferName", "''", "transfers"]]) {
+    const cols = `id, ${nameCol} AS name, ${colorCol} AS color, size, qtyDelta, vendor, vendorRef, accountId, paidPersonally, receiptKey, occurredAt, createdAt`;
+    const rows = await read((q) => `SELECT ${cols}, receiptGroup FROM ${table} WHERE id IN (${q})`, (q) => `SELECT ${cols}, NULL AS receiptGroup FROM ${table} WHERE id IN (${q})`, ids(src));
+    const legacy = new Map();
+    for (const r of rows) {
+      if (r.receiptGroup) { out.set(`${src}:${r.id}`, { group: "group:" + r.receiptGroup, row: r, kind }); continue; }
+      const byInvoice = !!String(r.vendorRef || "").trim();
+      const k = [kind, String(r.occurredAt || "").slice(0, 10), r.vendor || "", r.vendorRef || "", r.accountId ?? "", Number(r.paidPersonally) || 0, byInvoice ? "" : (r.receiptKey || "")].join("\u0001");
+      (legacy.get(k) || legacy.set(k, { byInvoice, rows: [] }).get(k)).rows.push(r);
+    }
+    for (const { byInvoice, rows: list } of legacy.values()) {
+      list.sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) || Number(a.id) - Number(b.id));
+      let group = "", last = 0;
+      for (const r of list) {
+        const at = Date.parse(r.createdAt) || 0;
+        if (!group || (!byInvoice && at - last > RECEIPT_CLUSTER_GAP_MS_)) group = `legacy:${kind}:${r.id}`;
+        last = at;
+        out.set(`${src}:${r.id}`, { group, row: r, kind });
+      }
+    }
+  }
+  for (const v of out.values()) {
+    const r = v.row;
+    v.vendor = r.vendor || ""; v.vendorRef = r.vendorRef || "";
+    v.day = String(r.occurredAt || "").slice(0, 10); v.accountId = r.accountId;
+    v.part = [r.name, r.color].filter(Boolean).join(" · ") + (r.size ? " " + r.size : "") + " ×" + Number(r.qtyDelta);
+    delete v.row;
+  }
+  // The R&D / written-off expense and the personal-items draw of a receive: a stamped one shares its
+  // receiptGroup; an older blank receive's are found by the wording Receive order gave them, same date and payer.
+  const stamped = new Map(), byWording = new Map();
+  for (const v of out.values()) {
+    if (v.group.startsWith("group:")) { if (!stamped.has(v.group)) stamped.set(v.group, v); continue; }
+    if (v.kind !== "blanks" || !v.vendor) continue;
+    const what = v.vendor + (v.vendorRef ? ` #${v.vendorRef}` : "");
+    for (const prefix of ["R&D / testing — ", "Personal items — "]) {
+      const k = [prefix + what, v.day, v.accountId ?? ""].join("\u0001");
+      if (!byWording.has(k)) byWording.set(k, v);
+    }
+  }
+  if (stamped.size || byWording.size) {
+    for (const [src, table, textCol, dateCol] of [["expense", "expenses", "description", "expenseDate"], ["owner", "owner_transactions", "note", "txDate"]]) {
+      const cols = `id, ${textCol} AS text, ${dateCol} AS d, accountId`;
+      const rows = await read((q) => `SELECT ${cols}, receiptGroup FROM ${table} WHERE id IN (${q})`, (q) => `SELECT ${cols}, NULL AS receiptGroup FROM ${table} WHERE id IN (${q})`, ids(src));
+      for (const r of rows) {
+        const g = r.receiptGroup ? stamped.get("group:" + r.receiptGroup) : byWording.get([String(r.text || ""), String(r.d || "").slice(0, 10), r.accountId ?? ""].join("\u0001"));
+        if (g) out.set(`${src}:${r.id}`, { group: g.group, kind: g.kind, vendor: g.vendor, vendorRef: g.vendorRef, part: src === "owner" ? String(r.text || "Personal items") : "" });
+      }
+    }
+  }
+  // Only a receipt with more than one record among these moves is worth combining.
+  const count = {};
+  for (const m of moves) { const v = out.get(`${m.src}:${m.srcId}`); if (v) count[v.group] = (count[v.group] || 0) + 1; }
+  for (const [k, v] of out) if ((count[v.group] || 0) < 2) out.delete(k);
+  return out;
+}
+// The one-line wording of a combined receipt: "Blanks — S&S Activewear #INV-1001 (3 items)".
+function receiptLabel_(g, n) {
+  const who = [g.vendor, g.vendorRef ? "#" + g.vendorRef : ""].filter(Boolean).join(" ");
+  return `${g.kind === "transfers" ? "Transfer sheets" : "Blanks"}${who ? " — " + who : ""} (${n} item${n === 1 ? "" : "s"})`;
+}
+// Moves {key, src, srcId, date, cents, label} → one entry per receipt, in the order of each receipt's first
+// part: {key, keys, date, cents, label, parts: [{key, label, cents}]} (a plain move keeps keys [key], parts []).
+async function combineReceipts_(db, moves) {
+  const groups = await receiptGroups_(db, moves);
+  const out = [], byGroup = new Map();
+  for (const m of moves) {
+    const g = groups.get(m.key);
+    if (!g) { out.push({ ...m, keys: [m.key], parts: [] }); continue; }
+    let e = byGroup.get(g.group);
+    if (!e) { byGroup.set(g.group, e = { key: m.key, keys: [], date: m.date, cents: 0, label: "", parts: [], src: m.src, srcId: m.srcId, _g: g }); out.push(e); }
+    e.keys.push(m.key); e.cents += m.cents;
+    e.parts.push({ key: m.key, label: g.part || m.label, cents: m.cents });
+  }
+  for (const e of out) if (e._g) { e.label = receiptLabel_(e._g, e.parts.length); delete e._g; }
+  return out;
+}
+
+// The register of one account: every movement from MONEY_MOVE_SOURCES (the same list the balances are summed
+// from, so it can never disagree with Accounts & money) dated on/after the account's opening date and up to
+// `dateTo`, oldest first for the running balance, returned NEWEST first. Dollars out.
+export async function getAccountRegister(db, accountId, dateFrom, dateTo) {
+  const acct = await db.prepare("SELECT * FROM accounts WHERE id = ?").bind(Number(accountId)).first();
+  if (!acct) return null;
+  const all = [];
+  const perSource = await Promise.all(MONEY_MOVE_SOURCES.map(sql => db.prepare(
+    `SELECT m.* FROM (${sql}) m WHERE m.accountId = ? AND m.d >= ? AND m.d <= ?`).bind(Number(accountId), acct.openingDate, dateTo).all()));
+  perSource.forEach(({ results }, order) => { for (const r of results) all.push({ src: r.src, srcId: Number(r.srcId), date: r.d, cents: Number(r.c), label: r.label || "", order }); });
+  all.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.order - b.order || a.srcId - b.srcId);
+  // One row per stock receipt (2026-10): its records — a stock row per blank / size, and any R&D expense or
+  // personal-items draw — sit together where the first of them falls, and become one row with the parts listed.
+  const rgroups = await receiptGroups_(db, all);
+  if (rgroups.size) {
+    const members = new Map();
+    for (const r of all) { const g = rgroups.get(`${r.src}:${r.srcId}`); if (g) (members.get(g.group) || members.set(g.group, []).get(g.group)).push(r); }
+    const done = new Set(), ordered = [];
+    for (const r of all) {
+      const g = rgroups.get(`${r.src}:${r.srcId}`);
+      if (!g) { ordered.push(r); continue; }
+      if (done.has(g.group)) continue;
+      done.add(g.group);
+      ordered.push(...members.get(g.group));
+    }
+    all.length = 0; all.push(...ordered);
+  }
+
+  // Extra facts the category / description need: transfer counterparties and receipts, one query per table.
+  const ids = (src) => [...new Set(all.filter(r => r.src === src).map(r => r.srcId))];
+  const names = Object.fromEntries(((await db.prepare("SELECT id, name FROM accounts").all()).results || []).map(a => [Number(a.id), a.name]));
+  const xfer = new Map();
+  const xferIds = [...new Set([...ids("transfer_in"), ...ids("transfer_out")])];
+  for (let i = 0; i < xferIds.length; i += 80) {
+    const chunk = xferIds.slice(i, i + 80);
+    const { results } = await db.prepare(`SELECT id, fromAccountId, toAccountId, note FROM account_transfers WHERE id IN (${chunk.map(() => "?").join(",")})`).bind(...chunk).all();
+    for (const t of results) xfer.set(Number(t.id), t);
+  }
+  const receipts = new Map();   // "table:id" → {key, name}
+  for (const table of [...new Set(Object.values(RECEIPT_TABLES_).map(t => t.table))]) {
+    const want = [...new Set(all.filter(r => RECEIPT_TABLES_[r.src].table === table).map(r => r.srcId))];
+    for (let i = 0; i < want.length; i += 80) {
+      const chunk = want.slice(i, i + 80);
+      const { results } = await db.prepare(`SELECT id, receiptKey, receiptName FROM ${table} WHERE id IN (${chunk.map(() => "?").join(",")})`).bind(...chunk).all();
+      for (const t of results) receipts.set(table + ":" + Number(t.id), { key: t.receiptKey || "", name: t.receiptName || "" });
+    }
+  }
+
+  let bal = Number(acct.openingBalanceCents) || 0, startBal = bal, totalIn = 0, totalOut = 0;
+  const rows = [];
+  let open = null;   // the receipt row still taking parts
+  for (const r of all) {
+    const before = r.date < dateFrom;
+    bal += r.cents;
+    if (before) { startBal = bal; continue; }
+    if (r.cents > 0) totalIn += r.cents; else totalOut += -r.cents;
+    const g = rgroups.get(`${r.src}:${r.srcId}`);
+    if (g) {
+      const isStock = r.src === "blanks" || r.src === "transfer_sheet";
+      if (open && open._group === g.group) {
+        open._cents += r.cents; open.amount = fromCents(open._cents); open.balance = fromCents(bal);
+        open.parts.push({ description: g.part || r.label, amount: fromCents(r.cents) });
+        if (isStock && !open._stock) {   // the receipt button works through a stock row (it covers the whole receive)
+          const rc = receipts.get(RECEIPT_TABLES_[r.src].table + ":" + r.srcId) || { key: "", name: "" };
+          Object.assign(open, { src: r.src, srcId: r.srcId, receiptKey: rc.key, receiptName: rc.name, _stock: true });
+        }
+        open.description = receiptLabel_(g, open.parts.length);
+        continue;
+      }
+      const rc = receipts.get(RECEIPT_TABLES_[r.src].table + ":" + r.srcId) || { key: "", name: "" };
+      open = { src: r.src, srcId: r.srcId, date: r.date, category: g.kind === "transfers" ? "Transfers (stock)" : "Blanks", description: receiptLabel_(g, 1),
+        amount: fromCents(r.cents), balance: fromCents(bal), receiptKey: rc.key, receiptName: rc.name,
+        parts: [{ description: g.part || r.label, amount: fromCents(r.cents) }], _group: g.group, _cents: r.cents, _stock: isStock };
+      rows.push(open);
+      continue;
+    }
+    open = null;
+    let category = REGISTER_CATEGORY_[r.src] || "", description = r.label;
+    if (r.src === "payment") category = / (refund|dispute) \(/.test(r.label) ? "Refund" : "Deposit";
+    else if (r.src === "expense") category = r.cents > 0 ? "Expense refund" : "Expense";
+    else if (r.src === "owner") category = r.cents > 0 ? "Owner contribution" : "Owner draw";
+    else if (r.src === "transfer_in" || r.src === "transfer_out") {
+      const t = xfer.get(r.srcId), other = t ? Number(r.src === "transfer_in" ? t.fromAccountId : t.toAccountId) : 0;
+      category = "Transfer";
+      description = (r.src === "transfer_in" ? "From " : "To ") + (names[other] || "another account") + (t && t.note ? " — " + t.note : "");
+    }
+    const rc = receipts.get(RECEIPT_TABLES_[r.src].table + ":" + r.srcId) || { key: "", name: "" };
+    rows.push({ src: r.src, srcId: r.srcId, date: r.date, category, description, amount: fromCents(r.cents), balance: fromCents(bal),
+      receiptKey: rc.key, receiptName: rc.name });
+  }
+  for (const r of rows) { delete r._group; delete r._cents; delete r._stock; }
+  rows.reverse();
+  const MAX_ROWS = 3000;
+  return { account: { id: Number(acct.id), name: acct.name, type: acct.type, active: !!acct.active, openingDate: acct.openingDate, openingBalance: fromCents(acct.openingBalanceCents) },
+    dateFrom, dateTo, startBalance: fromCents(startBal), endBalance: fromCents(bal), totalIn: fromCents(totalIn), totalOut: fromCents(totalOut),
+    count: rows.length, truncated: rows.length > MAX_ROWS, rows: rows.slice(0, MAX_ROWS) };
+}
+
+// ---- One receipt = several records ---------------------------------------------------------------
+// A Receive order (or transfer sheet) writes the stock rows for every blank / sheet on it, an optional
+// R&D / written-off expense and an optional personal-use owner draw. New receives stamp them all with one
+// receiptGroup; older ones are found by what they share. `kind` is "blanks" or "transfers"; `seedId` is any
+// one of the stock rows. Returns null when it isn't a live purchase row, else
+//   { kind, via: "group"|"match", group, stock: [{id, name, color, size, qty, unitCostCents, accountId, paidPersonally, occurredAt, receiptKey}],
+//     expense: {...}|null, draw: {...}|null, vendor, vendorRef, date, accountId, paidPersonally, receiptKey, receiptName }
+const RECEIPT_EXTRA_PREFIX_ = { blanks: "R&D / testing —", transfers: "Transfer sheet written off —" };
+const RECEIPT_CLUSTER_GAP_MS_ = 10000;     // rows one receive wrote are written within moments of each other
+export async function getReceiptRecords(db, kind, seedId) {
+  const table = kind === "transfers" ? "transfer_movements" : "inventory_movements";
+  const nameCol = kind === "transfers" ? "transferName" : "blankName";
+  const seed = await db.prepare(`SELECT * FROM ${table} WHERE id = ? AND kind = 'purchase' AND voidedAt IS NULL`).bind(Number(seedId)).first();
+  if (!seed) return null;
+  const stockOf = (r) => ({ id: Number(r.id), name: r[nameCol] || "", color: r.color || "", size: r.size || "", qty: Number(r.qtyDelta), unitCostCents: Number(r.unitCostCents),
+    accountId: r.accountId == null ? null : Number(r.accountId), paidPersonally: !!Number(r.paidPersonally), occurredAt: r.occurredAt, receiptKey: r.receiptKey || "", createdAt: r.createdAt });
+  const expenseOf = (r) => r ? { id: Number(r.id), description: r.description, amountCents: Number(r.amountCents), accountId: r.accountId == null ? null : Number(r.accountId),
+    paidPersonally: !!Number(r.paidPersonally), date: r.expenseDate, receiptKey: r.receiptKey || "" } : null;
+  const drawOf = (r) => r ? { id: Number(r.id), note: r.note || "", amountCents: Number(r.amountCents), accountId: r.accountId == null ? null : Number(r.accountId), date: r.txDate, receiptKey: r.receiptKey || "" } : null;
+  let stock, expense = null, draw = null, via;
+  if (seed.receiptGroup) {
+    via = "group";
+    stock = (await db.prepare(`SELECT * FROM ${table} WHERE receiptGroup = ? AND kind = 'purchase' AND voidedAt IS NULL ORDER BY id`).bind(seed.receiptGroup).all()).results.map(stockOf);
+    expense = expenseOf(await db.prepare("SELECT * FROM expenses WHERE receiptGroup = ? AND deletedAt IS NULL ORDER BY id LIMIT 1").bind(seed.receiptGroup).first());
+    draw = drawOf(await db.prepare("SELECT * FROM owner_transactions WHERE receiptGroup = ? AND deletedAt IS NULL ORDER BY id LIMIT 1").bind(seed.receiptGroup).first());
+  } else {
+    via = "match";
+    // Same day, vendor, invoice, payer and receipt file, written in one run (each row within 10 s of the next).
+    const { results } = await db.prepare(`SELECT * FROM ${table} WHERE kind = 'purchase' AND voidedAt IS NULL AND receiptGroup IS NULL
+        AND substr(occurredAt, 1, 10) = substr(?, 1, 10) AND vendor = ? AND vendorRef = ? AND accountId IS ? AND paidPersonally = ? AND receiptKey = ? ORDER BY createdAt, id`)
+      .bind(seed.occurredAt, seed.vendor || "", seed.vendorRef || "", seed.accountId ?? null, Number(seed.paidPersonally) || 0, seed.receiptKey || "").all();
+    const at = (r) => Date.parse(r.createdAt) || 0;
+    const clusters = []; let cur = null;
+    for (const r of results) { if (!cur || at(r) - cur.last > RECEIPT_CLUSTER_GAP_MS_) clusters.push(cur = { rows: [], last: 0 }); cur.rows.push(r); cur.last = at(r); }
+    const mine = clusters.find(c => c.rows.some(r => Number(r.id) === Number(seed.id))) || { rows: [seed] };
+    stock = mine.rows.map(stockOf);
+    const lo = Math.min(...mine.rows.map(at)) - 30000, hi = Math.max(...mine.rows.map(at)) + 30000;
+    const near = (r) => { const t = Date.parse(r.createdAt) || 0; return t >= lo && t <= hi; };
+    const day = String(seed.occurredAt).slice(0, 10);
+    const exp = (await db.prepare(`SELECT * FROM expenses WHERE deletedAt IS NULL AND receiptGroup IS NULL AND expenseDate = ? AND vendor = ? AND description LIKE ? AND accountId IS ? AND paidPersonally = ? ORDER BY id`)
+      .bind(day, seed.vendor || "", RECEIPT_EXTRA_PREFIX_[kind] + "%", seed.accountId ?? null, Number(seed.paidPersonally) || 0).all()).results.filter(near);
+    expense = expenseOf(exp[0]);
+    if (!Number(seed.paidPersonally)) {
+      const dr = (await db.prepare(`SELECT * FROM owner_transactions WHERE deletedAt IS NULL AND receiptGroup IS NULL AND txDate = ? AND kind = 'draw' AND note LIKE 'Personal items —%' AND accountId IS ? ORDER BY id`)
+        .bind(day, seed.accountId ?? null).all()).results.filter(near);
+      draw = drawOf(dr[0]);
+    }
+  }
+  return { kind, via, group: seed.receiptGroup || "", stock, expense, draw, vendor: seed.vendor || "", vendorRef: seed.vendorRef || "", date: String(seed.occurredAt).slice(0, 10),
+    accountId: seed.accountId == null ? null : Number(seed.accountId), paidPersonally: !!Number(seed.paidPersonally), receiptKey: seed.receiptKey || "", receiptName: seed.receiptName || "" };
+}
+
+// The records a receipt file belongs on, as [{table, id}]: just the one row for most kinds of money movement, but
+// the WHOLE receive (every stock row, its expense and its draw) for a blank / transfer-sheet purchase — the
+// vendor's receipt covers all of it, and a Receive order attaches it to all of it. null if not found / not live.
+export async function receiptTargets(db, src, srcId) {
+  const meta = RECEIPT_TABLES_[src];
+  if (!meta) return null;
+  const row = await db.prepare(`SELECT id FROM ${meta.table} WHERE id = ? AND ${meta.live}`).bind(Number(srcId)).first();
+  if (!row) return null;
+  if (src === "blanks" || src === "transfer_sheet") {
+    const rec = await getReceiptRecords(db, src === "blanks" ? "blanks" : "transfers", srcId);
+    if (rec) return [...rec.stock.map(s => ({ table: meta.table, id: s.id })), ...(rec.expense ? [{ table: "expenses", id: rec.expense.id }] : []),
+      ...(rec.draw ? [{ table: "owner_transactions", id: rec.draw.id }] : [])];
+  }
+  return [{ table: meta.table, id: Number(srcId) }];
+}
+export async function getRecordReceipt(db, src, srcId) {
+  const meta = RECEIPT_TABLES_[src];
+  const r = meta ? await db.prepare(`SELECT receiptKey, receiptName FROM ${meta.table} WHERE id = ? AND ${meta.live}`).bind(Number(srcId)).first() : null;
+  return r ? { key: r.receiptKey || "", name: r.receiptName || "" } : null;
+}
+// Sets (or clears, with key "") the receipt on those records in one batch. Changes no amounts.
+export async function setReceiptFile(db, targets, key, name) {
+  const ALLOWED = new Set(Object.values(RECEIPT_TABLES_).map(t => t.table));
+  await db.batch(targets.filter(t => ALLOWED.has(t.table)).map(t =>
+    db.prepare(`UPDATE ${t.table} SET receiptKey = ?, receiptName = ? WHERE id = ?`).bind(String(key || "").slice(0, 300), String(name || "").slice(0, 200), Number(t.id))));
+}
+
+// What stands in the way of moving a receipt to another paying account, as plain sentences ([] = nothing).
+// `target` is {accountId, paidPersonally} or null (only the target-independent checks run). Closed tax months are
+// checked by the caller's periodGuard.
+export async function receiptAccountBlockers(db, rec, target) {
+  const out = [];
+  const matched = async (src, ids) => {
+    if (!ids.length) return 0;
+    return Number((await db.prepare(`SELECT count(*) n FROM statement_matches WHERE src = ? AND srcId IN (${ids.map(() => "?").join(",")})`).bind(src, ...ids).first()).n || 0);
+  };
+  const n = await matched(rec.kind === "transfers" ? "transfer_sheet" : "blanks", rec.stock.map(s => s.id))
+    + await matched("expense", rec.expense ? [rec.expense.id] : []) + await matched("owner", rec.draw ? [rec.draw.id] : []);
+  if (n) out.push("Part of this receipt is matched to a bank-statement line. Unmatch it on Reconcile first, then change the account.");
+  const month = String(rec.date).slice(0, 7);
+  const old = [...new Set([...rec.stock.map(s => s.accountId), rec.expense && rec.expense.accountId, rec.draw && rec.draw.accountId].filter(x => x != null))];
+  for (const a of old) if (await isReconciled(db, a, month)) { out.push(`${month} is reconciled for the account it was paid from — reopen that month on Reconcile first.`); break; }
+  if (target && target.accountId && await isReconciled(db, target.accountId, month)) out.push(`${month} is reconciled for the account you chose — reopen that month on Reconcile first.`);
+  if (target && target.paidPersonally && rec.draw) out.push("This receipt has a “Personal items” owner draw. Paid with personal funds that part isn't a business transaction at all — delete the draw first, then choose Personal funds.");
+  return out;
+}
+
+// Moves EVERY record of one receipt to the same paying account (or to Personal funds) in one batch: its stock rows,
+// its R&D / written-off expense and its personal-use owner draw. `rec` is from getReceiptRecords. Stock, cost and
+// COGS don't change — only where the money came from. The caller has already checked the blockers.
+export async function setReceiptAccount(db, rec, target) {
+  const table = rec.kind === "transfers" ? "transfer_movements" : "inventory_movements";
+  const acct = target.paidPersonally ? null : Number(target.accountId), pers = target.paidPersonally ? 1 : 0, now = new Date().toISOString();
+  const stmts = rec.stock.map(s => db.prepare(`UPDATE ${table} SET accountId = ?, paidPersonally = ? WHERE id = ? AND voidedAt IS NULL`).bind(acct, pers, s.id));
+  if (rec.expense) stmts.push(db.prepare("UPDATE expenses SET accountId = ?, paidPersonally = ?, updatedAt = ? WHERE id = ? AND deletedAt IS NULL").bind(acct, pers, now, rec.expense.id));
+  if (rec.draw && acct) stmts.push(db.prepare("UPDATE owner_transactions SET accountId = ?, updatedAt = ? WHERE id = ? AND deletedAt IS NULL").bind(acct, now, rec.draw.id));
+  await db.batch(stmts);
 }
 
 // ---- Statement import & reconciliation (migrations/0015) ---------------------
@@ -6599,6 +10268,9 @@ export async function autoMatchStatement(db, accountId, month) {
   for (const m of moves) if (m.src === "payment" && byKey.has(`fee:${m.srcId}`)) {
     groups.push({ keys: [m.key, `fee:${m.srcId}`], cents: m.cents + byKey.get(`fee:${m.srcId}`).cents, date: m.date });
   }
+  // A stock receipt is one charge on the statement (2026-10): every size of every blank on it, with its R&D /
+  // personal part, as one candidate.
+  for (const e of await combineReceipts_(db, moves)) if (e.keys.length > 1) groups.push({ keys: e.keys, cents: e.cents, date: e.date });
   const used = new Set();
   const days = (a, b) => Math.abs(Date.parse(a) - Date.parse(b)) / 86400000;
   const stmts = [], now = new Date().toISOString();
@@ -6670,14 +10342,19 @@ export async function getReconciliationData(db, accountId, month) {
   const moveByKey = new Map(allMoves.map(m => [m.key, m]));
   const matchesByLine = {};
   for (const r of matchRows) (matchesByLine[r.lineId] = matchesByLine[r.lineId] || []).push(`${r.src}:${r.srcId}`);
-  const outLines = lines.map(l => {
+  // A stock receipt's records (a row per blank / size, its R&D / personal part) are one charge on the statement,
+  // so each list shows them as ONE entry with `keys` (all its records) and `parts` (2026-10, combineReceipts_).
+  const entry = (e) => ({ key: e.key, keys: e.keys, date: e.date, label: e.label, amount: fromCents(e.cents),
+    parts: e.parts.map(p => ({ key: p.key, label: p.label, amount: fromCents(p.cents) })) });
+  const outLines = [];
+  for (const l of lines) {
     const keys = matchesByLine[l.id] || [];
     const items = keys.map(k => moveByKey.get(k)).filter(Boolean);
     const broken = keys.length > 0 && items.length !== keys.length;   // a matched item was since voided/deleted
-    return { id: Number(l.id), date: l.lineDate, description: l.description, amount: fromCents(l.amountCents),
+    outLines.push({ id: Number(l.id), date: l.lineDate, description: l.description, amount: fromCents(l.amountCents),
       status: l.ignoredAt ? "ignored" : broken ? "broken" : items.length ? "matched" : "unmatched",
-      ignoreReason: l.ignoreReason || "", matched: items.map(m => ({ key: m.key, date: m.date, label: m.label, amount: fromCents(m.cents) })) };
-  });
+      ignoreReason: l.ignoreReason || "", matched: (await combineReceipts_(db, items)).map(entry) });
+  }
   const through = allMoves.filter(m => m.date <= to);
   const bookCents = Number(account.openingBalanceCents) + through.reduce((a, m) => a + m.cents, 0);
   const uncleared = through.filter(m => !taken.has(m.key));
@@ -6686,9 +10363,9 @@ export async function getReconciliationData(db, accountId, month) {
   return {
     account: { id: Number(account.id), name: account.name, type: account.type, openingDate: account.openingDate, csvMapping: account.csvMapping || "" },
     month, from, to, lines: outLines,
-    unmatchedBook: uncleared.filter(m => m.date >= from).map(m => ({ key: m.key, date: m.date, label: m.label, amount: fromCents(m.cents) })),
-    unclearedEarlier: uncleared.filter(m => m.date < from).map(m => ({ key: m.key, date: m.date, label: m.label, amount: fromCents(m.cents) })),
-    candidates: allMoves.filter(m => !taken.has(m.key) && m.date >= addDays_(from, -10)).map(m => ({ key: m.key, date: m.date, label: m.label, amount: fromCents(m.cents) })),
+    unmatchedBook: (await combineReceipts_(db, uncleared.filter(m => m.date >= from))).map(entry),
+    unclearedEarlier: (await combineReceipts_(db, uncleared.filter(m => m.date < from))).map(entry),
+    candidates: (await combineReceipts_(db, allMoves.filter(m => !taken.has(m.key) && m.date >= addDays_(from, -10)))).map(entry),
     bookBalance: fromCents(bookCents), uncleared: fromCents(unclearedCents), ignored: fromCents(Number(ign.c)),
     expectedStatementBalance: fromCents(expectedStatementCents),
     reconciled: rec ? { statementBalance: fromCents(rec.statementEndingBalanceCents), bookBalance: fromCents(rec.bookBalanceCents), at: rec.reconciledAt, by: rec.reconciledBy } : null,
@@ -6968,7 +10645,7 @@ function parsePayment_(row) {
 // active line has shipped, mirroring how recomputeOrderBlankStatus_ sets the order-level ordered/
 // received summaries. blankCounts drives the "N/T" partial-progress labels in the admin cells.
 function blankProgress_(items) {
-  const active = (items || []).filter(it => !it.cancelDate);
+  const active = (items || []).filter(it => !it.cancelDate && !it.noBlank);   // lines that use a blank
   const total = active.length;
   const ordered = active.filter(it => it.blankOrderedAt).length;
   const shipped = active.filter(it => it.blankShippedAt).length;
@@ -7063,6 +10740,11 @@ function parseOrder_(row, items, payments, labels) {
     // and blankShippedAt has no order column at all, so it's derived here (set only when every
     // active line has shipped).
     ...blankProgress_(items),
+    // false when every active line's product is made with no blank (migrations/0057): the order has
+    // no blank steps at all, and Mark manufactured doesn't wait for one.
+    needsBlanks: !(items || []).some(it => !it.cancelDate) || (items || []).some(it => !it.cancelDate && !it.noBlank),
+    // Every active line is filled from the shop's finished stock (migrations/0060): "made" = pulled from stock.
+    allFromStock: (items || []).some(it => !it.cancelDate) && (items || []).filter(it => !it.cancelDate).every(it => it.fromStock),
     blankCondition: row.blankCondition || "",
     manufacturedAt: row.manufacturedAt || "",
     digitizingCompleteAt: row.digitizingCompleteAt || "",
@@ -7088,6 +10770,10 @@ function parseItem_(row) {
     id: row.id,
     orderId: row.orderId,
     productId: row.productId || "",
+    // Its product is made with no blank (migrations/0057), or it's filled from finished stock (0060):
+    // the blank steps don't apply to this line.
+    noBlank: !!Number(row.noBlank),
+    fromStock: !!Number(row.fromStock),   // filled from the shop's finished stock (migrations/0060)
     name: row.name,
     type: row.type,
     size: row.size || "",
@@ -7124,20 +10810,312 @@ function parseItem_(row) {
   };
 }
 
+// ---- Finished stock (migrations/0060) ---------------------------------------------------------------
+// Blanks already decorated for a shop's product, on hand to sell: ready_to_ship (shop + product + size →
+// quantity, avgCostCents), with every change a finished_goods_movements row — the same shape as blanks
+// (inventory_movements → blank_sizes). How pieces get there and leave:
+//   make    Make for stock: N blanks leave blank inventory at their average cost (a consume row with
+//           reason 'finished' — NOT cost of goods) and N finished pieces arrive at that cost.
+//   opening the counts entered before this was tracked (the migration), at the linked blank's cost.
+//   adjust  a count correction (Stock window → Correct count).
+//   sell    an order line filled from stock is PULLED when the order is made — that's the cost of goods.
+//   return  a pulled piece put back (its line cancelled / order voided before it shipped).
+// A storefront (or local) order line for an in-stock product + size is filled from stock when it's
+// placed (order_items.fromStock); until it's pulled its pieces are SET ASIDE — worked out when read, so a
+// cancel or void releases them with nothing to write. The shop's "N in stock" badge shows what's left.
+// Configurable products (color / graphic pickers) aren't stocked in this version: a finished piece would
+// be one color + graphics combination, and the storefront shows no stock badge for them.
+
+// The size finished stock is kept under: '' for a flat-priced product (whose order lines say "OSFA").
+function stockSize_(pricingMode, size) { return pricingMode === "flat" ? "" : String(size || ""); }
+// Pieces SET ASIDE per "orgId|productId|stockSize": still to pull on active lines filled from stock.
+async function finishedSetAside_(db, orgId) {
+  if (!(await hasFromStockColumn_(db))) return {};
+  const { results } = await db.prepare(
+    `SELECT oi.orgId, oi.productId, CASE WHEN p.pricingMode = 'flat' THEN '' ELSE oi.size END AS size,
+            SUM(oi.qty - COALESCE(oi.manufacturedQty, 0)) AS n, group_concat(DISTINCT oi.orderId) AS orderIds
+     FROM order_items oi JOIN orders o ON o.orderId = oi.orderId
+     LEFT JOIN products p ON p.orgId = oi.orgId AND p.productId = oi.productId
+     WHERE oi.fromStock = 1 AND oi.cancelDate IS NULL AND o.voidedAt IS NULL AND COALESCE(oi.manufacturedQty, 0) < oi.qty
+       ${orgId ? "AND oi.orgId = ?" : ""}
+     GROUP BY oi.orgId, oi.productId, 3`).bind(...(orgId ? [orgId] : [])).all();
+  const out = {};
+  for (const r of results) out[[r.orgId, r.productId, r.size].join("|")] = { n: Number(r.n) || 0, orderIds: String(r.orderIds || "").split(",").filter(Boolean) };
+  return out;
+}
+// SQL (with its binds) for the pieces set aside on one product + stock size — used inside the guarded
+// statements, so it's evaluated at the moment the statement runs.
+function setAsideSql_(orgId, productId, pricingMode, size) {
+  return pricingMode === "flat"
+    ? { sql: `COALESCE((SELECT SUM(x.qty - COALESCE(x.manufacturedQty, 0)) FROM order_items x JOIN orders xo ON xo.orderId = x.orderId
+               WHERE x.fromStock = 1 AND x.cancelDate IS NULL AND xo.voidedAt IS NULL AND x.orgId = ? AND x.productId = ?), 0)`, binds: [orgId, productId] }
+    : { sql: `COALESCE((SELECT SUM(x.qty - COALESCE(x.manufacturedQty, 0)) FROM order_items x JOIN orders xo ON xo.orderId = x.orderId
+               WHERE x.fromStock = 1 AND x.cancelDate IS NULL AND xo.voidedAt IS NULL AND x.orgId = ? AND x.productId = ? AND x.size = ?), 0)`, binds: [orgId, productId, size] };
+}
+async function stockProduct_(db, orgId, productId) {
+  return db.prepare("SELECT productId, name, pricingMode, configurable, noBlankNeeded FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first()
+    .catch(() => db.prepare("SELECT productId, name, pricingMode FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first());
+}
+// The blank a product + stock size is made from (a flat product's link is under "OSFA", or '').
+async function stockLink_(db, orgId, productId, pricingMode, size) {
+  for (const sz of pricingMode === "flat" ? ["OSFA", ""] : [size]) {
+    const l = await db.prepare(
+      `SELECT l.blankId, l.blankColor, l.blankSize, b.name AS blankName, COALESCE(bs.quantity, 0) AS quantity, COALESCE(bs.purchasePriceCents, 0) AS avg
+       FROM product_blank_links l LEFT JOIN blanks b ON b.id = l.blankId
+       LEFT JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+       WHERE l.orgId = ? AND l.productId = ? AND l.productColor = '' AND l.productSize = ?`).bind(orgId, productId, sz).first();
+    if (l && l.blankId != null) return l;
+  }
+  return null;
+}
+
+// What the storefront badge shows: AVAILABLE pieces (on hand less set aside), per product + size.
 export async function getReadyToShipByOrg(db, orgId) {
   const { results } = await db.prepare(
     "SELECT productId, size, quantity FROM ready_to_ship WHERE orgId=? ORDER BY productId, size"
   ).bind(orgId).all();
-  return results.map(r => ({ productId: r.productId, size: r.size, quantity: Number(r.quantity) || 0 }));
+  const held = await finishedSetAside_(db, orgId);
+  return results.map(r => ({ productId: r.productId, size: r.size,
+    quantity: Math.max(0, (Number(r.quantity) || 0) - ((held[[orgId, r.productId, r.size].join("|")] || {}).n || 0)) }));
 }
 
+// "Ready to decorate": per product + color + size, how many of its linked blank are FREE (on hand less
+// set aside for orders, getBlankReservations — the same free Make for stock and Use from stock use). A
+// blank shared by several products counts for each. {productId: {color: {size: n}}}; a plain product's
+// color is '', a flat product's size is '' (as the storefront keys finished stock). Products made with no
+// blank and blanks kept for testing are left out; only counts above 0 are returned.
+export async function getBlankReadyByOrg(db, orgId) {
+  const sql = noBlank => `SELECT l.productId, l.productColor, l.productSize, l.blankId, l.blankColor, l.blankSize,
+      p.pricingMode, COALESCE(bs.quantity, 0) AS quantity
+    FROM product_blank_links l JOIN products p ON p.orgId = l.orgId AND p.productId = l.productId
+    JOIN blanks b ON b.id = l.blankId
+    JOIN blank_sizes bs ON bs.blankId = l.blankId AND bs.color = l.blankColor AND bs.size = l.blankSize
+    WHERE l.orgId = ? AND COALESCE(b.forTesting, 0) = 0${noBlank ? " AND COALESCE(p.noBlankNeeded, 0) = 0" : ""}`;
+  let rows;
+  try { ({ results: rows } = await db.prepare(sql(true)).bind(orgId).all()); }
+  catch (e) { ({ results: rows } = await db.prepare(sql(false)).bind(orgId).all()); }
+  const held = await getBlankReservations(db);
+  const out = {};
+  for (const r of rows) {
+    const free = (Number(r.quantity) || 0) - (held[[r.blankId, r.blankColor || "", r.blankSize || ""].join("|")] || 0);
+    if (free <= 0) continue;
+    const size = r.pricingMode === "flat" ? "" : String(r.productSize || "");
+    const byColor = (out[r.productId] = out[r.productId] || {});
+    const bySize = (byColor[r.productColor || ""] = byColor[r.productColor || ""] || {});
+    bySize[size] = Math.max(bySize[size] || 0, free);
+  }
+  return out;
+}
+
+// The Stock window: per size on hand / set aside (and by which orders) / available / average cost /
+// value, and what Make for stock would use — the linked blank and how many of it are free.
+export async function getFinishedStock(db, orgId, productId) {
+  const p = await stockProduct_(db, orgId, productId);
+  if (!p) return null;
+  let rows = [];
+  try { ({ results: rows } = await db.prepare("SELECT size, quantity, avgCostCents FROM ready_to_ship WHERE orgId=? AND productId=? ORDER BY size").bind(orgId, productId).all()); }
+  catch (e) { ({ results: rows } = await db.prepare("SELECT size, quantity, 0 AS avgCostCents FROM ready_to_ship WHERE orgId=? AND productId=? ORDER BY size").bind(orgId, productId).all()); }
+  const held = await finishedSetAside_(db, orgId), reserved = await getBlankReservations(db);
+  const sizes = p.pricingMode === "flat" ? [""] : Object.keys(tryParse_((await db.prepare("SELECT sizePricingCents FROM products WHERE orgId=? AND productId=?").bind(orgId, productId).first() || {}).sizePricingCents, {}) || {});
+  for (const r of rows) if (!sizes.includes(r.size)) sizes.push(r.size);
+  const out = [];
+  for (const size of sizes) {
+    const r = rows.find(x => x.size === size) || { quantity: 0, avgCostCents: 0 };
+    const h = held[[orgId, productId, size].join("|")] || { n: 0, orderIds: [] };
+    const link = await stockLink_(db, orgId, productId, p.pricingMode, size);
+    const onHand = Number(r.quantity) || 0, avg = Number(r.avgCostCents) || 0;
+    out.push({ size, onHand, setAside: h.n, setAsideOrders: h.orderIds, available: Math.max(0, onHand - h.n), avgCost: fromCents(avg), value: fromCents(Math.max(0, onHand) * avg),
+      blank: link ? { blankId: Number(link.blankId), name: link.blankName || "", color: link.blankColor || "", size: link.blankSize || "", avgCost: fromCents(link.avg),
+        free: Math.max(0, Number(link.quantity) - (reserved[[link.blankId, link.blankColor || "", link.blankSize || ""].join("|")] || 0)) } : null });
+  }
+  return { productId, name: p.name || productId, flat: p.pricingMode === "flat", configurable: !!Number(p.configurable), noBlankNeeded: !!Number(p.noBlankNeeded), sizes: out };
+}
+
+// Make for stock: `qty` blanks of the size's linked blank are decorated into finished pieces. One
+// guarded batch (makeItemPieces_ style): every statement only applies while the blank still has
+// enough FREE (on hand less set aside for orders), and the claim on blank_sizes runs last — so two
+// requests can't both take the last blanks. Returns {claimed, unitCost}.
+export async function makeForStock(db, { orgId, productId, size, qty, occurredAt }) {
+  const q = Math.floor(Number(qty) || 0);
+  if (q <= 0) throw pricingError_("Enter how many were made.");
+  const p = await stockProduct_(db, orgId, productId);
+  if (!p) throw pricingError_("Product not found.");
+  if (Number(p.configurable)) throw pricingError_("Products with color and graphic choices can't be stocked yet — each finished piece would be one combination.");
+  const sz = stockSize_(p.pricingMode, size);
+  // Made with no blank at all (migrations/0057, a patch from shop supplies): no blanks to take out.
+  if (Number(p.noBlankNeeded)) throw pricingError_(`${p.name || productId} is made with no blank, so there are no blanks to take out — enter how many you have with Correct count.`);
+  const link = await stockLink_(db, orgId, productId, p.pricingMode, sz);
+  if (!link) throw pricingError_(`${p.name || productId}${sz ? " (" + sz + ")" : ""} isn't linked to a blank — link it on the product first, or enter the count with Correct count.`);
+  const blankId = Number(link.blankId), bColor = link.blankColor || "", bSize = link.blankSize || "";
+  const held = (await getBlankReservations(db))[[blankId, bColor, bSize].join("|")] || 0;
+  const free = Number(link.quantity) - held;
+  if (q > free) throw pricingError_(`Only ${Math.max(0, free)} ${link.blankName || "blank"}${bColor ? " " + bColor : ""}${bSize && bSize !== "OSFA" ? " " + bSize : ""} free${held ? ` (${held} set aside for orders)` : ""} — receive more first.`);
+  const now = new Date().toISOString(), at = occurredAt || now;
+  const G = "(SELECT quantity FROM blank_sizes WHERE blankId = ? AND color = ? AND size = ?) >= ?", gb = [blankId, bColor, bSize, q + held];
+  const avgSql = "MAX(0, COALESCE((SELECT purchasePriceCents FROM blank_sizes WHERE blankId = ? AND color = ? AND size = ?), 0))", ab = [blankId, bColor, bSize];
+  const note = `Made for stock — ${p.name || productId}${sz ? " (" + sz + ")" : ""}`.slice(0, 300);
+  const res = await db.batch([
+    db.prepare(`INSERT INTO inventory_movements (blankId, blankName, color, size, qtyDelta, unitCostCents, kind, orderId, itemId, vendor, vendorRef, note, occurredAt, createdAt, vendorChargedTax, accountId, paidPersonally, receiptKey, receiptName, reason)
+      SELECT ?, ?, ?, ?, ?, ${avgSql}, 'consume', NULL, NULL, '', '', ?, ?, ?, 0, NULL, 0, '', '', 'finished' WHERE ${G}`)
+      .bind(blankId, link.blankName || "", bColor, bSize, -q, ...ab, note, at, now, ...gb),
+    db.prepare(`INSERT INTO finished_goods_movements (orgId, productId, productName, color, size, qtyDelta, unitCostCents, kind, blankMovementId, note, occurredAt, createdAt)
+      SELECT ?, ?, ?, '', ?, ?, ${avgSql}, 'make', (SELECT max(id) FROM inventory_movements WHERE blankId = ? AND reason = 'finished'), ?, ?, ? WHERE ${G}`)
+      .bind(orgId, productId, p.name || productId, sz, q, ...ab, blankId, note, at, now, ...gb),
+    db.prepare(`INSERT INTO ready_to_ship (orgId, productId, size, quantity, updatedAt, avgCostCents) SELECT ?, ?, ?, ?, ?, ${avgSql} WHERE ${G}
+      ON CONFLICT(orgId, productId, size) DO UPDATE SET
+        avgCostCents = CAST(ROUND((MAX(ready_to_ship.quantity, 0) * ready_to_ship.avgCostCents + excluded.quantity * excluded.avgCostCents) * 1.0
+                                  / (MAX(ready_to_ship.quantity, 0) + excluded.quantity)) AS INTEGER),
+        quantity = ready_to_ship.quantity + excluded.quantity, updatedAt = excluded.updatedAt`)
+      .bind(orgId, productId, sz, q, now, ...ab, ...gb),
+    db.prepare(`UPDATE blank_sizes SET quantity = quantity - ? WHERE blankId = ? AND color = ? AND size = ? AND quantity >= ?`).bind(q, blankId, bColor, bSize, q + held),
+  ]);
+  const claimed = Number(res.at(-1) && res.at(-1).meta && res.at(-1).meta.changes) === 1;
+  return { claimed, unitCost: fromCents(Number(link.avg) || 0), blank: { name: link.blankName || "", color: bColor, size: bSize } };
+}
+
+// Stock window → Correct count: sets the on-hand count to what was counted, as an `adjust` movement for
+// the difference (an increase at the current average cost, or the linked blank's when there's none yet).
+// Refused below what's set aside for orders, and if the count changed since it was read.
+export async function setFinishedCount(db, { orgId, productId, size, quantity, note }) {
+  const want = Math.floor(Number(quantity));
+  if (!Number.isFinite(want) || want < 0) throw pricingError_("Enter a count of 0 or more.");
+  const p = await stockProduct_(db, orgId, productId);
+  if (!p) throw pricingError_("Product not found.");
+  const sz = stockSize_(p.pricingMode, size);
+  const cur = await db.prepare("SELECT quantity, avgCostCents FROM ready_to_ship WHERE orgId=? AND productId=? AND size=?").bind(orgId, productId, sz).first();
+  const onHand = cur ? Number(cur.quantity) || 0 : 0, avg = cur ? Number(cur.avgCostCents) || 0 : 0;
+  const held = ((await finishedSetAside_(db, orgId))[[orgId, productId, sz].join("|")] || {}).n || 0;
+  if (want < held) throw pricingError_(`${held} ${held === 1 ? "is" : "are"} set aside for orders — the count can't go below that.`);
+  const delta = want - onHand;
+  if (!delta) return { delta: 0 };
+  let unit = avg;
+  if (!unit && delta > 0) { const l = await stockLink_(db, orgId, productId, p.pricingMode, sz); unit = l ? Number(l.avg) || 0 : 0; }
+  const newAvg = delta > 0 ? Math.round((Math.max(0, onHand) * avg + delta * unit) / (Math.max(0, onHand) + delta)) : avg;
+  const now = new Date().toISOString();
+  const G = "COALESCE((SELECT quantity FROM ready_to_ship WHERE orgId = ? AND productId = ? AND size = ?), 0) = ?", gb = [orgId, productId, sz, onHand];
+  const res = await db.batch([
+    db.prepare(`INSERT INTO finished_goods_movements (orgId, productId, productName, color, size, qtyDelta, unitCostCents, kind, note, occurredAt, createdAt)
+      SELECT ?, ?, ?, '', ?, ?, ?, 'adjust', ?, ?, ? WHERE ${G}`)
+      .bind(orgId, productId, p.name || productId, sz, delta, unit, String(note || "Count corrected").slice(0, 300), now, now, ...gb),
+    db.prepare(`INSERT INTO ready_to_ship (orgId, productId, size, quantity, updatedAt, avgCostCents) SELECT ?, ?, ?, ?, ?, ? WHERE ${G}
+      ON CONFLICT(orgId, productId, size) DO UPDATE SET quantity = excluded.quantity, avgCostCents = excluded.avgCostCents, updatedAt = excluded.updatedAt`)
+      .bind(orgId, productId, sz, want, now, newAvg, ...gb),
+  ]);
+  if (!(Number(res[0] && res[0].meta && res[0].meta.changes) === 1)) throw pricingError_("The count changed while you were editing — reopen the Stock window and try again.");
+  return { delta, unitCost: fromCents(unit) };
+}
+
+// Kept for older callers: a typed count is now a recorded correction.
 export async function upsertReadyToShipQty(db, orgId, productId, size, quantity) {
-  const updatedAt = new Date().toISOString();
-  await db.prepare(
-    `INSERT INTO ready_to_ship (orgId, productId, size, quantity, updatedAt)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(orgId, productId, size) DO UPDATE SET quantity=excluded.quantity, updatedAt=excluded.updatedAt`
-  ).bind(orgId, productId, size, Math.max(0, Number(quantity) || 0), updatedAt).run();
+  return setFinishedCount(db, { orgId, productId, size, quantity });
+}
+
+// Rebuilds one product + size's cached quantity / average cost from its non-voided movements (the
+// same replay as getFinishedGoodsValuation) — after a void, like recomputeBlankSizeFromHistory_.
+async function recomputeFinishedFromHistory_(db, orgId, productId, size) {
+  const { results } = await db.prepare(
+    "SELECT qtyDelta, unitCostCents, kind FROM finished_goods_movements WHERE orgId=? AND productId=? AND size=? AND voidedAt IS NULL ORDER BY occurredAt, id"
+  ).bind(orgId, productId, size).all();
+  let qty = 0, avg = 0;
+  for (const m of results) {
+    const d = Number(m.qtyDelta);
+    if (d > 0 && m.kind !== "sell") { const on = Math.max(0, qty); avg = Math.round((on * avg + d * Number(m.unitCostCents)) / (on + d)); }
+    qty += d;
+  }
+  await db.prepare(`INSERT INTO ready_to_ship (orgId, productId, size, quantity, updatedAt, avgCostCents) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(orgId, productId, size) DO UPDATE SET quantity = excluded.quantity, avgCostCents = excluded.avgCostCents, updatedAt = excluded.updatedAt`)
+    .bind(orgId, productId, size, qty, new Date().toISOString(), avg).run();
+}
+
+export async function getFinishedGoodsMovements(db, orgId, productId) {
+  const { results } = await db.prepare(
+    "SELECT * FROM finished_goods_movements WHERE orgId=? AND productId=? ORDER BY occurredAt DESC, id DESC LIMIT 500").bind(orgId, productId).all();
+  return results.map(r => ({ id: Number(r.id), size: r.size || "", qtyDelta: Number(r.qtyDelta), unitCost: fromCents(r.unitCostCents), kind: r.kind,
+    orderId: r.orderId || "", note: r.note || "", occurredAt: r.occurredAt, voidedAt: r.voidedAt || "", voidReason: r.voidReason || "" }));
+}
+
+// Voids a mistaken opening / make / adjust entry (sell and return rows come from orders and are
+// corrected there). Voiding a `make` also voids the blanks it used — they're back in blank stock.
+// Refused when it would leave fewer on hand than are set aside. Returns the row (pre-void) or throws.
+export async function voidFinishedGoodsMovement(db, id, reason) {
+  const row = await db.prepare("SELECT * FROM finished_goods_movements WHERE id=?").bind(Number(id)).first();
+  if (!row || row.voidedAt) throw pricingError_("That entry isn't there or is already voided.");
+  if (!["opening", "make", "adjust"].includes(row.kind)) throw pricingError_("Entries made by an order are corrected on the order.");
+  const cur = await db.prepare("SELECT quantity FROM ready_to_ship WHERE orgId=? AND productId=? AND size=?").bind(row.orgId, row.productId, row.size).first();
+  const held = ((await finishedSetAside_(db, row.orgId))[[row.orgId, row.productId, row.size].join("|")] || {}).n || 0;
+  const after = (cur ? Number(cur.quantity) : 0) - Number(row.qtyDelta);
+  if (after < 0) throw pricingError_(`Voiding this would leave ${after} on hand — some of these pieces have already been sold. Use Correct count instead.`);
+  if (after < held) throw pricingError_(`Voiding this would leave ${after} on hand, but ${held} ${held === 1 ? "is" : "are"} set aside for orders.`);
+  const now = new Date().toISOString(), why = String(reason || "").slice(0, 300);
+  const r = await db.prepare("UPDATE finished_goods_movements SET voidedAt=?, voidReason=? WHERE id=? AND voidedAt IS NULL").bind(now, why, Number(id)).run();
+  if (!((r.meta && r.meta.changes) > 0)) throw pricingError_("That entry was just voided.");
+  if (row.kind === "make" && row.blankMovementId) {
+    const bm = await db.prepare("SELECT * FROM inventory_movements WHERE id=? AND voidedAt IS NULL").bind(Number(row.blankMovementId)).first();
+    if (bm) {
+      await db.prepare("UPDATE inventory_movements SET voidedAt=?, voidReason=? WHERE id=?").bind(now, ("Finished stock entry voided: " + why).slice(0, 300), Number(bm.id)).run();
+      await recomputeBlankSizeFromHistory_(db, bm.blankId, bm.color || "", bm.size);
+    }
+  }
+  await recomputeFinishedFromHistory_(db, row.orgId, row.productId, row.size);
+  return row;
+}
+
+// Finished stock on hand and its value at the END of a moment (ISO), from the movements — a running
+// weighted-average cost per shop + product + size (Schedule C Part III, like getInventoryValuation).
+export async function getFinishedGoodsValuation(db, asOf) {
+  let results = [];
+  try {
+    ({ results } = await db.prepare(
+      "SELECT orgId, productId, productName, size, qtyDelta, unitCostCents, kind FROM finished_goods_movements WHERE occurredAt <= ? AND voidedAt IS NULL ORDER BY occurredAt, id"
+    ).bind(asOf).all());
+  } catch (e) { if (!/no such table/i.test(String(e && e.message))) throw e; }
+  const state = new Map();
+  for (const m of results) {
+    const key = [m.orgId, m.productId, m.size].join("|");
+    const st = state.get(key) || { orgId: m.orgId, productId: m.productId, name: m.productName, size: m.size || "", qty: 0, avg: 0 };
+    const d = Number(m.qtyDelta);
+    if (d > 0 && m.kind !== "sell") { const on = Math.max(0, st.qty); st.avg = Math.round((on * st.avg + d * Number(m.unitCostCents)) / (on + d)); }
+    st.qty += d; st.name = m.productName || st.name;
+    state.set(key, st);
+  }
+  const rows = [...state.values()].filter(r => r.qty !== 0)
+    .map(r => ({ orgId: r.orgId, productId: r.productId, name: r.name, size: r.size, qty: r.qty, avgCost: fromCents(r.avg), value: fromCents(Math.max(0, r.qty) * r.avg) }))
+    .sort((a, b) => (a.orgId + a.name + a.size).localeCompare(b.orgId + b.name + b.size));
+  return { asOf, rows, units: rows.reduce((s, r) => s + r.qty, 0), value: fromCents(rows.reduce((s, r) => s + toCents(r.value), 0)) };
+}
+
+// A pulled from-stock line taken back (its line cancelled, or its order voided, before it shipped):
+// its pieces return to finished stock at the cost they left with, and the line's cost is cleared.
+// Guarded: the line's cost is the claim (cleared last), so it happens once. itemId null = every line.
+async function returnFinishedStock_(db, orderId, itemId) {
+  if (!(await hasFromStockColumn_(db))) return 0;
+  const o = await db.prepare("SELECT shippedAt, deliveredAt FROM orders WHERE orderId=?").bind(orderId).first();
+  if (!o || o.shippedAt || o.deliveredAt) return 0;
+  const { results: lines } = await db.prepare(
+    `SELECT oi.id, oi.orgId, oi.productId, oi.size, oi.manufacturedQty, oi.cogsCents, p.pricingMode, p.name
+     FROM order_items oi LEFT JOIN products p ON p.orgId = oi.orgId AND p.productId = oi.productId
+     WHERE oi.orderId = ? AND oi.fromStock = 1 AND COALESCE(oi.manufacturedQty, 0) > 0 AND COALESCE(oi.cogsCents, 0) > 0 ${itemId ? "AND oi.id = ?" : ""}`
+  ).bind(...(itemId ? [orderId, Number(itemId)] : [orderId])).all();
+  let n = 0;
+  for (const l of lines) {
+    const pieces = Number(l.manufacturedQty), cents = Number(l.cogsCents), unit = Math.round(cents / pieces);
+    const sz = stockSize_(l.pricingMode, l.size), now = new Date().toISOString();
+    const G = "(SELECT COALESCE(cogsCents, 0) FROM order_items WHERE id = ?) = ?", gb = [Number(l.id), cents];
+    const res = await db.batch([
+      db.prepare(`INSERT INTO finished_goods_movements (orgId, productId, productName, color, size, qtyDelta, unitCostCents, kind, orderId, itemId, note, occurredAt, createdAt)
+        SELECT ?, ?, ?, '', ?, ?, ?, 'return', ?, ?, ?, ?, ? WHERE ${G}`)
+        .bind(l.orgId, l.productId, l.name || l.productId, sz, pieces, unit, orderId, Number(l.id), ("Put back from order " + orderId).slice(0, 300), now, now, ...gb),
+      db.prepare(`INSERT INTO ready_to_ship (orgId, productId, size, quantity, updatedAt, avgCostCents) SELECT ?, ?, ?, ?, ?, ? WHERE ${G}
+        ON CONFLICT(orgId, productId, size) DO UPDATE SET
+          avgCostCents = CAST(ROUND((MAX(ready_to_ship.quantity, 0) * ready_to_ship.avgCostCents + excluded.quantity * excluded.avgCostCents) * 1.0
+                                    / (MAX(ready_to_ship.quantity, 0) + excluded.quantity)) AS INTEGER),
+          quantity = ready_to_ship.quantity + excluded.quantity, updatedAt = excluded.updatedAt`)
+        .bind(l.orgId, l.productId, sz, pieces, now, unit, ...gb),
+      db.prepare("UPDATE order_items SET cogsCents = 0 WHERE id = ? AND COALESCE(cogsCents, 0) = ?").bind(Number(l.id), cents),
+    ]);
+    if (Number(res.at(-1) && res.at(-1).meta && res.at(-1).meta.changes) === 1) n += pieces;
+  }
+  return n;
 }
 
 export async function updateOrderPlacedAt(db, orderId, placedAt) {

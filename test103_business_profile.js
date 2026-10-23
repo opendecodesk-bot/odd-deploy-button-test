@@ -80,7 +80,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   console.log("\n=== Admin ===");
   const adm = read("public/admin.js");
   ok("Global settings has a Business profile form saved with the rest", /<h2 style="margin-bottom:12px;">Business profile<\/h2>/.test(adm) && /action: "updateBusinessProfile"/.test(adm) && /id="gBizName"|bizField\("gBizName"/.test(adm));
-  ok("page titles, the printed receipt and the label byline use the profile", /document\.title = bizName_\(\) \+ " — /.test(adm) && /by \$\{escapeHtml\(bizName_\(\)\)\}/.test(adm));
+  ok("page titles, the printed receipt and the label byline use the profile", /function adminTitle_\(page\)\{ return bizName_\(\) \+ " — "/.test(adm) && /by \$\{escapeHtml\(bizName_\(\)\)\}/.test(adm));
 
   console.log(`\n${fail ? "FAIL" : "ALL PASS"} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

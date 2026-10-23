@@ -40,6 +40,7 @@ function makeReq(url, { body, headers = {}, method = "POST" } = {}){
 global.rateLimited = async () => ({ blocked: false, retryAfter: 0 });
 global.rateLimitCheck = async () => ({ blocked: false, retryAfter: 0 });
 global.rateLimitHit = async () => {};
+global.rateLimitCheckGlobal = async () => ({ blocked: false, retryAfter: 0 }); global.rateLimitHitGlobal = async () => {};
 global.rateLimitResponse = () => new Response("", { status: 429 });
 global.getCatalogData = async () => ({ subdomainMap: { league101: "league-101", rec: "rec" }, orgs: {} });
 
@@ -221,6 +222,7 @@ const SAME = { Origin: ADMIN, "CF-Connecting-IP": "203.0.113.7" };
     let inserted = null;
     Object.assign(global, {
       getOrgById: async (db, orgId) => ({ orgId, ready: true, allowOrdersAfterDeadline: true }),
+      getPublishedOrg: async (db, orgId) => ({ orgId, ready: true, allowOrdersAfterDeadline: true }),   // migrations/0076
       getLocaleSettings: async () => ({ timeZone: "", country: "US" }),   // the default Region
       priceItem: async () => ({ unitPrice: 25, personalizationFee: 0, name: "Club Polo", type: "shirt" }),
       getProductsByOrg: async () => [], insertOrder: async (db, order, items) => { inserted = items; },
@@ -267,8 +269,9 @@ const SAME = { Origin: ADMIN, "CF-Connecting-IP": "203.0.113.7" };
     const realFetch = global.fetch;
     global.fetch = async (url, opts) => { stripeParams = new URLSearchParams(opts.body); return { json: async () => ({ url: "https://checkout.stripe.com/x" }) }; };
     const C = load("functions/api/checkout.js", ["onRequestPost"]);
-    const call = (host, body) => C.onRequestPost({ env: { DB: {}, STRIPE_SECRET_KEY: "sk_test" },
-      request: makeReq("https://" + host + "/api/checkout", { body }) });
+    const { orderTokenFor } = require("./testlib/order-token");
+    const call = async (host, body) => C.onRequestPost({ env: { DB: {}, STRIPE_SECRET_KEY: "sk_test" },
+      request: makeReq("https://" + host + "/api/checkout", { body: Object.assign({ checkoutToken: await orderTokenFor({ STRIPE_SECRET_KEY: "sk_test" }, body.orderId) }, body) }) });
 
     state.paid = true; stripeParams = null;
     let r = await call("league101.example.com", { orderId: "ORD-1", orgId: "league-101" });

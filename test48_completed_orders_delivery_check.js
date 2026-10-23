@@ -1,4 +1,5 @@
 const fs = require("fs");
+const { autoConfirm } = require("./testlib/confirm.js");
 const { MAIL_ENV, MAIL_OK, captureMail } = require("./testlib/mail-mock");
 const { createD1 } = require("./testlib/d1-shim.js");
 const { JSDOM, ResourceLoader } = require("jsdom");
@@ -265,7 +266,7 @@ const setState = (d1, orderId, s) => {
   await w.loadAdminScript();
   w.eval('adminKey = "cookie"; adminOrgs = [{ orgId: "prime", name: "Example League" }]; window._ordersFilter = { from: "", to: "" };');
   const toasts = []; w.showToast = (m, bad) => toasts.push({ m, bad });
-  const confirms = []; let confirmAnswer = true; w.confirm = (m) => { confirms.push(m); return confirmAnswer; };
+  const confirms = []; let confirmAnswer = true; autoConfirm(w, (m) => { confirms.push(m); return confirmAnswer; });
   const app = w.document.getElementById("app");
   const wait = async (fn, n = 200) => { for (let i = 0; i < n && !fn(); i++) await new Promise(x => setTimeout(x, 10)); return fn(); };
   const org = { orgId: "prime", name: "Example League" };
@@ -320,11 +321,11 @@ const setState = (d1, orderId, s) => {
   // declining
   await addOrder(d1, "PAID2", "prime", { customerName: "Pat" }); setState(d1, "PAID2", { paid: true }); d1._raw.run("UPDATE orders SET qaPackedAt=? WHERE orderId='PAID2'", [daysAgo(1)]);
   await paint(); confirms.length = 0;
-  let n = 0; w.confirm = (m) => { confirms.push(m); return ++n === 1; };   // yes to "delivered", no to "completed"
+  let n = 0; autoConfirm(w, (m) => { confirms.push(m); return ++n === 1; });   // yes to "delivered", no to "completed"
   check("PAID2");
   await w.bulkSetFulfillmentStage("prime", "delivered");
   console.log("declining the completion prompt leaves it delivered but open:", d1.q("SELECT completedAt c, deliveredAt d FROM orders WHERE orderId='PAID2'").map(x => x.c === null && x.d !== null)[0]);
-  w.confirm = (m) => { confirms.push(m); return true; };
+  autoConfirm(w, (m) => { confirms.push(m); return true; });
   await paint();
   const p2 = w.document.querySelector('tr[data-order="PAID2"] td[data-action-td]');
   console.log("...and it now has a 'Mark completed' button:", /Mark completed/.test(p2.textContent));

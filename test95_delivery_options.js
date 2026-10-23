@@ -87,7 +87,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
 
   console.log("\n=== The storefront catalog ===");
   const catalog = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +
-    "const getReadyToShipByOrg = async () => [];\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
+    "const getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
   catalog.set(async () => lib.getPublicCatalogData(d1));
   const cat = JSON.parse(await (await catalog.get({ request: { url: "https://league.example.com/api/catalog" }, env })).text()).catalog;
   ok("the shop's options reach the storefront with their fees", cat.deliveryOptions.map(o => o.label + ":" + o.fee).join("|") === "Local pickup:0|Delivery at practice:0|Hand delivery:5" && cat.shippingEnabled === false);

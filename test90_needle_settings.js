@@ -1,4 +1,5 @@
 const fs = require("fs");
+const { autoConfirm } = require("./testlib/confirm.js");
 const { createD1 } = require("./testlib/d1-shim.js");
 const { JSDOM, ResourceLoader } = require("jsdom");
 
@@ -24,10 +25,12 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   dbSrc + "\n" + strip(read("functions/api/orders.js")) + "\nreturn onRequestPost;")();
 
 const migrations = fs.readdirSync(__dirname + "/migrations").filter(f => /^\d{4}_/.test(f) && f >= "0006").sort();
-const newDb = async (upTo) => {
+// `without`: leave out the one migration whose number starts with this ("0044") — a database that
+// has everything else, which is what production looks like when code is deployed just before it.
+const newDb = async (without) => {
   const d1 = await createD1();
   d1._raw.exec(read("testlib/schema-pre-0006.sql"));
-  for (const f of migrations) if (!upTo || f < upTo) d1.execFile(read("migrations/" + f));
+  for (const f of migrations) if (!without || !f.startsWith(without)) d1.execFile(read("migrations/" + f));
   return d1;
 };
 const tick = (ms) => new Promise(res => setTimeout(res, ms || 60));
@@ -202,7 +205,7 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 60));
         if (String(url).includes("127.0.0.1")) throw new Error("no agent in tests");
         return { ok: true, status: 200, json: async () => ({ status: "error", message: "n/a" }) };
       };
-      win.confirm = () => true;
+      autoConfirm(win, () => true);
     } });
   const w = dom.window, doc = w.document;
   await tick(150);
@@ -338,4 +341,4 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 60));
   await w.renderRunOrder(app);
   await settle(() => app.querySelector(".run-job-card"));
   console.log("changing the needle size for a weight changes what Run Order recommends:", needle(oTee) === "Needle: 80/12 Ballpoint");
-})().catch(e => { console.log("test90 crashed:", false, e); });
+})().catch(e => { console.error(e); console.log("test90 ran to the end without crashing: false"); process.exitCode = 1; });

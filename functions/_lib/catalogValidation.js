@@ -4,6 +4,8 @@
 // convenience — these run on every createOrg/updateOrg/createProduct/updateProduct, so a
 // hand-crafted request can't store a javascript: link or a CSS-breaking "color".
 
+import { RESERVED_SUBDOMAINS } from "./hostConfig.js";
+
 export const ORG_ID_RE = /^[a-z0-9-]{2,40}$/;
 export const SUBDOMAIN_RE = /^[a-z0-9]{2,40}$/;
 export const PRODUCT_ID_RE = /^[a-z0-9-]{1,40}$/;
@@ -41,8 +43,13 @@ export function validateOrgFields(body, isCreate) {
   if (isCreate && !ORG_ID_RE.test(String(body.orgId || ""))) {
     return { error: "Org ID must be 2-40 lowercase letters, numbers, or hyphens." };
   }
+  // "all" is the admin's All-shops Orders page (#orders/all), so it can't be a shop's id.
+  if (isCreate && String(body.orgId) === "all") return { error: "“all” is reserved — pick another Org ID." };
   if (body.subdomain && !SUBDOMAIN_RE.test(String(body.subdomain))) {
     return { error: "Subdomain must be 2-40 lowercase letters or numbers (no hyphens)." };
+  }
+  if (body.subdomain && RESERVED_SUBDOMAINS.includes(String(body.subdomain))) {
+    return { error: `“${body.subdomain}” is reserved — pick another web address.` };
   }
   if (body.accent && !isValidAccent(body.accent)) {
     return { error: "Accent must be a valid CSS color (e.g. #1E7A4C, navy, rgb(30,122,76))." };

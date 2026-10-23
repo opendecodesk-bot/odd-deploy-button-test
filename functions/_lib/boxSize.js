@@ -8,8 +8,10 @@
  * Returns { box:{length,width,height}, packing } or null when the order
  * doesn't fit any defined configuration (admin will send shipping separately).
  *
- * Type classification uses keyword matching on the product type string so it
- * works with whatever values are stored in the catalog without a strict enum.
+ * Type classification: a product's category says which limit it counts against
+ * (product_categories.packAs, passed in as `packAs` = { <category key>: class }).
+ * A type that isn't in that map — an old order line, or a caller that doesn't
+ * pass the map — falls back to keyword matching on the type string.
  */
 
 const FALLBACK_BOXES = [
@@ -38,8 +40,9 @@ const FALLBACK_BOXES = [
   },
 ];
 
-function classifyType(type) {
+function classifyType(type, packAs) {
   const t = String(type || "").toLowerCase();
+  if (packAs && Object.prototype.hasOwnProperty.call(packAs, t)) return packAs[t];
   if (/sweatshirt|hoodie|crewneck|fleece/.test(t)) return "sweatshirt";
   if (/shirt|tee|polo|jersey/.test(t))             return "shirt";
   if (/cap|hat|beanie|visor/.test(t))              return "cap";
@@ -53,7 +56,7 @@ function classifyType(type) {
  */
 const DEFAULT_ITEM_WEIGHT_OZ = 8;
 
-export function selectBox(items, presets) {
+export function selectBox(items, presets, packAs) {
   let shirts = 0, sweatshirts = 0, caps = 0, other = 0, totalWeightOz = 0;
   for (const item of items) {
     // Whole pieces only. A storefront cart arrives here already checked (lineQty in db.js), so the box
@@ -63,7 +66,7 @@ export function selectBox(items, presets) {
     const qty = item.qty == null ? 1 : item.qty;
     const wt  = (typeof item.weightOz === "number" && item.weightOz > 0) ? item.weightOz : DEFAULT_ITEM_WEIGHT_OZ;
     totalWeightOz += wt * qty;
-    switch (classifyType(item.type || item.productType || "")) {
+    switch (classifyType(item.type || item.productType || "", packAs)) {
       case "shirt":      shirts      += qty; break;
       case "sweatshirt": sweatshirts += qty; break;
       case "cap":        caps        += qty; break;

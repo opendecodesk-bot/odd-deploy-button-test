@@ -35,7 +35,7 @@ import { classifyHost }  from "../_lib/hostConfig.js";
 import { getCatalogData } from "../_lib/catalogCache.js";
 import { requireAdmin }  from "../_lib/adminAuth.js";
 import { jsonResponse, featureOffResponse }  from "../_lib/http.js";
-import { getOrderForShipping, recordShippingLabel, getShipFromAddress, getOrderLabel, setShippingLabelUrl } from "../_lib/db.js";
+import { getOrderForShipping, recordShippingLabel, getShipFromAddress, getOrderLabel, setShippingLabelUrl, getCategoryPackMap } from "../_lib/db.js";
 import { selectBox } from "../_lib/boxSize.js";
 
 // Fallback box used when selectBox() returns null (order doesn't match a
@@ -173,9 +173,13 @@ export async function onRequestPost(context){
     ? { length: String(orderData.parcelLength), width: String(orderData.parcelWidth), height: String(orderData.parcelHeight) }
     : null;
 
+  // Which package-size limit each product category counts against (migrations/0056); the box
+  // chooser falls back to guessing from the type's wording if this can't be read.
+  let packAs = null;
+  try { packAs = await getCategoryPackMap(env.DB); } catch (e) {}
   const boxResult = parcelOverride ? { box: parcelOverride }
     : savedParcel     ? { box: savedParcel }
-    : selectBox(orderData.items || []);
+    : selectBox(orderData.items || [], null, packAs);
 
   const parcel = (boxResult && boxResult.box) ? boxResult.box : FALLBACK_PARCEL;
 

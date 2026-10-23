@@ -451,6 +451,21 @@ adds the Access email beside it when the two differ.
 - The by-hand roll-up call in [operations.md](operations.md) has to go to one of your shop
   hostnames instead of the admin hostname.
 
+### Vendor connections (PromoStandards)
+
+Tools → **Vendor integrations** fetches product data, your prices and images straight from suppliers
+that offer PromoStandards web services (S&S Activewear, SanMar, OTTO Cap and many more). Each vendor
+gives you a login for them (ask their web services or EDI team). The logins are stored encrypted, under
+a key only your site has. Make it once:
+
+```bash
+openssl rand -hex 32 | npx wrangler secret put VENDOR_CREDENTIALS_KEY
+```
+
+Keep it: a new key makes the saved logins unreadable, and they'd have to be entered again. Without the
+key, Vendor integrations says so and nothing else changes; you can still import a vendor's product
+file (Blanks → + New blank from vendor file…).
+
 ---
 
 ## GitHub (optional)
@@ -498,6 +513,7 @@ Without GitHub you can still back up by hand: create the bucket (step 3), then r
 | `ACCESS_TEAM_DOMAIN` | Cloudflare → Zero Trust | `<team>.cloudflareaccess.com` | No | Installer |
 | `ACCESS_AUD` | The main Access application's settings (not the bypass one) | a long string | No | Installer |
 | `CF_API_TOKEN` | Cloudflare → API Tokens | a long string | Yes | Installer |
+| `VENDOR_CREDENTIALS_KEY` | You make it (`openssl rand -hex 32`) | 64 hex characters | — | `npx wrangler secret put` |
 | `CF_ACCOUNT_ID` | Cloudflare dashboard | letters and digits | No | Installer |
 | `CF_ZONE_ID` | Your domain's Overview page | letters and digits | No | Installer |
 | `R2_PUBLIC_BASE` | The images bucket's custom domain | `https://images.<your domain>` | — | Installer, later run |

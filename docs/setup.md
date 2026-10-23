@@ -100,7 +100,9 @@ expected, not confirmed):
 - *The admin hostname already has a DNS record* — step 9 fails; delete that record in the
   dashboard (DNS) so Cloudflare can create its own, and run again.
 - *`wrangler` prints its answers differently from what the installer expects* — it will say it
-  could not read the answer; do that step by hand (below) and run again.
+  could not read the answer; do that step by hand (below) and run again. `npm ci` installs the
+  `wrangler` version this project is tested with (pinned in `package.json`), and `npx wrangler` uses it;
+  a different global `wrangler` isn't used.
 
 ### Options
 

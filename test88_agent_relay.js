@@ -74,6 +74,23 @@ const browser = (op, body, o) => call(op, body, { agent: false, ...(o || {}) });
   console.log("downloadUrl minted on the admin origin:", r.data.job.downloadUrl.startsWith("https://admin.example.com/api/design?key="));
   console.log("file name sanitised and fileKey not forwarded:", r.data.job.fileName === "logo.dst" && r.data.job.fileKey === undefined);
 
+  console.log("\n=== A read job keeps the listed name, and its answer can carry a design ===");
+  r = await browser("submit", { type: "read", machineIp: "192.168.1.60", fileName: "马头机~1.008" });
+  const readId = r.data.id;
+  r = await call("poll", {});
+  console.log("read job handed to the agent with the name exactly as listed:", r.data.job && r.data.job.type === "read" && r.data.job.fileName === "马头机~1.008");
+  await browser("submit", { type: "read", machineIp: "192.168.1.60", fileName: "Cap Front/../x\u0000.004" });
+  r = await call("poll", {});
+  console.log("…only control characters and path separators are dropped:", r.data.job.fileName === "Cap Front..x.004");
+  console.log("a read without a name is refused:", (await browser("submit", { type: "read", machineIp: "192.168.1.60", fileName: " " })).status === 400);
+  const design = "A".repeat(400 * 1024);   // a 300 KB design as base64
+  r = await call("result", { id: readId, httpStatus: 200, body: { status: "ok", fileName: "x.008", ext: "DSB", dataBase64: design } });
+  console.log("a 400 KB answer is accepted (the old cap was 64 KB):", r.status === 200);
+  r = await browser("result", { id: readId });
+  console.log("…and reaches the browser whole:", r.data.done === true && r.data.result.body.dataBase64.length === design.length);
+  r = await call("result", { id: readId, httpStatus: 200, body: { dataBase64: "A".repeat(1_600_000) } });
+  console.log("an answer over 1.5 MB is refused (413):", r.status === 413);
+
   console.log("\n=== Jobs expire: a job nobody picks up is never run later ===");
   r = await browser("submit", { type: "discover" });
   now += 121 * 1000;

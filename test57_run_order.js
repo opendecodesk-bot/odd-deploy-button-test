@@ -175,7 +175,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
     /EMBROIDERY_AGENT_URL = "http:\/\/127\.0\.0\.1:8787"/.test(adminJs) && /function checkSendAgent_/.test(adminJs) &&
     /function sendDesignToMachine_/.test(adminJs) && /run-send-btn/.test(adminJs));
   console.log("Machine Files tool is in the persistent admin header, routed, and wired to list/delete/send:",
-    /\["machinefiles", "Machine Files"\]/.test(adminJs) && /renderMachineFiles\(app\)/.test(adminJs) &&
+    /\["machinefiles", "Machine files"\]/.test(adminJs) && /renderMachineFiles\(app\)/.test(adminJs) &&
     /function listMachineFiles_/.test(adminJs) && /function deleteMachineFile_/.test(adminJs) &&
     /agentFetch_\("\/list"/.test(adminJs) && /agentFetch_\("\/delete"/.test(adminJs) && /agentFetch_\("\/send"/.test(adminJs));
   console.log("Scan for machines is wired into the Machines screen via the agent's /discover:",

@@ -34,12 +34,12 @@
  * person clicking around would lock the whole office out.
  */
 
-import { rateLimitCheck, rateLimitHit, rateLimitResponse } from "./rateLimit.js";
+import { rateLimitCheck, rateLimitHit, rateLimitResponse, rateLimitCheckGlobal, rateLimitHitGlobal } from "./rateLimit.js";
 import { jsonResponse } from "./http.js";
 import { accessEnabled, verifyAccess } from "./access.js";
 import {
   insertAdminSession, deleteAdminSession, getSettingRaw, setSettingRaw, getAdminSession, setAdminSessionPending,
-  deleteAllAdminSessions, getBootstrapState, insertFirstAdmin, updateUser, replaceRecoveryCodes,
+  deleteAllAdminSessions, getBootstrapState, insertFirstAdmin, updateUser, replaceRecoveryCodes, deleteUserSessions,
 } from "./db.js";
 
 const ADMIN_AUTH_BUCKET = "admin_auth";
@@ -47,6 +47,17 @@ const ADMIN_AUTH_BUCKET = "admin_auth";
 // (see requireAdmin), so this can be tight without ever throttling a signed-in
 // admin clicking around — and those clicks cost no rate-limit writes at all.
 const ADMIN_AUTH_LIMIT  = 10;
+// FAILED sign-in attempts across the whole install, from any address, per 15 minutes. The per-address
+// limit above is no limit against someone with many addresses; this one caps how fast a password,
+// passphrase or code can be guessed at all. While it is used up, NEW sign-ins are refused for the rest
+// of the window — people already signed in are not affected (their session is checked first).
+// ADMIN_AUTH_GLOBAL_LIMIT overrides the number; 0 turns it off.
+export const ADMIN_AUTH_GLOBAL_BUCKET = "admin_auth_all";
+export const ADMIN_AUTH_GLOBAL_WINDOW = 15 * 60;
+export function adminAuthGlobalLimit(env){
+  const n = Number(env && env.ADMIN_AUTH_GLOBAL_LIMIT);
+  return Number.isFinite(n) && String(env.ADMIN_AUTH_GLOBAL_LIMIT).trim() !== "" ? Math.max(0, Math.floor(n)) : 100;
+}
 
 const SESSION_PREFIX  = "sess_";
 export const SESSION_TTL_SEC = 24 * 60 * 60; // 24 hours
@@ -125,6 +136,16 @@ export async function revokeSession(env, token){
   if(token && /^sess_[0-9a-f]{48}$/.test(token) && env.DB){
     await deleteAdminSession(env.DB, await sha256Hex_(token));
   }
+}
+
+// "Sign out everywhere": every session of the user this token belongs to, this one included.
+// Returns that user's id, or null when the token isn't a live session.
+export async function revokeUserSessionsFor(env, token){
+  if(!token || !/^sess_[0-9a-f]{48}$/.test(token) || !env.DB) return null;
+  const sess = await readSession_(env, token);
+  if(!sess || sess === "unavailable" || !sess.user) { await revokeSession(env, token); return null; }
+  await deleteUserSessions(env.DB, sess.user.id);
+  return sess.user.id;
 }
 
 // Returns the active TOTP secret: the one stored in D1 (set via the admin panel) takes
@@ -394,15 +415,33 @@ export async function requireAdmin(env, host, providedKey, request, notAdminMess
     return errorResponse(notAdminMessage || "Not available here.", 403);
   }
 
+  const need = role === "staff" || role === "manager" ? role : "admin";
+  // Someone already signed in is let through BEFORE any failure budget is looked at: junk requests
+  // from the same address (another device on the network, a tab firing requests) mustn't lock a
+  // signed-in user out. A session token is 192 random bits, so checking one is no guessing aid.
+  const hasCookie = !!readCookie(request, SESSION_COOKIE);
+  let result = null;
+  if(hasCookie){
+    result = await checkCredential(env, providedKey, request, need, options || {});
+    if(!result.denied) return null;
+  }
+
   const rl = await rateLimitCheck(env, ADMIN_AUTH_BUCKET, request, ADMIN_AUTH_LIMIT);
   if(rl.blocked) return rateLimitResponse(rl.retryAfter);
+  if(!hasCookie){
+    const all = await rateLimitCheckGlobal(env, ADMIN_AUTH_GLOBAL_BUCKET, adminAuthGlobalLimit(env), ADMIN_AUTH_GLOBAL_WINDOW);
+    if(all.blocked) return rateLimitResponse(all.retryAfter);
+  }
 
-  const need = role === "staff" || role === "manager" ? role : "admin";
-  const { denied, wrongCredential } = await checkCredential(env, providedKey, request, need, options || {});
+  if(!result) result = await checkCredential(env, providedKey, request, need, options || {});
+  const { denied, wrongCredential } = result;
   // Only a rejected credential counts toward the budget. A 503 is our outage, and "your role
   // can't do this" or "finish setting up first" is not a guess at a password.
   if(denied && wrongCredential){
     await rateLimitHit(env, ADMIN_AUTH_BUCKET, request);
+    // A wrong key with no session counts toward the install-wide budget too. A stale session cookie
+    // doesn't: that's an open tab whose session ran out, not a guess.
+    if(!hasCookie) await rateLimitHitGlobal(env, ADMIN_AUTH_GLOBAL_BUCKET, ADMIN_AUTH_GLOBAL_WINDOW);
   }
   return denied;
 }

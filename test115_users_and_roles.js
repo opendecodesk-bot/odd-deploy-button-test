@@ -33,7 +33,7 @@ const SECRET = "JBSWY3DPEHPK3PXP", SECRET2 = "KRSXG5CTMVRXEZLU", SECRET3 = "MFRG
   }
   if (wrong.length) console.log("   " + wrong.join("\n   "));
   ok(`all ${STAFF.length + MANAGER.length + ADMIN_ONLY.length} actions: staff is refused every manager and admin one, a manager every admin one, and an admin none`, wrong.length === 0 && STAFF.length > 150 && MANAGER.length > 25 && ADMIN_ONLY.length >= 9);
-  ok("the four things only an admin does: every Global settings write and the audit log (users and the two-step switch are below)", ["updateGlobalSettings", "updateFeatures", "updateBusinessProfile", "updateLocaleSettings", "updateSalesTaxSettings", "updateShipFromAddress", "updateMachineSettings", "backfillStripeFees", "getAuditLog"].every(a => ADMIN_ONLY.includes(a)));
+  ok("the four things only an admin does: every Global settings write and the audit log (users and the two-step switch are below)", ["updateGlobalSettings", "updateFeatures", "updateBusinessProfile", "updateLocaleSettings", "updateSalesTaxSettings", "updateShipFromAddress", "updateMachineSettings", "updatePricingSettings", "backfillStripeFees", "getAuditLog"].every(a => ADMIN_ONLY.includes(a)));
   ok("a manager reads Global settings, runs the shops and the books; staff does neither", ["getGlobalSettings", "getSetupStatus", "createOrg", "updateOrg", "publish", "listMoney", "reconcileMonth", "closePeriod", "getAccountantExport", "saveExpenseCategory", "createTestTransaction"].every(a => MANAGER.includes(a)));
   ok("staff has the day's work: orders, refunds and voids, labels, production, inventory, catalog content, equipment, expenses, reports, design files", ["getOrdersAllShops", "recordRefund", "voidOrder", "deletePayment", "getOrderForShipping", "startRun", "receiveBlanks", "createProduct", "setTierPrices", "saveGraphic", "saveMachine", "saveHoop", "saveExpense", "getRevenueReport", "getSalesTaxReport", "saveDesign", "getBoxPresets", "getMachineSettings", "listOrgsAdmin"].every(a => STAFF.includes(a)));
   ok("an action nobody has heard of is nobody's — including names every object answers to", !(await A.orders({ action: "constructor" }, staff)).body.orders && (await A.orders({ action: "constructor" }, staff)).status === 403 && (await A.orders({ action: "__proto__" }, admin)).status >= 400 && (await A.orders({ action: "toString" }, manager)).status === 403);
@@ -52,7 +52,7 @@ const SECRET = "JBSWY3DPEHPK3PXP", SECRET2 = "KRSXG5CTMVRXEZLU", SECRET3 = "MFRG
   const gateCalls = [...ordersJs.matchAll(/requireAdmin\(([^\n]*)\)/g)].map(m => m[1]).filter(a => a.trim());
   ok("every gate call in the orders endpoint passes that action's role", gateCalls.length > 50 && gateCalls.every(a => /, ACTION_ROLE\[body\.action\]$/.test(a)));
   // Every API file is either open to the public on purpose, or names the role it needs.
-  const PUBLIC = ["admin-session", "catalog", "checkout", "customer-design", "daily-digest", "image-proxy", "shipping", "stripe-webhook", "upload-verify", "verify"];
+  const PUBLIC = ["admin-session", "catalog", "checkout", "customer-design", "daily-digest", "image-proxy", "invoice", "shipping", "stripe-webhook", "upload-verify", "verify"];
   const NEEDS = { "orders": /ACTION_ROLE\[body\.action\]/, "admin-users": /self \? "staff" : "admin"/, "admin-2fa": /"staff", \{ pending: \["2fa"\] \}/, "admin-password": /"staff", \{ pending: \["account", "password"\] \}/,
     "agent": /, "staff"$/, "design": /, "staff"$/, "receipt": /, "staff"$/, "shippo-label": /, "staff"$/, "upload": /, "staff"$/ };
   const files = fs.readdirSync(__dirname + "/functions/api").filter(f => f.endsWith(".js")).map(f => f.replace(/\.js$/, ""));
@@ -164,7 +164,8 @@ const SECRET = "JBSWY3DPEHPK3PXP", SECRET2 = "KRSXG5CTMVRXEZLU", SECRET3 = "MFRG
   ok("once enrolled — recovery codes in hand — the same session is let through", r.status === 200 && r.body.pending === null && r.body.recoveryCodes.length === 10 && (await A.orders({ action: "getOrdersAllShops" }, enrol)).status === 200);
   ok("someone already enrolled is unaffected: password, code, in", (r = await A.signIn("olive@myshop.com", "correct horse battery", totpNow(SECRET3, 1))).status === 200 && r.body.pending === null);
   ok("while it is required nobody can switch their own two-step off", (r = await A.twoFactor({ action: "disable", code: totpNow(SECRET2) }, enrol)).status === 409 && /required/.test(r.body.message) && !!A.user("samantha@myshop.com").totpSecret);
-  ok("new recovery codes need a code from the app, and replace the old ones", (await A.twoFactor({ action: "newRecoveryCodes", code: "000000" }, enrol)).status === 400 && (r = await A.twoFactor({ action: "newRecoveryCodes", code: totpNow(SECRET2) }, enrol)).status === 200 && r.body.recoveryCodes.length === 10);
+  ok("the code that just turned two-step on can't be used again", (r = await A.twoFactor({ action: "newRecoveryCodes", code: totpNow(SECRET2) }, enrol)).status === 400 && /already used/.test(r.body.message));
+  ok("new recovery codes need a code from the app, and replace the old ones", (await A.twoFactor({ action: "newRecoveryCodes", code: "000000" }, enrol)).status === 400 && (r = await A.twoFactor({ action: "newRecoveryCodes", code: totpNow(SECRET2, 1) }, enrol)).status === 200 && r.body.recoveryCodes.length === 10);
   await A.users({ action: "reset2fa", id: sam }, boss);
   ok("after an admin resets it, that user must enrol again at their next sign-in", (await A.signIn("samantha@myshop.com", "samantha's second password")).body.pending === "2fa");
   const fresh = await A.users({ action: "create", name: "Nia New", email: "nia@myshop.com", role: "staff" }, boss);
@@ -183,17 +184,17 @@ const SECRET = "JBSWY3DPEHPK3PXP", SECRET2 = "KRSXG5CTMVRXEZLU", SECRET3 = "MFRG
   const adminJs = read("public/admin.js");
   const cut = (start, end) => { const i = adminJs.indexOf(start); const j = adminJs.indexOf(end, i); if (i < 0 || j < 0) throw new Error("admin.js no longer has: " + start); return adminJs.slice(i, j); };
   const roles = (me) => new Function("adminMe", "ADMIN_NAV_GROUPS", "adminPageOn_",
-    cut("const adminRoleRank_", "// The email typed") .replace("// After a step is finished", "") .split("// The marker also remembers")[0] + cut("const ADMIN_MANAGER_PAGES", "function renderRoleOff_") +
-    "\nreturn { adminCan_, adminPageRole_, adminNavGroups_ };")(me, new Function(cut("const ADMIN_NAV_GROUPS = [", "// Flat list of every page hash") + "\nreturn ADMIN_NAV_GROUPS;")(), () => true);
+    cut("const adminRoleRank_", "// The email typed") .replace("// After a step is finished", "") .split("// The marker also remembers")[0] + cut("const ADMIN_ONLY_PAGES", "function renderRoleOff_") +
+    "\nreturn { adminCan_, adminPageRole_, adminNavGroups_, adminCanOpen_ };")(me, new Function(cut("const ADMIN_NAV_GROUPS = [", "// Flat list of every page hash") + "\nreturn ADMIN_NAV_GROUPS;")(), () => true);
   const pagesFor = (role) => roles(role ? { role } : null).adminNavGroups_().flatMap(g => g.items.filter(Array.isArray).map(i => i[0]));
   const R = roles({ role: "staff" });
-  ok("each page has a lowest role: Users and the audit log are an admin's; Global settings, package sizes, shops and the books a manager's", ["users", "audit"].every(p => R.adminPageRole_(p) === "admin") &&
-    ["settings", "catalog/settings", "packages", "money", "reconcile", "books", "catalog/new-org", "catalog/orgs/league-101/edit"].every(p => R.adminPageRole_("#" + p) === "manager") &&
+  ok("each page has a lowest role: Users, the audit log and Global settings are an admin's; package sizes, shops and the books a manager's", ["users", "audit", "settings", "catalog/settings"].every(p => R.adminPageRole_(p) === "admin") &&
+    ["packages", "money", "reconcile", "books", "catalog/new-org", "catalog/orgs/league-101/edit"].every(p => R.adminPageRole_("#" + p) === "manager") &&
     ["orders", "", "catalog", "catalog/orgs/league-101/products", "inventory", "expenses", "revenue", "designs/league-101", "security", "password", "machines"].every(p => R.adminPageRole_(p) === "staff"));
   ok("the menu a Back office user sees has none of the manager's or admin's pages; a manager's has no Users or Audit Log; an admin's has everything", !pagesFor("staff").some(p => ["users", "audit", "settings", "packages", "money", "reconcile", "books"].includes(p)) && pagesFor("staff").includes("expenses") && pagesFor("staff").includes("password") &&
-    ["settings", "money", "books"].every(p => pagesFor("manager").includes(p)) && !pagesFor("manager").includes("users") && !pagesFor("manager").includes("audit") && ["users", "audit", "settings"].every(p => pagesFor("admin").includes(p)));
+    ["packages", "money", "books"].every(p => pagesFor("manager").includes(p)) && !pagesFor("manager").includes("users") && !pagesFor("manager").includes("audit") && !pagesFor("manager").includes("settings") && ["users", "audit", "settings"].every(p => pagesFor("admin").includes(p)));
   ok("a role the page doesn't know hides nothing (the server still refuses): nobody is locked out of the menu by a newer server", pagesFor(null).includes("users") && pagesFor("auditor").includes("users") && pagesFor("constructor").includes("settings"));
-  ok("Users is in the Security menu, with 2FA, Change password and Sign out", /\{ label: "Security", items: \[ \["users", "Users"\], \["security", "Security \(2FA\)"\], \["password", "Change password"\], \{ action: "adminSignOut\(\)", label: "Sign out" \} \]\}/.test(adminJs));
+  ok("Users is in the Settings menu, with 2FA, Change password, Sign out and Sign out everywhere", /\["users", "Users"\], \["security", "Security \(2FA\)"\], \["password", "Change password"\],\s*\{ action: "adminSignOut\(\)", label: "Sign out" \}, \{ action: "adminSignOutEverywhere\(\)", label: "Sign out everywhere" \}/.test(adminJs));
   const route = cut("async function adminRoute()", "function promptAdminPassphrase");
   ok("the router shows a step that is owed before any page, and a page above the user's role says so instead of loading", route.indexOf("if (adminPending) { renderPendingStep_(app); return; }") > 0 && route.indexOf("if (adminPending)") < route.indexOf("renderOrdersPage(app)") &&
     route.indexOf("if (!adminCan_(adminPageRole_(raw))) { renderRoleOff_(app, raw); return; }") > 0 && route.indexOf("renderRoleOff_") < route.indexOf("renderOrdersPage(app)") && /if \(raw === "users"\) \{ renderUsers\(app\); return; \}/.test(route));
@@ -233,15 +234,17 @@ const SECRET = "JBSWY3DPEHPK3PXP", SECRET2 = "KRSXG5CTMVRXEZLU", SECRET3 = "MFRG
   ok("changing a password: a refusal is shown and the user stays signed in", /not right/.test(f.els.pwError.textContent) && f.out.signedOut === 0 && f.els.pwSubmit.disabled === false);
   f = await chg({}, { ok: true, json: async () => ({ status: "ok", signInAgain: true }) });
   ok("…success signs out, for a fresh sign-in with the new password", f.out.signedOut === 1 && /Sign in with the new one/.test(f.out.toast));
-  // Global settings as a manager: readable, nothing can be changed.
-  const controls = [{ disabled: false }, { disabled: false }, { disabled: false }], inserted = [];
-  const readOnly = (me) => new Function("adminCan_", "document", cut("function globalSettingsReadOnly_(){", "// One-time maintenance") + "\nglobalSettingsReadOnly_();")(
-    roles(me).adminCan_, { getElementById: () => ({ querySelectorAll: () => controls, insertBefore: (n) => inserted.push(n), firstChild: null }), createElement: () => ({ style: {} }) });
-  readOnly({ role: "admin" });
-  const untouched = controls.every(c => !c.disabled) && inserted.length === 0;
-  readOnly({ role: "manager" });
-  ok("Global settings for a manager: every control is switched off and a note says an admin makes changes; for an admin nothing is touched", untouched && controls.every(c => c.disabled) && inserted.length === 1 && /An admin makes changes here/.test(inserted[0].innerHTML));
-  ok("the buttons that make or publish shops are drawn only for a manager or above", /\$\{adminCan_\("manager"\) \? `<button class="admin-btn" onclick="location\.hash='#catalog\/new-org'">\+ New Org<\/button>/.test(adminJs));
+  // What a user can't use isn't shown at all: no menu entry, no link, no button.
+  ok("Global settings is an admin's alone: hidden from a manager's menu, and only an admin can open it", !roles({ role: "manager" }).adminCanOpen_("settings") && roles({ role: "admin" }).adminCanOpen_("settings") &&
+    !adminJs.includes("globalSettingsReadOnly_"));
+  ok("the page asks the server who is signed in before drawing the menu (a missing or stale copy can't show everything)",
+    /await refreshAdminMe_\(\);\s*renderAdminNav\(\);/.test(cut("async function loadAdminOrgList(){", "function renderPickerOrgButtons")) && /action: "me"/.test(cut("async function refreshAdminMe_(){", "async function loadAdminOrgList(){")));
+  ok("sign-in only takes an admin to Global settings to finish setup; the 'turned off' page only offers it to an admin", /if \(!adminCanOpen_\("settings"\)\) return;/.test(cut("async function openSettingsIfSetupIncomplete_", "function renderPickerOrgButtons")) &&
+    /\$\{adminCanOpen_\("settings"\) \? `<button class="admin-btn" onclick="location\.hash='#settings'">Open Global settings<\/button>` : ""\}/.test(adminJs));
+  ok("buttons for what only a manager may do aren't drawn for back office: a shop's Edit, Publish in the shop bar, Create test transaction, managing expense categories",
+    /\$\{adminCanOpen_\("catalog\/orgs\/" \+ o\.orgId \+ "\/edit"\) \? `<button/.test(adminJs) && /const pubBtn = !shop \|\| !manager \? ""/.test(adminJs) &&
+    /\$\{adminCan_\("manager"\) \? `<button class="admin-btn" data-org="\$\{escapeHtml\(selectedOrgId\)\}" onclick="createTestTransaction/.test(adminJs) && /\$\{adminCan_\("manager"\) \? `<button type="button" class="admin-btn" id="expCatManage"/.test(adminJs));
+  ok("the buttons that make or publish shops are drawn only for a manager or above", /\$\{adminCan_\("manager"\) \? `<button class="admin-btn wiz-start-btn" onclick="location\.hash='#wizard\/new'">＋ New shop setup<\/button>/.test(adminJs));
   ok("the Users page offers the three roles by their names, and the two-step switch", /const ADMIN_ROLE_LABELS = \{ staff: "Back office", manager: "Manager", admin: "Admin" \};/.test(adminJs) && /Require two-step sign-in for everyone/.test(adminJs) && /usersCall_\(\{action: "setRequire2fa", on\}\)/.test(adminJs));
   ok("recovery codes are shown once, at enrolment, and the forced enrolment only moves on when the user says they have them", /render2FACodes_\(data\.recoveryCodes, after\)/.test(adminJs) && /if\(wasForced\)\{ _tfa\.forced = false; adminStepDone_\(data\.pending\); \}/.test(adminJs));
 

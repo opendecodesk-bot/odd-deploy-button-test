@@ -30,7 +30,7 @@
 import { classifyHost } from "../_lib/hostConfig.js";
 import { getCatalogData } from "../_lib/catalogCache.js";
 import { jsonResponse } from "../_lib/http.js";
-import { getReadyToShipByOrg } from "../_lib/db.js";
+import { getReadyToShipByOrg, getBlankReadyByOrg, getDraftCatalogShop, verifyPreviewToken } from "../_lib/db.js";
 
 // Computes which payment methods are enabled for an org.
 // Result is the intersection of:
@@ -93,7 +93,7 @@ function toClientProduct(p){
     images: p.images.map(normImageUrl), features: p.features,
     personalizationPrice: p.personalizationPrice,
     personalizationOptions: p.personalizationOptions || [],
-    weightOz: p.weightOz ?? null
+    weightOz: p.shipWeightOz ?? p.weightOz ?? null
   };
   if(p.pricingMode === "flat"){
     out.flatPrice = p.flatPrice;
@@ -107,11 +107,23 @@ function toClientProduct(p){
   if(p.customDesign){
     out.customDesign = { kind: p.customDesign, price: p.customDesignPrice ?? null, required: !!p.customDesignRequired };
   }
+  // Versions of a product (migrations/0059): the shop page shows products sharing a versionGroup as one
+  // card with a toggle labelled by versionLabel ("Short sleeve | Long sleeve").
+  // What decorates it, in words (name + decoration location), so the shop page can say so with or without a picture.
+  if(Array.isArray(p.decorations) && p.decorations.length) out.decorations = p.decorations.slice(0, 12).map(d => ({
+    kind: String(d.kind || ""), name: String(d.name || ""), location: String(d.location || "") }));
+  if(p.versionGroup){ out.versionGroup = String(p.versionGroup); out.versionLabel = String(p.versionLabel || ""); }
   // Configurable products (migrations/0036): per-location option menus + garment colors.
   if(p.configurable){
     out.configurable = true;
     out.garmentColors = p.garmentColors || [];
     out.locations = p.locations || [];
+    // Printed transfers that are part of the product (migrations/0068): it's decorated without any pick, so every
+    // location may be left at None. Only the fact is sent — which graphics they are is the shop's business.
+    if((p.fixedTransfers || []).length) out.hasFixedTransfers = true;
+    // Color price groups (migrations/0064): a color in a group is priced by its group, else by sizePricing/flatPrice.
+    if((p.colorGroups || []).length) out.colorGroups = p.colorGroups.map(g => ({ label: g.label, colors: g.colors || [],
+      ...(g.flatPrice != null ? { flatPrice: g.flatPrice } : { sizePricing: g.sizePricing || {} }) }));
   }
   // Per-color images from the product's linked blank colors (migrations/0037); the storefront
   // prefers these over the product's own images. Image URLs re-normalised on the way out.
@@ -132,6 +144,10 @@ function toClientProduct(p){
       if(u) gi[k] = u;
     }
     if(Object.keys(gi).length) out.graphicImages = gi;
+    // Which keys are its printed transfers' (migrations/0068): shown with the configurable preview, or as a plain
+    // product's first pictures. Only location / graphic ids and the location's name.
+    if(Array.isArray(p.fixedMockups) && p.fixedMockups.length) out.fixedMockups = p.fixedMockups.map(f => ({
+      locationId: Number(f.locationId), graphicId: Number(f.graphicId), label: String(f.label || "") }));
   }
   return out;
 }
@@ -186,7 +202,15 @@ export async function onRequestGet(context){
     return jsonResponse({status:"closed", message:"Online ordering isn't available here.", business: catalogData.business || {}, country, features});
   }
 
-  const org = orgId && catalogData.orgs[orgId];
+  let org = orgId && catalogData.orgs[orgId];
+  // The admin's draft preview (migrations/0076): ?preview=<token signed for THIS shop> serves the shop's live,
+  // unpublished rows (never cached). Anything else — a bad or expired token — is just the published shop.
+  let preview = false;
+  const previewToken = url.searchParams.get("preview");
+  if(org && previewToken && host.kind === "locked" && env.DB && await verifyPreviewToken(env, orgId, previewToken)){
+    try{ const draft = await getDraftCatalogShop(env.DB, orgId); if(draft){ org = draft; preview = true; } }
+    catch(e){ console.error("draft preview failed:", e); }
+  }
   if(!org){
     // The root domain always lands here (it serves no shop): one answer, 200,
     // whatever ?org= says, so probing ?org=<guess> can't enumerate org IDs.
@@ -214,9 +238,15 @@ export async function onRequestGet(context){
       console.error("ready_to_ship fetch failed:", e);
     }
   }
+  // "Ready to decorate": the linked blank's free stock per color + size (display only; non-fatal).
+  let blankReady = {};
+  if(env.DB){
+    try{ blankReady = await getBlankReadyByOrg(env.DB, orgId); }
+    catch(e){ console.error("blank-ready fetch failed:", e); }
+  }
 
   return jsonResponse({
-    status:"ok", orgId,
+    status:"ok", orgId, ...(preview ? { preview: true } : {}),
     business: catalogData.business || {},   // who runs the site: name, contact, how to pay by Venmo/Zelle/check
     country,   // "US" or "OTHER" (Global settings → Region): which address format the forms use
     features,  // Global settings → Features ({} or a missing key = on)
@@ -231,7 +261,9 @@ export async function onRequestGet(context){
       // Carrier rates need a US ZIP, so outside the US the shipping entry isn't offered — nor when
       // the Shipping feature is switched off.
       deliveryOptions: (org.deliveryOptions || []).filter(o => carrierShipping || o.type !== "shipping").map(o => ({ id: o.id, type: o.type, label: o.label, fee: o.fee })),
-      products: org.products.map(p => ({ ...toClientProduct(p), stock: stockByProduct[p.productId] || null })),
+      // The storefront's sections, in the managed order (migrations/0056) — only the ones this shop uses.
+      categories: (catalogData.categories || []).filter(c => org.products.some(p => p.type === c.key)).map(c => ({ key: c.key, label: c.label })),
+      products: org.products.map(p => ({ ...toClientProduct(p), stock: stockByProduct[p.productId] || null, blankStock: blankReady[p.productId] || null })),
       // Configurable-product option catalog + tier prices (migrations/0036); only present when the
       // org has configurable products. Image URLs re-normalised on the way out.
       graphics: (org.graphics || []).map(g => ({ ...g, imageUrl: normImageUrl(g.imageUrl), thumbUrl: normImageUrl(g.thumbUrl) })),

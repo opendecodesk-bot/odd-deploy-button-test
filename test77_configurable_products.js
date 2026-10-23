@@ -106,7 +106,9 @@ const near = (a, b) => Math.abs(a - b) < 0.005;
   ok("blank + transfer received → READY, card shows the blank and the graphic", !!card && card.blank.name === "63374" && card.transfers.some(t => t.graphicName === "Lockup"));
 
   r = await call({ action: "getGangSheet" });
-  ok("gang sheet totals transfers by graphic × ink × size", r.body.rows.some(x => x.graphic === "Lockup" && x.size === "L" && x.count === 1));
+  // Its transfers are in hand (marked received, and in stock), so there's nothing left to print for it —
+  // the gang sheet's totalling is covered by test100 / test134.
+  ok("gang sheet leaves out a line whose transfers are in hand", r.status === 200 && !r.body.rows.some(x => x.graphic === "Lockup"));
 
   r = await call({ action: "makeTransferLine", org: "colonnade", orderId: "O1", itemId });
   ok("mark made succeeds and completes the order", r.status === 200 && r.body.orderComplete === true);
@@ -208,8 +210,8 @@ const near = (a, b) => Math.abs(a - b) < 0.005;
     /prods: locMap\[k\]\.prods/.test(a) && /prods: colorMap\[c\]\.prods/.test(a) &&
     /gfChecklist_\(\(ctx\.allLocations/.test(a) && /gfChecklist_\(\(ctx\.allColors/.test(a) &&
     /querySelectorAll\("#gfLocs \.gfLocChk:checked"\)/.test(a) && /querySelectorAll\("#gfColors \.gfColorChk:checked"\)/.test(a));
-  ok("the form explains leaving boxes unchecked offers everywhere a product menu includes the graphic",
-    /Leave all unchecked to offer wherever a product's own location menu includes this graphic/.test(a));
+  ok("the form explains leaving boxes unchecked offers it wherever a product offers the graphic",
+    /Leave all unchecked to offer it wherever a product offers this graphic/.test(a));
 
   const h = read("public/index.html");
   ok("storefront: configurable branch + configurator + cart config",

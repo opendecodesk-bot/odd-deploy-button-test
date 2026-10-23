@@ -5,13 +5,12 @@ const { JSDOM, ResourceLoader } = require("jsdom");
 // extractPdfItems_ talks to pdf.js and can't run outside a browser — everything else
 // is a pure function over plain {str,x,y,page} items, tested here (via jsdom loading
 // the real admin.js, same pattern test44/test45 use for client-side parsers) against
-// position data in the shape pdf.js produces for 8 sample invoices (4 in S&S Activewear's
-// layout, 4 in SanMar's) — testlib/fixtures/pdf-order-items.json. The layouts are the
-// vendors' own and the items are styles from their public catalogues; the quantities,
-// prices, dates, totals and warehouses in them are made up. Each
-// sample's parsed line-item sum is checked against the subtotal printed on that
-// invoice, so a drift in the parsing logic shows up as a concrete dollar mismatch,
-// not just a changed snapshot.
+// position data captured by running pdf.js itself against 8 real supplier invoices (4 S&S, 4 SanMar) —
+// testlib/fixtures/pdf-order-items.json. The layout (every x / y) is the real one; every value in it —
+// prices (doubled), order / invoice / tracking numbers, the buyer's name, address, email and card, the
+// SanMar product names and styles — is made up. Each sample's parsed line-item sum is checked against that
+// invoice's own printed subtotal, so a drift in the parsing logic shows up as a
+// concrete dollar mismatch, not just a changed snapshot.
 
 const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
 const items = JSON.parse(read("testlib/fixtures/pdf-order-items.json"));
@@ -28,17 +27,17 @@ const items = JSON.parse(read("testlib/fixtures/pdf-order-items.json"));
   const qtySum = (r) => r.groups.reduce((t, g) => t + g.lines.reduce((a, l) => a + l.qty, 0), 0);
   const lineSum = (r) => Math.round(r.groups.reduce((t, g) => t + g.lines.reduce((a, l) => a + l.qty * l.unitCost, 0), 0) * 100) / 100;
 
-  console.log("=== Each sample invoice: parsed totals match the invoice's own printed numbers ===");
+  console.log("=== Each sample invoice (real layouts, made-up values): parsed totals match the invoice's own printed numbers ===");
   const expect = {
     // [vendor, invoice/order ref, receivedAt, shipping&other, groups, total pieces, line-item $ total]
-    ss1: ["S&S Activewear", "10000001", "2026-06-14", 0, 9, 65, 369.96],
-    ss2: ["S&S Activewear", "10000002", "2026-06-12", 0, 6, 70, 330.78],
-    ss3: ["S&S Activewear", "10000003", "2026-06-12", 0, 4, 13, 87.16],
-    ss4: ["S&S Activewear", "10000004", "2026-06-12", 0, 3, 10, 106],
-    sm1: ["SanMar", "SO-100000001", "2026-08-23", 0, 11, 57, 432.89],
-    sm2: ["SanMar", "SO-100000002", "2026-07-22", 0, 4, 34, 350.72],
-    sm3: ["SanMar", "SO-100000003", "2026-05-20", 39.03, 14, 62, 265.2],
-    sm4: ["SanMar", "SO-100000004", "2026-07-06", 19.74, 3, 28, 168.01],
+    ss1: ["S&S", "910000001", "2026-06-22", 0, 9, 43, 404.26],
+    ss2: ["S&S", "910000003", "2026-05-14", 0, 6, 61, 478.78],
+    ss3: ["S&S", "910000005", "2026-05-14", 0, 4, 8, 82],
+    ss4: ["S&S", "910000006", "2026-05-14", 0, 3, 5, 89.04],
+    sm1: ["SanMar", "SO-110000007", "2026-09-08", 0, 11, 37, 447.3],
+    sm2: ["SanMar", "SO-110000010", "2026-08-24", 0, 4, 21, 415.64],
+    sm3: ["SanMar", "SO-110000013", "2026-04-28", 76.9, 14, 43, 319.7],
+    sm4: ["SanMar", "SO-110000016", "2026-06-21", 35.2, 3, 17, 131.54],
   };
   const results = {};
   for (const [key, [vendor, ref, date, ship, groups, qty, total]] of Object.entries(expect)) {
@@ -59,11 +58,11 @@ const items = JSON.parse(read("testlib/fixtures/pdf-order-items.json"));
   const sm1 = results.sm1;
   const trueNavy = sm1.groups.find(g => g.color === "True Navy");
   console.log("a color wrapping across two lines with different x (SanMar's 'True'/'Navy') reassembles as one color, and its two sizes stay one blank:",
-    !!trueNavy && trueNavy.description === "Sport-Tek® Micropique Sport-Wick® Polo" &&
+    !!trueNavy && trueNavy.description === "Demo Sport® Fine Pique Quick-Dry® Polo" &&
     JSON.stringify(trueNavy.lines.map(l => l.size).sort()) === '["L","XL"]');
   const cap = sm1.groups.find(g => g.color === "True Kelly Green");
   console.log("a color wrapping across two lines with EACH line itself having two words (SanMar's 'True Kelly'/'Green') still comes out whole:", !!cap);
-  console.log("the ignored Warehouse column ('Phoenix, AZ') never leaks into Size:", sm1.groups.every(g => g.lines.every(l => !/Phoenix|AZ/.test(l.size))));
+  console.log("the ignored Warehouse column ('Richmond, VA') never leaks into Size:", sm1.groups.every(g => g.lines.every(l => !/Richmond|VA/.test(l.size))));
   console.log("a leading '*' (S&S's not-returnable flag) is stripped from the description, not kept as a separate near-duplicate blank:",
     results.ss2.groups.some(g => g.description === "JERZEES - Men's Dri-Power® Polo - 437R") && !results.ss2.groups.some(g => /^\*/.test(g.description)));
 
@@ -109,7 +108,7 @@ const items = JSON.parse(read("testlib/fixtures/pdf-order-items.json"));
     w.guessBlankType_({ description: "C2 Sport Performance T-Shirt" }) === "shirt" &&
     w.guessBlankType_({ description: "mystery item" }) === "shirt");
   console.log("the import preview has a per-row Type dropdown and no longer hardcodes productType:",
-    /class="pi-type"/.test(adminJs) && /BLANK_PRODUCT_TYPES\.map/.test(adminJs) && !/productType: "shirt"/.test(adminJs) && /productType: type/.test(adminJs));
+    /class="pi-type"/.test(adminJs) && /categoryOptionsHtml_\(guessBlankType_\(g\)\)/.test(adminJs) && !/productType: "shirt"/.test(adminJs) && /productType: type/.test(adminJs));
   console.log("the Type dropdown disables when a row is mapped to an existing blank:",
     /\.pi-blank"\)\.forEach\(sel => sel\.addEventListener\("change"[\s\S]{0,180}pi-type/.test(adminJs));
 })();

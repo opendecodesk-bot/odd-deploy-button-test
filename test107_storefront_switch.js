@@ -53,13 +53,14 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
   const admin = (body) => post("admin", Object.assign({ key: "x" }, body));
   const setF = async (features) => { const r = await admin({ action: "updateFeatures", features }); await tick(20); return r; };
   const place = (id, host) => post(host || "acme", { orderId: id, orgId: "acme", customerName: "Cust", contact: "c@x.com", paymentMethod: "Venmo", items: [{ productId: "tee", size: "M", qty: 1 }] });
-  const catalog = new Function(hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => [];\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
+  const catalog = new Function(hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
   catalog.set(catalogData);
   const cat = async (host) => { const res = await catalog.get({ request: { url: `https://${hostname(host)}/api/catalog` }, env }); return { status: res.status, text: await res.text() }; };
   const catJ = async (host) => JSON.parse((await cat(host)).text);
+  const { orderTokenFor } = require("./testlib/order-token");
   const checkout = new Function("getCatalogData", hostSrc + "\n" + httpSrc + "\nconst rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
     dbSrc + "\n" + strip(read("functions/api/checkout.js")) + "\nreturn onRequestPost;")(catalogData);
-  const pay = async (host, orderId) => { const res = await checkout({ env, request: { url: `https://${hostname(host)}/api/checkout`, json: async () => ({ orderId, orgId: "acme" }), headers: { get: () => null } } }); return { status: res.status, body: JSON.parse(await res.text()) }; };
+  const pay = async (host, orderId) => { const res = await checkout({ env, request: { url: `https://${hostname(host)}/api/checkout`, json: async () => ({ orderId, orgId: "acme", checkoutToken: await orderTokenFor(env, orderId) }), headers: { get: () => null } } }); return { status: res.status, body: JSON.parse(await res.text()) }; };
   const g = { rateLimited: async () => ({ blocked: false }), getBoxPresets: async () => null, selectBox: () => ({ box: {}, packing: 0, boxWeightOz: 0 }), getProductsByOrg: async () => [{ productId: "tee", type: "shirt", weightOz: 6 }], getShipFromAddress: async () => ({ zip: "43004" }), ...new Function(dbSrc + "\nreturn { lineQty, QTY_MESSAGE };")() };
   const shipping = new Function("g", "getCatalogData", "const { rateLimited, getBoxPresets, selectBox, getProductsByOrg, getShipFromAddress, lineQty, QTY_MESSAGE } = g; const rateLimitResponse = () => null;\n" +
     hostSrc + "\n" + httpSrc + "\n" + strip(read("functions/_lib/quoteToken.js")) + "\n" + strip(read("functions/api/shipping.js")) + "\nreturn onRequestPost;")(g, catalogData);

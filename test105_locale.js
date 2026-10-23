@@ -143,7 +143,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const handId = (await lib.getOrgById(d1, "acme")).deliveryOptions[1].id;
 
   const catalog = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +
-    "const getReadyToShipByOrg = async () => [];\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
+    "const getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
   catalog.set(async () => lib.getPublicCatalogData(d1));
   const cat = async (host) => { const res = await catalog.get({ request: { url: `https://${host}.example.com/api/catalog` }, env }); return JSON.parse(await res.text()); };
   let c = await cat("shipper");

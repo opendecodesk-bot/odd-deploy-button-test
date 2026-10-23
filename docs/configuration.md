@@ -48,6 +48,7 @@ Also in `wrangler.toml`: the **hostnames** the Worker serves (`routes`), and the
 | `CF_ZONE_ID` | with automatic hostnames | — | The zone id of your domain. |
 | `CF_WORKER_NAME` | with automatic hostnames | — | This Worker's name (the `name` in `wrangler.toml`). |
 | `TURNSTILE_SITE_KEY` | with Turnstile | — | The public half of a Turnstile widget; sent to the storefront. |
+| `ADMIN_AUTH_GLOBAL_LIMIT` | no | `100` | Failed sign-ins allowed across the whole site, from any address, per 15 minutes; past it, new sign-ins wait for the window to end (people already signed in aren't affected). `0` turns it off. Each address also has its own limit of 10 a minute. |
 | `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` | with Cloudflare Access | — | Turn on Cloudflare Access checking for the admin. See the warning below. |
 
 Older names the code still reads, for installs that already use them — don't set these on a new
@@ -62,7 +63,7 @@ Set by `npm run setup`, or one at a time with `npx wrangler secret put NAME`.
 | Name | Required | What it does |
 |---|---|---|
 | `PROXY_ADMIN_PASSPHRASE` | **yes** | The way in to a new install, and the key every user's password is stored under. Without it nobody can sign in. The installer generates one and shows it once; the first sign-in with it creates the first admin, and from then on it opens nothing. Replacing it (`npm run setup -- --new-passphrase`) gets a locked-out admin back in, and voids **every** user's password. |
-| `SIGNING_SECRET` | **yes** | Signs carrier shipping quotes (so a customer can't change the price) and the short-lived links that open receipts and design files. Any long random string. |
+| `SIGNING_SECRET` | **yes** | Signs carrier shipping quotes (so a customer can't change the price) the short-lived links that open receipts and design files, and a shop's draft preview link. Any long random string. |
 | `CRON_SECRET` | no | Only for starting the morning roll-up by hand (`POST /api/daily-digest` with `{"key": …}`). The scheduled roll-up doesn't use it. |
 | `STRIPE_SECRET_KEY` | for card payments | Your Stripe secret key. Without it "Card" isn't offered at checkout. |
 | `STRIPE_WEBHOOK_SECRET` | with Stripe | The signing secret of the Stripe webhook endpoint. **Without it, card payments are taken but never recorded on their orders** — the webhook is refused. |
@@ -71,6 +72,7 @@ Set by `npm run setup`, or one at a time with `npx wrangler secret put NAME`.
 | `CF_EMAIL_API_TOKEN` | one email provider | A Cloudflare API token with only the Email Sending permission (used with `CF_ACCOUNT_ID`). |
 | `TURNSTILE_SECRET_KEY` | with Turnstile | The secret half of the Turnstile widget. **Set it together with `TURNSTILE_SITE_KEY`** — the secret alone refuses every order. |
 | `CF_API_TOKEN` | with automatic hostnames | A Cloudflare API token that can attach hostnames to this Worker. It can change your account, so give it the narrowest permissions that work (see [shops-and-domains.md](shops-and-domains.md)). |
+| `VENDOR_CREDENTIALS_KEY` | with vendor connections | Encrypts the logins saved under Tools → Vendor integrations (PromoStandards). Any long random string, set once: changing it makes the saved logins unreadable (enter them again). Without it vendors can't be connected; everything else works. |
 | `AGENT_TOKEN` | with the send-agent relay | Shared with the send-agent program; at least 32 characters, or the relay stays off. |
 
 Older names still read as fallbacks: `QUOTE_SIGNING_SECRET` and `LINK_SIGNING_SECRET` (used when
@@ -95,7 +97,7 @@ when that install's owner becomes its first user, and each user's own secret is 
 | Section | What it holds | Default | Notes |
 |---|---|---|---|
 | **Setup status** | Read-only: which of the things on this page are set. | — | |
-| **Business profile** | Business name, one-line description, footer line, contact email shown to customers, your own inbox, a receipts inbox, Venmo username, Zelle contact, "checks payable to", "mail checks to". | all blank ("Our shop" stands in for a missing name) | Live as soon as saved. |
+| **Business profile** | Business name, one-line description, footer line, contact email shown to customers, your own inbox, a receipts inbox, Venmo username, Zelle contact, "checks payable to", "mail checks to", the purchase order prefix for orders placed with suppliers. | all blank ("Our shop" stands in for a missing name) | Live as soon as saved. |
 | **Region** | Time zone; country (`US` or `OTHER`). | time zone from `TIMEZONE`, else UTC; country `US` | Country `OTHER` makes addresses free text and turns carrier shipping off. |
 | **Features** | Five switches: Storefront, Production, Bookkeeping, Shipping, Design approval. | all on | See the README. Live within about half a minute. |
 | **Payment methods** | Which of Card, Venmo, Zelle, Check are offered, site-wide. Each shop can turn more off, never back on. | all on (Card also needs Stripe) | **The one section that needs Publish** (Manage catalog → Publish) to reach the storefront. |

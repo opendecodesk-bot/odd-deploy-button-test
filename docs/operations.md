@@ -24,7 +24,8 @@ daylight-saving changes.
 4. Collects what is new since the last roll-up: orders (not test or voided ones), payments, refunds
    and disputes, customers' answers to design proofs, deliveries and pickups, failed admin sign-ins,
    and problems (an email that couldn't be sent, a Stripe webhook that failed, a roll-up that
-   failed).
+   failed). With the Production feature on, it also lists machine maintenance that's due (never a
+   reason to send on its own).
 5. Sends one email. If there is **nothing new**, the scheduled run sends a short "nothing new"
    email instead, so a quiet morning can't be mistaken for "it didn't run".
 
@@ -186,8 +187,10 @@ People sign in with their own email and password. An admin manages them under
 | Role | Shown as | Can use |
 |---|---|---|
 | `staff` | Back office | Orders, payments and refunds, shipping labels, production, inventory, catalog content, equipment lists, expenses, reports, design files |
-| `manager` | Manager | All of that, plus creating and editing shops, custom domains, Publish, package sizes, the books (accounts and money, reconciling, expense categories, closing periods, the accountant's export). Can read Global settings |
-| `admin` | Admin | Everything, plus Users, the "Require two-step sign-in" switch, the audit log and every change to Global settings |
+| `manager` | Manager | All of that, plus creating and editing shops, custom domains, Publish, package sizes, the books (accounts and money, reconciling, expense categories, closing periods, the accountant's export) |
+| `admin` | Admin | Everything, plus Users, the "Require two-step sign-in" switch, the audit log and Global settings |
+
+What a role can't use isn't shown: no menu entry, link or button for it.
 
 - **Adding someone:** name, email, role. You are shown a temporary password once; give it to
   them. They must choose their own the first time they sign in.
@@ -201,6 +204,12 @@ People sign in with their own email and password. An admin manages them under
 - **Require two-step sign-in** (the checkbox under the list): nobody is signed out. At their
   next sign-in, anyone without an authenticator app must set one up before anything else opens,
   and is given ten recovery codes. Turn your own on first.
+- **A lost or shared computer:** Security → **Sign out everywhere** ends every session you have, on
+  every device, this one included. Turning your two-step sign-in on or off also signs your other
+  devices out.
+- **Failed sign-ins are limited:** 10 a minute from one address (an IPv6 address counts by its /64),
+  and 100 every 15 minutes across the whole site from anywhere (`ADMIN_AUTH_GLOBAL_LIMIT`, see
+  [configuration.md](configuration.md)). Someone already signed in is never locked out by them.
 - **Everything above is in the audit log** (Reports → Audit Log → Security & users).
 
 ### Locked out
@@ -235,3 +244,47 @@ own settings, so reset it key by key, not as a whole table.
 - **Tools → Global settings → Setup status** — anything not configured.
 - **The Worker's logs in the Cloudflare dashboard** — errors the code logged (`wrangler.toml` turns
   on `[observability]`).
+
+## Machine maintenance
+
+Each run adds to its machine's stitch count and run time: the design's stitch count comes from its
+Tajima `.dst` or Barudan `.dsb` machine file (or type it on the design version), and a run stopped
+part-way can say how many stitches it got through. On **Machines**, type a reading from the
+machine's own counter to set it straight.
+
+Tools → **Machine maintenance** keeps a list of jobs per machine — oil the hook every 8 run hours,
+change the needles every 2 million stitches — and a log of when each was done. Run Order warns when
+a job on the machine is due, the morning roll-up and Communications list what's due, and the Run
+Times report shows stitches per run. It's part of the Production feature.
+
+## Cleaning up images
+
+- **Blanks → Find duplicate photos** looks through each color's photos for copies of the same picture
+  (the same address, the same file, or one that looks the same) and lets you remove the extras. A
+  garment's front and back are never called duplicates, and a color always keeps at least one photo.
+  **Repair photo thumbnails** remakes missing small copies.
+- **Tools → Orphaned images** (admins) lists files in the image store that nothing points to any more —
+  a photo replaced or removed, an upload whose form was never saved. **Scan the image store**, then
+  **Download selected (.zip)** to keep a copy and **Remove selected from storage**. Anything uploaded in
+  the last day is left alone, and each file is checked again just before it's removed.
+
+Admin screens keep your place after a change: the scroll position, open sections, ticked boxes and
+search stay as they were, and what changed is briefly highlighted.
+
+## The books: the Account viewer and receipts
+
+**Finance → Account viewer** shows one account's register: pick the account and dates (the last 32 days
+to start), then Search. Newest first, with the date, category, description, amount and the running
+balance, so it ends on the balance Accounts & money shows. Every row has a receipt button: view it, or
+attach or replace one with **＋ Receipt** / **Replace** (allowed in a closed month — it doesn't change
+the books).
+
+A stock purchase is **one row**, as it is on the card or bank statement, even though Receive order wrote
+a line per blank and size (plus any R&D or personal part); open it to see the parts. Reconcile treats it
+the same way: one item to match, and auto-match tries the whole receipt against a statement line.
+
+Paid it from the wrong account? Accounts & money → Blanks & transfers bought → **Change account…** moves
+the whole receipt — every stock line, its R&D / written-off expense and its personal-items draw — in one
+step. It's refused when the receipt is matched to a statement line, falls in a reconciled or closed month,
+or would move to Personal funds while a personal draw exists. These are managers' pages, and part of
+Bookkeeping.

@@ -40,8 +40,8 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
 
     console.log("=== Header ===");
     const groups = (adminJs.match(/const ADMIN_NAV_GROUPS = \[([\s\S]*?)\];/) || [])[1] || "";
-    const tools = (groups.match(/label: "Tools", items: \[([\s\S]*?)\]\},/) || [])[1] || "";
-    console.log("Tools lists Package sizes and Global settings as pages:", /\["packages", "Package sizes"\]/.test(tools) && /\["settings", "Global settings"\]/.test(tools));
+    const grp = (label) => (groups.match(new RegExp('label: "' + label + '", items: \\[([\\s\\S]*?)\\]\\},')) || [])[1] || "";
+    console.log("Catalog lists Package sizes and Settings lists Global settings, as pages:", /\["packages", "Package sizes"\]/.test(grp("Catalog")) && /\["settings", "Global settings"\]/.test(grp("Settings")));
     console.log("Package sizes no longer opens a pop-up from the menu:", !/showManagePackagePresets/.test(adminJs));
     console.log("Manage catalog is a top-level button, not in Tools:", /navGo\('catalog'\)">Manage catalog</.test(adminJs) && !/\["catalog"/.test(groups));
     console.log("#packages and #settings are routed:", /raw === "packages"\)\s*\{ renderPackageSizes\(app\)/.test(adminJs) && /raw === "settings" \|\| raw === "catalog\/settings"/.test(adminJs));
@@ -50,7 +50,7 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
     w.renderGlobalSettings(app);
     await tick();
     const backBtn = Array.from(app.querySelectorAll("button")).find(b => /Back/.test(b.textContent));
-    console.log("the page has no Back button:", !backBtn && /Global Settings/.test(app.textContent));
+    console.log("the page has no Back button:", !backBtn && /Global settings/.test(app.textContent));
     console.log("the breadcrumb no longer goes through Manage Catalog:", !/Manage Catalog/.test(app.querySelector(".org-hero").textContent));
 
     console.log("\n=== Package sizes is a page, not a pop-up ===");
@@ -93,7 +93,7 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
     console.log("toolbar order matches Threads: search first, then the buttons:",
       panel.querySelector("#blankSearch").parentNode === panel.querySelector("#blankAddBtn").parentNode &&
       panel.querySelector("#blankSearch").parentNode.firstElementChild.id === "blankSearch");
-    const blankRows = () => Array.from(app.querySelectorAll("#blanksPanel tbody tr")).map(tr => tr.querySelector("td").textContent);
+    const blankRows = () => Array.from(app.querySelectorAll("#blanksPanel tbody tr")).map(tr => tr.querySelector("td").childNodes[0].textContent.trim());
     console.log("both blanks listed:", JSON.stringify(blankRows()) === JSON.stringify(["Gildan 5000", "Richardson 112"]));
     const search = app.querySelector("#blankSearch");
     const type = (v) => { search.value = v; search.dispatchEvent(new w.Event("input")); };

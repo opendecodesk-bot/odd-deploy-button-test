@@ -42,6 +42,8 @@ global.getAllOrgs = async () => [];
 // Order submission requires the org to exist and be ready (server-side).
 // shippingEnabled: a signed carrier quote is only accepted for a shop that offers shipping (migrations/0045).
 global.getOrgById = async (db, orgId) => ({ orgId, name: orgId, subdomain: "", ready: true, shippingEnabled: true, orderDeadline: null, allowOrdersAfterDeadline: true });
+// Order submission reads the PUBLISHED shop (migrations/0076); here it is whatever getOrgById says.
+global.getPublishedOrg = (db, orgId) => global.getOrgById(db, orgId);
 // The REAL address check from db.js (whitelist + state-vs-ZIP), not a mock.
 // Region (Global settings): the default install — US address formats, no saved time zone.
 global.getLocaleSettings = async () => ({ timeZone: "", country: "US" });
@@ -347,13 +349,17 @@ global.getOrderItemById = async () => null;
     global.insertOrder = async () => {};
   }
 
-  console.log("\n=== Order submission from root/hub domain keeps whatever orgId the client legitimately chose ===");
+  console.log("\n=== The bare domain takes no orders — the shop comes from the address, never the request ===");
   {
     let insertedOrgId = null;
     global.insertOrder = async (db, order) => { insertedOrgId = order.orgId; };
     const hubOrder = {orderId:"T3", customerName:"Test Customer", orgId:"league-202", contact:"a@b.com", items:[{productId:"s",type:"shirt",size:"M",qty:1}]};
-    await onRequestPost(makeContext(hubOrder, BASE_ENV, "https://example.com/api/orders"));
-    console.log("Root domain order keeps its legitimate orgId:", insertedOrgId === "league-202");
+    const hubRes = await onRequestPost(makeContext(hubOrder, BASE_ENV, "https://example.com/api/orders"));
+    console.log("An order sent to the bare domain naming a shop is refused, nothing saved:", hubRes.status === 403 && insertedOrgId === null && /shop's own page/.test(JSON.parse(await hubRes.text()).message));
+    const unknownRes = await onRequestPost(makeContext(Object.assign({}, hubOrder, { orgId: "no-such-shop" }), BASE_ENV, "https://example.com/api/orders"));
+    console.log("…with the same answer whether or not that shop exists (no guessing shop ids):", unknownRes.status === 403 && JSON.parse(await unknownRes.text()).message === "Orders are placed from a shop's own page.");
+    await onRequestPost(makeContext(hubOrder, BASE_ENV, "http://localhost:8788/api/orders"));
+    console.log("A developer's own machine (localhost) may still name the shop:", insertedOrgId === "league-202");
     global.insertOrder = async () => {};
   }
 

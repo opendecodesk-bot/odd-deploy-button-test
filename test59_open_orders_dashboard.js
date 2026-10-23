@@ -134,4 +134,20 @@ const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
   await paintShop(prime);
   console.log("narrowing to the last 7 days drops the older orders (SHIP1 @12d, DONE1 @40d gone):",
     beforeDate.includes("SHIP1") && !shopIds().includes("SHIP1"));
+
+  console.log("\n=== Where the Orders page opens ===");
+  const route = async (hash) => { w.history.replaceState(null, "", hash); await w.adminRoute(); await new Promise(x => setTimeout(x, 30)); await wait(() => w.document.getElementById("ordFilterOrg") && !/Loading/.test(w.document.getElementById("adminPanel").textContent)); };
+  await route("#orders");
+  console.log("the Orders page opens on the first shop (the top of the Shop dropdown), not All shops:", w.location.hash === "#orders/prime" && w.document.getElementById("ordFilterOrg").value === "prime" && !!w.document.getElementById("bulkBar"));
+  await route("#");
+  console.log("…and so does the admin's home address:", w.location.hash === "#orders/prime" && w.document.getElementById("ordFilterOrg").value === "prime");
+  await route("#orders/all");
+  console.log("All shops is still there, at #orders/all:", w.location.hash === "#orders/all" && w.document.getElementById("ordFilterOrg").value === "" && /^Shop/.test(w.document.querySelector("#adminPanel thead th").textContent));
+  w.rerenderOrdersView(); await new Promise(x => setTimeout(x, 30)); await wait(() => w.document.getElementById("ordFilterOrg"));
+  console.log("…Refresh / a filter change there stays on All shops:", w.location.hash === "#orders/all" && w.document.getElementById("ordFilterOrg").value === "");
+  await route("#orders/rec");
+  w.onOrdersOrgChange("");
+  console.log("picking All shops in the dropdown goes to #orders/all:", w.location.hash === "#orders/all");
+  const cv = new Function(strip(require("fs").readFileSync(__dirname + "/functions/_lib/hostConfig.js", "utf8")) + "\n" + strip(require("fs").readFileSync(__dirname + "/functions/_lib/catalogValidation.js", "utf8")) + "\nreturn validateOrgFields;")();
+  console.log("“all” can't be a shop's ID (it's the All-shops address):", /reserved/.test(cv({ orgId: "all" }, true).error || "") && !cv({ orgId: "allston" }, true).error);
 })().catch(e => { console.log("test59 crashed:", false); console.error(e); process.exit(1); });

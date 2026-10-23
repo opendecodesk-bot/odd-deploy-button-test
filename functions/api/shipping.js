@@ -28,7 +28,7 @@
 import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
 import { jsonResponse } from "../_lib/http.js";
 import { selectBox } from "../_lib/boxSize.js";
-import { getBoxPresets, getProductsByOrg, getShipFromAddress, lineQty, QTY_MESSAGE } from "../_lib/db.js";
+import { getBoxPresets, getProductsByOrg, getShipFromAddress, lineQty, QTY_MESSAGE, getCategoryPackMap, getOrderInvoice, invoiceExpired } from "../_lib/db.js";
 import { classifyHost } from "../_lib/hostConfig.js";
 import { getCatalogData } from "../_lib/catalogCache.js";
 import { signQuote, canonicalItems } from "../_lib/quoteToken.js";
@@ -51,6 +51,7 @@ export async function onRequestPost(context){
   // Carrier rates are quoted by US ZIP only. Outside the US (Global settings → Region → country)
   // the shop's pickup and flat-fee delivery options are what's offered. The country rides on the
   // catalog data, which is edge-cached — no extra database read.
+  let storefrontOff = false;
   try{
     const cd = await getCatalogData(env);
     // Global settings → Features → Shipping switched off: no carrier rates at all.
@@ -58,10 +59,11 @@ export async function onRequestPost(context){
       return jsonResponse({status:"error", feature:"shipping", message:"Carrier shipping isn't available for this shop — please choose another delivery option."}, 403);
     }
     // Storefront switched off: no rate quotes for customers. The admin's own quotes (a parcel typed
-    // in by hand on the admin host) still work.
+    // in by hand on the admin host) still work, and so does a customer's invoice the shop sent
+    // (checked below, once the request's invoice token has been read).
     if(((cd && cd.features) || {}).storefront === false &&
        classifyHost(new URL(request.url).hostname, cd.subdomainMap, env).kind !== "admin"){
-      return jsonResponse({status:"error", feature:"storefront", message:"Online ordering isn't available here."}, 403);
+      storefrontOff = true;
     }
     if(((cd && cd.locale) || {}).country === "OTHER"){
       return jsonResponse({status:"error", message:"Carrier shipping rates aren't available for this shop's region — please choose another delivery option."}, 400);
@@ -77,6 +79,16 @@ export async function onRequestPost(context){
   let body;
   try{ body = await request.json(); }
   catch(e){ return jsonResponse({status:"error", message:"Invalid JSON."}, 400); }
+
+  // With the storefront off, only rates for an invoice the shop sent: a valid, unexpired invoice token
+  // for an order of the shop the rates are for (functions/api/invoice.js).
+  if(storefrontOff){
+    const tok = /^[a-z0-9]{16,64}$/.test(String((body && body.invoiceToken) || "")) ? String(body.invoiceToken) : "";
+    const inv = tok ? await getOrderInvoice(env.DB, tok).catch(() => null) : null;
+    if(!inv || invoiceExpired(inv) || (typeof body.org === "string" && body.org && body.org !== inv.orgId)){
+      return jsonResponse({status:"error", feature:"storefront", message:"Online ordering isn't available here."}, 403);
+    }
+  }
 
   const { zip } = body;
   let items = body.items;
@@ -102,7 +114,9 @@ export async function onRequestPost(context){
     const catalogData = await getCatalogData(env);
     const host = classifyHost(new URL(request.url).hostname, catalogData.subdomainMap, env);
     if(host.kind === "locked") orgId = host.orgId;
-    else if(host.kind === "root" && typeof body.org === "string") orgId = body.org;
+    // The shop comes from the address the request was sent to. Only a developer's own machine
+    // (localhost) may name it in the request instead.
+    else if(host.kind === "root" && typeof body.org === "string" && /^(localhost|127\.0\.0\.1)$/.test(new URL(request.url).hostname)) orgId = body.org;
   }catch(e){ /* unresolved org → quotes are returned unsigned (not orderable) */ }
 
   // A storefront cart (the shop is known, so its rates get signed) is rebuilt from the catalog: each
@@ -119,7 +133,7 @@ export async function onRequestPost(context){
       for(const it of items){
         const p = typeof it.productId === "string" ? byId.get(it.productId) : null;
         if(!p) return jsonResponse({status:"error", message:"An item in your cart is no longer available — please refresh the page."}, 400);
-        cart.push({ productId: it.productId, qty: it.qty, weightOz: typeof p.weightOz === "number" ? p.weightOz : 0, type: p.type || "" });
+        cart.push({ productId: it.productId, qty: it.qty, weightOz: p.shipWeightOz > 0 ? p.shipWeightOz : Number(p.weightOz) > 0 ? Number(p.weightOz) : 0, type: p.type || "" });
       }
       items = cart;
     }
@@ -141,14 +155,16 @@ export async function onRequestPost(context){
     : null;
 
   // Load DB-backed box presets (falls back to hardcoded defaults inside selectBox if none).
-  let boxPresets = null;
+  let boxPresets = null, packAs = null;
   if (env.DB) {
     try { boxPresets = await getBoxPresets(env.DB); } catch(e) {}
+    // Which package-size limit each product category counts against (migrations/0056).
+    try { packAs = await getCategoryPackMap(env.DB); } catch(e) {}
   }
 
   // Select the smallest box that fits the order's item types + quantities.
   // If no box matches, return a manual-shipping notice instead of Shippo rates.
-  const boxResult = parcelOverride ? { box: parcelOverride, packing: 0 } : selectBox(items, boxPresets);
+  const boxResult = parcelOverride ? { box: parcelOverride, packing: 0 } : selectBox(items, boxPresets, packAs);
   if(!boxResult){
     return jsonResponse({
       status: "ok",

@@ -78,19 +78,22 @@ async function send_(env, msg) {
 // (it needs the paid Workers plan). Set RESEND_API_KEY and verify the sending domain with Resend;
 // the sender is still EMAIL_FROM. Returns true (accepted) or false. Unlike Cloudflare's API, Resend
 // reports a bounce later (by webhook), so a permanently bouncing address isn't detected here.
-async function sendViaResend_(env, { to, subject, html, text }, id) {
+// `report` (optional, the test send on the Communications page): filled with what the provider said.
+async function sendViaResend_(env, { to, subject, html, text }, id, report) {
   const from = String(env.EMAIL_FROM || ("orders@" + siteRoot_(env))).trim();
   const bcc = id.bcc && id.bcc.toLowerCase() !== String(to).trim().toLowerCase() ? [id.bcc] : [];
   try {
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
-      headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+      headers: { "Authorization": `Bearer ${String(env.RESEND_API_KEY).trim()}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         from: `${String(id.name).replace(/[<>"\r\n]/g, "")} <${from}>`, to: [to], reply_to: id.owner,
         ...(bcc.length ? { bcc } : {}), subject, html: html || undefined, text: text || "(no plain-text body)",
       }),
     });
     const data = await res.json().catch(() => ({}));
+    if (report) Object.assign(report, { httpStatus: res.status, providerId: data.id || "",
+      providerMessage: String(data.message || data.error || (data.name ? data.name : "") || "").slice(0, 500), providerName: data.name || "" });
     if (!res.ok || !data.id) {
       console.error(`Resend HTTP ${res.status}:`, JSON.stringify(data).slice(0, 500));
       return false;
@@ -98,13 +101,14 @@ async function sendViaResend_(env, { to, subject, html, text }, id) {
     return true;
   } catch (e) {
     console.error("Resend error:", e);
+    if (report) report.providerMessage = "Couldn't reach Resend: " + String((e && e.message) || e).slice(0, 300);
     return false;
   }
 }
 
 // Cloudflare Email Service. Returns true (sent), "bounced" (the recipient's address permanently
 // bounced), or false (not configured / failed).
-async function sendViaCloudflare_(env, { to, subject, html, text }, id) {
+async function sendViaCloudflare_(env, { to, subject, html, text }, id, report) {
   const from = String(env.EMAIL_FROM || ("orders@" + siteRoot_(env))).trim();
   const fromName = id.name;
   const bccAddr = id.bcc;
@@ -120,6 +124,7 @@ async function sendViaCloudflare_(env, { to, subject, html, text }, id) {
     }
     if (!env.CF_EMAIL_API_TOKEN || !env.CF_ACCOUNT_ID) {
       console.error("Email is not configured: set an EMAIL binding, or CF_EMAIL_API_TOKEN + CF_ACCOUNT_ID");
+      if (report) report.providerMessage = "No email provider is set up (no RESEND_API_KEY, no EMAIL binding, no CF_EMAIL_API_TOKEN + CF_ACCOUNT_ID).";
       return false;
     }
     const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CF_ACCOUNT_ID)}/email/sending/send`, {
@@ -131,6 +136,8 @@ async function sendViaCloudflare_(env, { to, subject, html, text }, id) {
       }),
     });
     const data = await res.json().catch(() => ({}));
+    if (report) Object.assign(report, { httpStatus: res.status,
+      providerMessage: ((data.errors || []).map(e => (e.code ? e.code + ": " : "") + (e.message || "")).join("; ") || "").slice(0, 500) });
     if (!res.ok || !data.success) {
       console.error(`Cloudflare email HTTP ${res.status}:`, JSON.stringify(data.errors || data).slice(0, 500));
       return false;
@@ -143,8 +150,53 @@ async function sendViaCloudflare_(env, { to, subject, html, text }, id) {
     return true;
   } catch (e) {
     console.error("Cloudflare email error:", e);
+    if (report) report.providerMessage = "Couldn't send through Cloudflare: " + String((e && e.message) || e).slice(0, 300);
     return false;
   }
+}
+
+// ---- The test send (Tools → Communications → Send a test email) ---------------------------------
+// One short message to `to`, through exactly the path every other email takes, and a report of what
+// happened that someone can act on: which provider, from which address, what it answered, and — for
+// the usual mistakes — what to do. Never records an email_failed issue (it's a deliberate test).
+// Secrets are never returned: a key is described (set or not, its length, whether it looks right).
+export async function sendTestEmail(env, to) {
+  const id = await mailIdentity_(env);
+  const from = String((env && env.EMAIL_FROM) || ("orders@" + siteRoot_(env))).trim();
+  const key = env && env.RESEND_API_KEY != null ? String(env.RESEND_API_KEY) : "";
+  const provider = key ? "resend" : (env && env.EMAIL && typeof env.EMAIL.send === "function") ? "cloudflare-binding"
+    : (env && env.CF_EMAIL_API_TOKEN && env.CF_ACCOUNT_ID) ? "cloudflare-api" : "none";
+  const report = { provider, from, fromDomain: from.split("@")[1] || "", to: String(to || ""), replyTo: id.owner, bcc: id.bcc || "",
+    businessName: id.name, rootDomain: siteRoot_(env), subjectTag: env && env.EMAIL_SUBJECT_TAG ? String(env.EMAIL_SUBJECT_TAG).trim() : "",
+    key: key ? { length: key.trim().length, looksLikeResend: /^re_[A-Za-z0-9_]+$/.test(key.trim()), spaceInside: /\s/.test(key.trim()), paddedEnds: key !== key.trim() } : null,
+    httpStatus: null, providerMessage: "", providerId: "", ok: false, hints: [] };
+  const hint = (t) => report.hints.push(t);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(report.to)) { hint("Enter an email address to send the test to."); return report; }
+  if (report.fromDomain === "example.com") hint("ROOT_DOMAIN isn't set, so emails would come from an example.com address. Set ROOT_DOMAIN (or EMAIL_FROM) to your own domain.");
+  if (key && report.key.spaceInside) hint("RESEND_API_KEY has a space or line break in the middle — copy it again (wrangler secret put RESEND_API_KEY) and redeploy.");
+  else if (key && report.key.paddedEnds) hint("RESEND_API_KEY was saved with a space or line break at the end. Emails now ignore it, but it's worth setting the key again cleanly.");
+  else if (key && !report.key.looksLikeResend) hint("RESEND_API_KEY doesn't look like a Resend key (they start with re_). Check you pasted the API key itself.");
+  if (provider === "none") { hint("No email provider is set up. Set RESEND_API_KEY (a secret), or Cloudflare Email Service — see docs/email.md."); return report; }
+  const tag = report.subjectTag;
+  const msg = { to: report.to, subject: (tag ? tag + " " : "") + "Test email from " + id.name,
+    html: `<div style="font-family:sans-serif"><p>This is a test email from <strong>${escHtml(id.name)}</strong> (${escHtml(report.rootDomain)}), sent from Tools → Communications.</p><p>If you can read this, email is working.</p></div>`,
+    text: `This is a test email from ${id.name} (${report.rootDomain}), sent from Tools → Communications.\n\nIf you can read this, email is working.` };
+  const r = provider === "resend" ? await sendViaResend_(env, msg, id, report) : await sendViaCloudflare_(env, msg, id, report);
+  report.ok = r === true;
+  if (r === "bounced") hint("That address permanently bounced — try another one.");
+  if (!report.ok && provider === "resend") {
+    const m = report.providerMessage.toLowerCase(), st = report.httpStatus;
+    if (st === 401 || (st === 403 && /api key/.test(m))) hint("Resend refused the API key. Make a new key in Resend (API Keys, with sending access), set it again with wrangler secret put RESEND_API_KEY, and redeploy.");
+    if (/domain/.test(m) && /verif|not.*(found|added)/.test(m)) hint(`Resend hasn't verified the domain you send from (${report.fromDomain}). In Resend → Domains add ${report.fromDomain}, put its DNS records in Cloudflare DNS, and wait until it shows Verified. Or set EMAIL_FROM to an address on a domain that is verified.`);
+    if (/only send testing emails to your own email/.test(m)) hint("Resend is in testing mode: without a verified domain it only sends to your own Resend account's address. Verify your domain in Resend → Domains.");
+    if (st === 422 && /from/.test(m)) hint(`Resend didn't accept the From address (${report.from}). Set EMAIL_FROM to a plain address on your verified domain, like orders@${report.rootDomain}.`);
+    if (st === 429) hint("Resend's rate limit — wait a minute and try again.");
+    if (!report.hints.length || report.hints.every(h => /ROOT_DOMAIN/.test(h))) hint("See Resend's message above; the Logs page in your Resend account shows the same attempt.");
+  }
+  if (report.ok) hint(provider === "resend"
+    ? "Resend accepted it. If it doesn't arrive, check spam, and the Logs page in your Resend account for this email's id (above)."
+    : "Accepted for sending. If it doesn't arrive, check spam.");
+  return report;
 }
 
 function escHtml(s) {
@@ -180,13 +232,14 @@ function configSummary_(it) {
   const c = it && it.config;
   if (!c || !Array.isArray(c.locations)) return "";
   const parts = c.locations
-    .filter((l) => !l.auto && l.location !== "reorderqr")
+    .filter((l) => !l.auto && !l.fixed && l.location !== "reorderqr")
     .map((l) => `${l.label || l.location}: ${l.graphicName}${l.ink ? " (" + l.ink + ")" : ""}`);
   return [c.garmentColor, ...parts].filter(Boolean).join(" · ");
 }
 
 // What to print after a line's name: a configurable line's picks, plus the personalization (typed name or
 // preset word) when there is one — both can apply to the same line.
+export function lineDetailText(it) { return lineDetail_(it); }   // for the invoice page
 function lineDetail_(it) {
   const cfg = configSummary_(it);
   const pers = it && it.personalized ? `“${it.persName || ""}”` : "";
@@ -299,7 +352,18 @@ async function timeZone_(env) {
 // day so that silence can't mean "it didn't run". Short on purpose: when it checked, since when
 // nothing is new, and what is still being watched (packages on the way, labels not yet picked up,
 // blanks on order). Lists no orders and moves no progress markers.
-export async function sendDigestHeartbeatEmail(env, { lastSentAt = "", inTransit = [], awaitingPickup = [], awaitingBlanks = [], adminUrl = adminSiteUrl_(env) } = {}) {
+// "Machine 1: Oil the rotary hook (5.2 h of run time since it was last done)" — machine maintenance that's due
+// (migrations/0071), for the roll-up and the quiet-morning email.
+function maintenanceText_(tasks) {
+  return (tasks || []).map(t => {
+    const parts = [];
+    if (t.everySeconds) parts.push(`${Math.round((Number(t.usedSeconds) || 0) / 360) / 10} h of run time`);
+    if (t.everyStitches) parts.push(`${(Number(t.usedStitches) || 0).toLocaleString("en-US")} stitches`);
+    return `${t.machineName || "Machine"}: ${t.name}${parts.length ? ` (${parts.join(", ")} since it was last done)` : ""}`;
+  });
+}
+
+export async function sendDigestHeartbeatEmail(env, { lastSentAt = "", inTransit = [], awaitingPickup = [], awaitingBlanks = [], maintenanceDue = [], adminUrl = adminSiteUrl_(env) } = {}) {
   const tz = await timeZone_(env);   // Region setting, else TIMEZONE, else UTC
   const when = (iso) => new Date(iso).toLocaleString("en-US", { timeZone: tz, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
@@ -312,6 +376,7 @@ export async function sendDigestHeartbeatEmail(env, { lastSentAt = "", inTransit
   const lines = [
     `The morning check ran at ${when(new Date().toISOString())} and found nothing new ${since}: no new orders, payments, refunds, deliveries or problems.`,
     watching.length ? `Still being watched: ${watching.join(", ")}.` : "",
+    maintenanceDue.length ? `Machine maintenance due: ${maintenanceText_(maintenanceDue).join("; ")}.` : "",
     `Details: ${adminUrl}/#comms`,
   ].filter(Boolean);
   const html = `<div style="font-family:system-ui,sans-serif;font-size:14px;color:#222;line-height:1.5;">` +
@@ -327,11 +392,13 @@ export async function sendDigestHeartbeatEmail(env, { lastSentAt = "", inTransit
 // sends sendDigestHeartbeatEmail instead, so a quiet morning still proves the roll-up ran).
 // pickedUp = orders the tracking check just marked shipped (carrier's first scan); awaitingPickup =
 // orders with a label the carrier hasn't scanned yet (listed for the record, never a reason to send).
-export async function sendDailyDigestEmail(env, { orders = [], notices = [], orgNames = {}, security = null, inTransit = [], pickedUp = [], awaitingPickup = [], issues = [], awaitingBlanks = [], adminUrl = adminSiteUrl_(env) }) {
+export async function sendDailyDigestEmail(env, { orders = [], notices = [], orgNames = {}, security = null, inTransit = [], pickedUp = [], awaitingPickup = [], issues = [], awaitingBlanks = [], priceReminder = null, belowTarget = [], maintenanceDue = [], adminUrl = adminSiteUrl_(env) }) {
   issues = issues || [];
+  belowTarget = belowTarget || [];
+  const pr = priceReminder && ((priceReminder.blanks || []).length || (priceReminder.products || []).length) ? priceReminder : null;
   awaitingBlanks = awaitingBlanks || [];
   const blanksOverdue = awaitingBlanks.filter(x => x.overdue);
-  if (!orders.length && !notices.length && !(security && security.count) && !pickedUp.length && !issues.length && !blanksOverdue.length) return false;
+  if (!orders.length && !notices.length && !(security && security.count) && !pickedUp.length && !issues.length && !blanksOverdue.length && !pr && !belowTarget.length) return false;
   const orgName = (id) => orgNames[id] || id || "";
   const tz = await timeZone_(env);   // Region setting, else TIMEZONE, else UTC
   const when = (iso) => new Date(iso).toLocaleString("en-US", { timeZone: tz, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -362,6 +429,8 @@ export async function sendDailyDigestEmail(env, { orders = [], notices = [], org
     delivered.length ? `${delivered.length} ${delivered.length === 1 ? "delivery" : "deliveries"}` : "",
     pickedUp.length ? `${pickedUp.length} picked up by carrier` : "",
     inTransit.length ? `${inTransit.length} in transit` : "",
+    pr ? "💲 blank prices to check" : "",
+    belowTarget.length ? `📉 ${plural(belowTarget.length, "product")} below price target` : "",
   ].filter(Boolean);
   const subject = `Daily roll-up — ${subjectParts.join(", ")}`;
 
@@ -374,7 +443,7 @@ export async function sendDailyDigestEmail(env, { orders = [], notices = [], org
       <td style="padding:6px 8px;vertical-align:top;white-space:nowrap">${escHtml(o.paymentMethod || "")}<br><span style="font-size:12px;color:${o.paid ? "#15803d" : "#b45309"}">${o.paid ? "Paid" : "Unpaid"}</span></td>
       <td style="padding:6px 8px;vertical-align:top;text-align:right;white-space:nowrap">${fmt$(o.total)}</td>
     </tr>`;
-  const KIND = { payment: "Payment", refund: "Refund", dispute: "Dispute", design: "Design", delivered: "Delivered" };
+  const KIND = { payment: "Payment", refund: "Refund", dispute: "Dispute", design: "Design", delivered: "Delivered", invoice: "Invoice" };
   const noticeHtml = (x) => `
     <tr style="border-top:1px solid #e5e7eb">
       <td style="padding:6px 8px;vertical-align:top;white-space:nowrap;color:#666;font-size:12px">${escHtml(when(x.createdAt))}</td>
@@ -439,6 +508,13 @@ export async function sendDailyDigestEmail(env, { orders = [], notices = [], org
           <td style="padding:6px 8px;vertical-align:top;${x.overdue ? "color:#b03a2e;font-weight:600" : "color:#555"}">${escHtml(x.statusLabel || "")}${(x.shipments || []).map(s => `<div style="font-size:12px;color:#555;margin-top:2px;font-weight:400">📦 ${escHtml(s.carrier || "")} ${(u => u ? `<a href="${escHtml(u)}">${escHtml(s.trackingNumber)}</a>` : escHtml(s.trackingNumber))(trackingUrl(s.carrier, s.trackingNumber))}${s.status ? ` — ${escHtml(blankStatusText_(s))}` : ""}${s.statusDate ? " (" + escHtml(when(s.statusDate)) + ")" : ""}</div>`).join("")}</td>
         </tr>`).join("")}</tbody></table>` : ""}
     ${activity.length ? `<h3 style="margin:22px 0 6px;font-size:17px">Payments, refunds &amp; customer responses</h3>${noticeTable(activity)}` : ""}
+    ${pr ? priceReminderHtml_(pr, orgName, tz) : ""}
+    ${belowTarget.length ? `<h3 style="margin:22px 0 6px;font-size:17px">📉 Products now below your price targets — ${belowTarget.length}</h3>
+    <p style="margin:0 0 6px;color:#555;font-size:13px">A blank's cost, a fee or a target changed since the last roll-up. The product's Pricing panel shows what each item costs and leaves.</p>
+    <ul style="margin:0;padding-left:18px;font-size:14px">${belowTarget.map(p => `<li><strong>${escHtml(p.name)}</strong> <span style="color:#666">(${escHtml(orgName(p.orgId))})</span><br><span style="font-size:13px;color:#555">${(p.problems || []).map(escHtml).join("<br>")}</span></li>`).join("")}</ul>` : ""}
+    ${maintenanceDue.length ? `<h3 style="margin:22px 0 6px;font-size:17px">🔧 Machine maintenance due — ${maintenanceDue.length}</h3>
+    <ul style="margin:0;padding-left:18px;font-size:14px">${maintenanceText_(maintenanceDue).map(x => `<li>${escHtml(x)}</li>`).join("")}</ul>
+    <p style="margin:6px 0 0;font-size:13px"><a href="${escHtml(adminUrl)}/#maintenance">Machine maintenance</a></p>` : ""}
     <hr/><p style="font-size:12px;color:#666">%%BUSINESS%% — daily roll-up</p>
   </div>`;
   const noticeText = (x) => `  ${when(x.createdAt)}  ${KIND[x.kind] || x.kind}  ${x.orderId} (${orgName(x.orgId)})  ${x.summary}${x.detail ? " — " + x.detail : ""}`;
@@ -462,9 +538,42 @@ export async function sendDailyDigestEmail(env, { orders = [], notices = [], org
       ((main) => main + (x.shipments || []).map(s => `\n      📦 ${s.carrier || ""} ${s.trackingNumber}${s.status ? " — " + blankStatusText_(s) : ""} ${trackingUrl(s.carrier, s.trackingNumber)}`).join(""))(
       `  ${x.orderId} (${orgName(x.orgId)})  ${x.customerName || ""}  ${[x.blankVendor, x.blankVendorOrderId && "#" + x.blankVendorOrderId].filter(Boolean).join(" ")}  ordered ${x.orderedDate || "?"}  — ${x.statusLabel || ""}`)).join("\n") : "",
     activity.length ? "Payments, refunds & customer responses\n" + activity.map(noticeText).join("\n") : "",
+    pr ? priceReminderText_(pr, orgName, tz) : "",
+    belowTarget.length ? `PRODUCTS NOW BELOW YOUR PRICE TARGETS — ${belowTarget.length}\n` + belowTarget.map(p => `  ${p.name} (${orgName(p.orgId)})\n` + (p.problems || []).map(x => "    " + x).join("\n")).join("\n") : "",
+    maintenanceDue.length ? `MACHINE MAINTENANCE DUE — ${maintenanceDue.length}\n` + maintenanceText_(maintenanceDue).map(x => "  " + x).join("\n") : "",
     adminUrl,
   ].filter(Boolean).join("\n\n");
   return send_(env, { to: ORDER_NOTIFICATION_EMAIL, subject, html, text });
+}
+
+// The 30-day vendor-price reminder (migrations/0062): blanks for sale on visible products whose vendor
+// prices haven't been checked in 30 days, then products priced on blank prices that have changed.
+const money_ = (v) => v == null ? "not entered" : fmt$(v);
+const priceChecked_ = (b, tz) => b.checkedAt ? "last checked " + new Date(b.checkedAt).toLocaleDateString("en-US", { timeZone: tz || "UTC", month: "short", day: "numeric", year: "numeric" }) : "never checked";
+const priceChange_ = (c) => `${c.blankName}${c.color ? " " + c.color : ""}${c.size ? " " + c.size : ""}: ${money_(c.from)} → ${money_(c.to)}`;
+function priceReminderHtml_(pr, orgName, tz) {
+  const blanks = pr.blanks || [], products = pr.products || [];
+  return `<h3 style="margin:22px 0 6px;font-size:17px">💲 Blank prices to check (every 30 days)</h3>
+    ${blanks.length ? `<p style="margin:0 0 6px;color:#555;font-size:13px">These blanks are used by products on sale. Check each one's prices with the vendor and enter any change on the blank (Blanks → Edit), or click “Prices are current” there.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px">
+      <thead><tr style="background:#f5f5f5;text-align:left"><th style="padding:4px 8px">Blank</th><th style="padding:4px 8px">Prices</th><th style="padding:4px 8px">Used by</th></tr></thead>
+      <tbody>${blanks.map(b => `<tr style="border-top:1px solid #e5e7eb">
+        <td style="padding:6px 8px;vertical-align:top">${escHtml(b.name)}${b.vendor ? `<br><span style="color:#666;font-size:12px">${escHtml(b.vendor)}</span>` : ""}</td>
+        <td style="padding:6px 8px;vertical-align:top;font-size:13px;color:#555">${escHtml(priceChecked_(b, tz))}<br>${Number(b.sizesWithPrice) || 0} of ${Number(b.sizes) || 0} sizes have a vendor price</td>
+        <td style="padding:6px 8px;vertical-align:top;font-size:13px">${(b.products || []).slice(0, 8).map(p => escHtml(p.name) + ` <span style="color:#666">(${escHtml(orgName(p.orgId))})</span>`).join("<br>")}${(b.products || []).length > 8 ? `<br>+${b.products.length - 8} more` : ""}</td>
+      </tr>`).join("")}</tbody></table>` : ""}
+    ${products.length ? `<h4 style="margin:14px 0 6px;font-size:15px">Products to re-price — ${products.length}</h4>
+    <p style="margin:0 0 6px;color:#555;font-size:13px">Their prices were set when these blanks cost something else. Update the product's prices, or open it and click “Prices still OK”.</p>
+    <ul style="margin:0;padding-left:18px;font-size:14px">${products.map(p => `<li><strong>${escHtml(p.name)}</strong> <span style="color:#666">(${escHtml(orgName(p.orgId))})</span><br><span style="font-size:13px;color:#555">${p.changes.map(c => escHtml(priceChange_(c))).join("<br>")}</span></li>`).join("")}</ul>` : ""}`;
+}
+function priceReminderText_(pr, orgName, tz) {
+  const blanks = pr.blanks || [], products = pr.products || [];
+  return [
+    blanks.length ? `BLANK PRICES TO CHECK (every 30 days) — ${blanks.length}\n` + blanks.map(b =>
+      `  ${b.name}${b.vendor ? " (" + b.vendor + ")" : ""} — ${priceChecked_(b, tz)}, ${Number(b.sizesWithPrice) || 0} of ${Number(b.sizes) || 0} sizes priced — used by ${(b.products || []).map(p => p.name + " (" + orgName(p.orgId) + ")").join(", ")}`).join("\n") : "",
+    products.length ? `PRODUCTS TO RE-PRICE — ${products.length}\n` + products.map(p =>
+      `  ${p.name} (${orgName(p.orgId)})\n` + p.changes.map(c => "    " + priceChange_(c)).join("\n")).join("\n") : "",
+  ].filter(Boolean).join("\n\n");
 }
 
 // Order / customer / tracking / status table shared by the roll-up's shipment sections.
@@ -642,6 +751,50 @@ export async function sendShippingPaymentEmail(env, { customerName, customerEmai
   </div>`;
   const text = `Shipping Payment for Order ${orderId}\n\n${bodyText}\n\n${paymentUrl}\n\n%%BUSINESS%%`;
   return send_(env, { to: customerEmail, subject, html, text });
+}
+
+// Sent to the customer with a link to their invoice page (/?invoice=<token>), where they choose how
+// they'll get the order and pay what's owed. `order` is the saved order (so the totals are the ones on
+// the books); `message` is the shop's optional note.
+export async function sendInvoiceEmail(env, { order, orgName, invoiceUrl, message, allowDelivery }) {
+  const subject = `Invoice for your order — ${order.orderId}`;
+  const name = String(order.customerName || "").trim();
+  const hello = name && name !== "Local Sale" ? `Hi ${name},` : "Hello,";
+  const lead = allowDelivery
+    ? "Your invoice is ready. Use the button below to choose how you'd like to get your order and to pay online."
+    : "Your invoice is ready. Use the button below to see the details and pay online.";
+  const note = String(message || "").trim();
+  const items = (order.items || []).filter(it => !it.cancelDate);
+  const due = Number(order.balanceDue) || 0;
+  const html = `<div style="font-family:sans-serif;max-width:600px;margin:auto">
+    <h2 style="color:#1d4ed8">Invoice${orgName ? " — " + escHtml(orgName) : ""}</h2>
+    <p>${escHtml(hello)} ${escHtml(lead)}</p>
+    ${note ? `<p style="background:#f8fafc;border-left:3px solid #1d4ed8;padding:10px 14px;white-space:pre-wrap">${escHtml(note)}</p>` : ""}
+    <p><strong>Order ID:</strong> ${escHtml(order.orderId)}</p>
+    ${itemsTable(items)}
+    ${receiptTotalsHtml_(order)}
+    ${Number(order.amountReceived) > 0 ? `<p style="font-size:14px">Paid so far: ${fmt$(order.amountReceived)} &nbsp;·&nbsp; <strong>Balance due: ${fmt$(due)}</strong></p>` : ""}
+    <div style="margin:24px 0;text-align:center">
+      <a href="${escHtml(invoiceUrl)}" style="display:inline-block;background:#1d4ed8;color:#fff;font-size:16px;font-weight:bold;padding:14px 32px;border-radius:6px;text-decoration:none">View &amp; pay invoice &rarr;</a>
+    </div>
+    <p style="font-size:13px;color:#555">If the button doesn't work, copy this link: ${escHtml(invoiceUrl)}</p>
+    <hr/>
+    <p style="font-size:12px;color:#666">%%BUSINESS%% — %%SITE%%</p>
+  </div>`;
+  const text = `Invoice for order ${order.orderId}\n\n${hello} ${lead}\n${note ? "\n" + note + "\n" : ""}\n${receiptTotalsText_(order)}\n` +
+    (Number(order.amountReceived) > 0 ? `Paid so far: ${fmt$(order.amountReceived)} · Balance due: ${fmt$(due)}\n` : "") +
+    `\nView and pay: ${invoiceUrl}\n\n%%BUSINESS%%`;
+  return send_(env, { to: order.contact, subject, html, text });
+}
+
+// Queued for the owner's 6 AM roll-up when a customer chooses how they'll get their order on its
+// invoice page (emailed at once only if it can't be queued).
+export async function sendInvoiceDeliveryNotification(env, { orderId, orgId, customerName, choice, detail }) {
+  const summary = `${customerName || "The customer"} chose ${choice} on their invoice`;
+  const text = `${summary}\nOrder: ${orderId} (${orgId})${detail ? "\n" + detail : ""}`;
+  return queueOwnerNotice_(env, { kind: "invoice", orderId, orgId, summary, detail: detail || "" },
+    { to: ORDER_NOTIFICATION_EMAIL, subject: `Invoice — delivery chosen — ${orgId} — ${orderId}`,
+      html: `<div style="font-family:sans-serif"><p>${escHtml(summary)}</p><p>Order ${escHtml(orderId)} (${escHtml(orgId)})</p>${detail ? `<p>${escHtml(detail)}</p>` : ""}</div>`, text });
 }
 
 // Sent to admin when a customer responds to a design verification.

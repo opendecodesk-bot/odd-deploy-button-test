@@ -72,6 +72,7 @@ functions/api/            one file per endpoint
   admin-2fa.js              setting up two-step sign-in
   upload.js                 picture uploads (admin)
   customer-design.js        a customer's own design, uploaded from the shop page
+  invoice.js                a customer's invoice page: choosing delivery, paying (token-gated)
   receipt.js, design.js     private file uploads and signed download links
   verify.js, upload-verify.js   the customer's design-approval page
   image-proxy.js            fetches a stored picture for the admin's mockup editor
@@ -153,8 +154,8 @@ Rules the data keeps (see [CONTRIBUTING.md](../CONTRIBUTING.md) for how the code
   disabled user's sessions stop working at once.
 - **Three roles**, each including the one below: `staff` (shown as "Back office": orders,
   production, inventory, catalog content, expenses, reports), `manager` (also shops, publishing
-  and the books; can read Global settings) and `admin` (also users, the audit log and every
-  Global settings change). **One function enforces them**: `requireAdmin` in
+  and the books) and `admin` (also users, the audit log and Global settings — a manager's
+  requests may still read some of its values, but the page is an admin's). **One function enforces them**: `requireAdmin` in
   `functions/_lib/adminAuth.js` takes the lowest role allowed, and anything it isn't told is
   admin-only. `ACTION_ROLE` in `functions/api/orders.js` gives each of that endpoint's actions
   its role; a test fails if an action or an API file has none. The menu hides what a role can't

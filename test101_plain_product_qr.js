@@ -1,4 +1,5 @@
 const fs = require("fs");
+const { autoConfirm } = require("./testlib/confirm.js");
 const { JSDOM, ResourceLoader } = require("jsdom");
 const { createD1 } = require("./testlib/d1-shim.js");
 
@@ -172,7 +173,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const html = read("public/index.html"), adminJs = read("public/admin.js");
   class L extends ResourceLoader { fetch(url, o){ if (url.includes("/admin.js")) return Promise.resolve(Buffer.from(adminJs)); return super.fetch(url, o); } }
   const dom = new JSDOM(html, { runScripts: "dangerously", resources: new L(), url: "https://admin.example.com/", pretendToBeVisual: true,
-    beforeParse(win){ win.CSS = win.CSS || { escape: (v) => String(v) }; win.confirm = () => true; win.fetch = async (url, init) => {
+    beforeParse(win){ win.CSS = win.CSS || { escape: (v) => String(v) }; autoConfirm(win, () => true); win.fetch = async (url, init) => {
       if (String(url).includes("/api/orders")) { const x = await call(JSON.parse(init.body)); return { ok: x.status < 400, status: x.status, json: async () => x.body }; }
       return { ok: true, status: 200, json: async () => ({ status: "admin" }) }; }; } });
   const w = dom.window, d = w.document;
@@ -213,7 +214,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   ok("Edit items has an 'Update from catalog…' button that previews, asks, then applies", /id="editOrderRefresh"/.test(adminJs) && /preview: true/.test(adminJs) && typeof w.refreshOrderFromCatalog_ === "function");
   await call({ orderId: "F2", orgId: "league", customerName: "Fix", contact: "c@x.com", paymentMethod: "Venmo", items: [{ productId: "polo-none", size: "L", qty: 1 }] }, "league");
   await d1.prepare("UPDATE products SET reorderQr='none' WHERE orgId='league' AND productId='polo-none'").run();
-  let asked = ""; w.confirm = (m) => { asked = m; return true; };
+  let asked = ""; autoConfirm(w, (m) => { asked = m; return true; });
   const did = await w.refreshOrderFromCatalog_({ orderId: "F2", orgId: "league" });
   ok("the button's prompt names the line and the change, and Yes applies it", did === true && /polo-none \(L\): Reorder QR removed/.test(asked) && !(await lib.getOrderById(d1, "F2")).items[0].config);
   ok("with nothing to change it says so and asks nothing", (asked = "", await w.refreshOrderFromCatalog_({ orderId: "F2", orgId: "league" })) === false && asked === "");

@@ -48,6 +48,7 @@ global.getOrderCheckoutState = async (db, orderId) => {
   return total === null ? null : { total, paid: global.__checkoutPaid, orgId: global.__checkoutOrg,
     voided: global.__checkoutVoided, ...row };
 };
+const { orderTokenFor } = require("./testlib/order-token");
 let checkoutSrc = fs.readFileSync(__dirname + "/functions/api/checkout.js", "utf8")
   .replace(/import \{[\s\S]*?\} from ["'][^"']+["'];\n?/g, "")
   .replace(/export async function/g, "async function");
@@ -179,7 +180,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   const co1 = await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   const d1 = JSON.parse(await co1.text());
@@ -208,14 +209,14 @@ function makeGsMock(calls){ return async (url, opts) => {
   // carry a phone number instead of an email — either would make Stripe
   // reject the session with "Invalid email address" if it were passed on.
   await checkoutHandler({
-    request: { json:async()=>({orderId:"TEST-1",orgId:"league-101",customerName:"Admin Test Transaction",contact:""}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "TEST-1"), orderId:"TEST-1",orgId:"league-101",customerName:"Admin Test Transaction",contact:""}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   const paramsBlank = new URLSearchParams(capturedBlankContactReq.opts.body);
   console.log("customer_email key is omitted entirely for a blank contact, not sent as an empty string:", !paramsBlank.has("customer_email"));
 
   await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T2",orgId:"league-101",customerName:"Bea",contact:"614-555-0100"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-T2"), orderId:"ORD-T2",orgId:"league-101",customerName:"Bea",contact:"614-555-0100"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   const paramsPhone = new URLSearchParams(capturedBlankContactReq.opts.body);
@@ -226,7 +227,7 @@ function makeGsMock(calls){ return async (url, opts) => {
   global.getOrderTotal = async () => 45;
   global.fetch = async (url, opts) => { capturedStripeReq = { url, opts }; return { json: async () => ({ url: "https://checkout.stripe.com/x" }) }; };
   await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101",customerName:"Mallory",contact:"mallory@evil.example"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101",customerName:"Mallory",contact:"mallory@evil.example"}), url:"https://example.com/api/checkout" },
     env: { STRIPE_SECRET_KEY: "sk_test_fake", DB: {} }
   });
   const spoofed = new URLSearchParams(capturedStripeReq.opts.body);
@@ -234,7 +235,7 @@ function makeGsMock(calls){ return async (url, opts) => {
   console.log("a spoofed body name is ignored in metadata:", spoofed.get("metadata[customerName]") === "Aaron");
   global.__checkoutVoided = true;
   const vRes = await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101"}), url:"https://example.com/api/checkout" },
     env: { STRIPE_SECRET_KEY: "sk_test_fake", DB: {} }
   });
   console.log("a voided order is refused (409):", vRes.status === 409);
@@ -251,7 +252,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101",total:0.50,customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101",total:0.50,customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   const paramsTampered = new URLSearchParams(capturedStripeReq2.opts.body);
@@ -273,7 +274,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   const co2c = await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-NOPE",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-NOPE"), orderId:"ORD-NOPE",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   console.log("Refuses cleanly:", JSON.parse(await co2c.text()).status === "error");
@@ -288,7 +289,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   const co2d = await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_live_bad"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_live_bad" }
   });
   const errData = JSON.parse(await co2d.text());
@@ -304,7 +305,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   const co2e = await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_live_bad"}, "ORD-T1"), orderId:"ORD-T1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_live_bad" }
   });
   const errData2 = JSON.parse(await co2e.text());
@@ -372,7 +373,7 @@ function makeGsMock(calls){ return async (url, opts) => {
     return { json: async () => ({status:"ok"}) };
   };
   await checkoutHandler({
-    request: { json:async()=>({orderId:"ORD-PI1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
+    request: { json:async()=>({checkoutToken: await orderTokenFor({STRIPE_SECRET_KEY:"sk_test_fake"}, "ORD-PI1"), orderId:"ORD-PI1",orgId:"league-101",customerName:"Aaron",contact:"a@example.com"}), url:"https://example.com/api/checkout" },
     env: { DB: {}, STRIPE_SECRET_KEY:"sk_test_fake" }
   });
   const piParams = new URLSearchParams(capturedPiReq.opts.body);

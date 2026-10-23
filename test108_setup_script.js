@@ -522,7 +522,8 @@ const UUID = [hex(8, "1a"), hex(4, "b"), hex(4, "c"), hex(4, "d"), hex(12, "e")]
 
   console.log("\n=== Wiring ===");
   const pkg = JSON.parse(read("package.json"));
-  ok("npm run setup runs it, and it added no dependency", pkg.scripts.setup === "node scripts/setup.mjs" && Object.keys(pkg.dependencies).join() === "jsdom" && Object.keys(pkg.devDependencies).sort().join() === "pdfjs-dist,sql.js");
+  ok("npm run setup runs it, and it added no dependency (wrangler is pinned to an exact version, for npm ci)", pkg.scripts.setup === "node scripts/setup.mjs" && Object.keys(pkg.dependencies).join() === "jsdom" &&
+    Object.keys(pkg.devDependencies).sort().join() === "pdfjs-dist,sql.js,wrangler" && /^\d+\.\d+\.\d+$/.test(pkg.devDependencies.wrangler));
   ok("the old secrets script is gone and nothing points at it", !fs.existsSync(path.join(__dirname, "scripts/set-worker-secrets.py")) &&
     ["wrangler.toml", "README.md", "test105_locale.js", "package.json"].every(f => !/set-worker-secrets/.test(read(f))));
   ok("wrangler.toml as shipped still has only placeholders (the installer writes the real values on your copy)", /REPLACE-WITH-YOUR-D1-DATABASE-ID/.test(tomlSrc) && !tomlSrc.includes(S.VARS_BEGIN) && !/^routes\s*=/m.test(tomlSrc));

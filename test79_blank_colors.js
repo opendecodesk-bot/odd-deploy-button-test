@@ -125,7 +125,8 @@ const near = (a, b) => Math.abs(a - b) < 0.005;
     /SIZE_ORDER\.forEach\(sz => \{ if \(!have\.has\(sz\)\)/.test(a));
   ok("blanks list shows colors and search covers them", /Colors &amp; sizes/.test(a) && /\.\.\.\(b\.colors \|\| \[\]\)\.map\(c => c\.color\)/.test(a));
   ok("a Merge button + modal call mergeBlanks", /onclick="blankMerge/.test(a) && /function showMergeBlanksModal_/.test(a) && /action: "mergeBlanks"/.test(a));
-  ok("receive (single + order) and write-off send color", /color: sz\.color \|\| ""/.test(a) && /color: q\.dataset\.color \|\| ""/.test(a) && /color: sel\.color \|\| ""/.test(a));
+  ok("receive order and write-off send color; the per-blank Receive window is gone (Receive order is the one way in)", /color: q\.dataset\.color \|\| ""/.test(a) && /color: sel\.color \|\| ""/.test(a) &&
+    !/function showReceiveBlanksModal/.test(a) && !/onclick="blankReceive\(/.test(a));
   ok("blank-links map (productColor, productSize) → blank color+size", /productColor: pc, productSize: size, blankId: Number\(k\.blankId\), blankColor/.test(a) && /class="bl-color"/.test(a));
   ok("blank-links has an Auto-map-from-first-row button that fills every row by name", /id="blAutoMap"/.test(a) && /Auto-map all from the first row/.test(a) && /section\.querySelectorAll\("\.bl-blank"\)\.forEach/.test(a));
   ok("storefront shows blank color images (after the product's own) and swaps them per garment color", /function productImages_/.test(h) && /colorImages/.test(h) && /function cfgImages_/.test(h) && /id="cfgimg-/.test(h));

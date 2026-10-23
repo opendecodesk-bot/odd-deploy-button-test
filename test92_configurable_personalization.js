@@ -44,7 +44,7 @@ const catalog = { status: "ok", orgId: "o1", catalog: { name: "League", eyebrow:
 
   // Empty name refused.
   d.querySelector('#cadd-tee').click();
-  ok("add is refused with an empty name", (w._alerts || []).some(m => /name to embroider/i.test(m)) && w.eval("cart").length === 0);
+  ok("add is refused with an empty name", /name to embroider/i.test(d.getElementById("cmsg-tee").textContent) && w.eval("cart").length === 0);
   d.getElementById("pers-name-tee").value = "  Bob  ";
   d.querySelector('#cadd-tee').click();
   const line = w.eval("cart")[0];

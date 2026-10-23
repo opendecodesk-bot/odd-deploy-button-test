@@ -122,7 +122,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   await new Promise(r => setTimeout(r, 150));
   await w.loadAdminScript();
   w.eval(`adminKey = "cookie";`);
-  ok("it's in the Inventory menu", /\["blankorder", "Blanks to Order"\]/.test(adminJs) && /raw === "blankorder"/.test(adminJs));
+  ok("it's in the Inventory menu", /\["blankorder", "Blanks to order"\]/.test(adminJs) && /raw === "blankorder"/.test(adminJs));
   // The arithmetic, on its own.
   const R = (needed, onHand, reserved, price) => w.blanksToOrderRow_({ needed, onHand, reserved, price }, true);
   ok("to order = needed − free stock, never below zero", R(8, 3, 0, 11.50).toOrder === 5 && R(2, 5, 4, 11.50).toOrder === 1 && R(2, 9, 0, 1).toOrder === 0 && R(2, 1, 4, 1).toOrder === 2);

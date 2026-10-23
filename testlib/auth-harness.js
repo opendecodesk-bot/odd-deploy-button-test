@@ -17,8 +17,12 @@ const strip = (src) => src.replace(/import\s*\{[\s\S]*?\}\s*from\s*["'][^"']+["'
 const ORIGIN = "https://admin.example.com";
 
 // The sources every endpoint needs, with the real adminAuth.js. `extra` is appended (an endpoint).
-const prelude = () => strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/db.js")) + "\n" + strip(read("functions/_lib/totp.js")) + "\n" +
+// `realLimits`: the real rate limiter on the same database instead of the stand-ins (failures are then
+// counted in rate_limits, not in `hits`).
+const prelude = (realLimits) => strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/db.js")) + "\n" + strip(read("functions/_lib/totp.js")) + "\n" +
+  (realLimits ? strip(read("functions/_lib/rateLimit.js")) + "\n" :
   "const rateLimitCheck = async () => ({ blocked: false }), rateLimited = async () => ({ blocked: false }), rateLimitResponse = () => null, rateLimitHit = async (env, bucket) => { __hits.push(bucket); };\n" +
+  "const rateLimitCheckGlobal = async () => ({ blocked: false }), rateLimitHitGlobal = async () => {};\n") +
   "const accessEnabled = () => false, verifyAccess = async () => ({ ok: true }); const getCatalogData = async () => ({ subdomainMap: {}, business: {} });\n" +
   strip(read("functions/_lib/adminAuth.js")) + "\n";
 
@@ -42,16 +46,18 @@ function totpNow(secret, step = 0) {
   return String((((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1000000).padStart(6, "0");
 }
 
-async function makeAuth({ d1, passphrase = "abcd-efgh-jkmn-pqrs-tuvw-xyz2" } = {}) {
+async function makeAuth({ d1, passphrase = "abcd-efgh-jkmn-pqrs-tuvw-xyz2", realLimits = false } = {}) {
   if (!d1) { d1 = await createD1(); d1._raw.exec(read("schema.sql")); }
   const hits = [];
-  const load = (file, ret) => new Function("__hits", prelude() + (file ? strip(read(file)) : "") + "\nreturn " + ret + ";")(hits);
+  const load = (file, ret) => new Function("__hits", prelude(realLimits) + (file ? strip(read(file)) : "") + "\nreturn " + ret + ";")(hits);
   const session = load("functions/api/admin-session.js", "{ post: onRequestPost, del: onRequestDelete }");
   const password = load("functions/api/admin-password.js", "onRequestPost");
   const users = load("functions/api/admin-users.js", "onRequestPost");
   const twoFactor = load("functions/api/admin-2fa.js", "onRequestPost");
   // Internals a test needs to stage an older install (a password record as the old code stored it).
   const lib = load("", "{ passwordRecordFor_, requireAdmin, adminUser, adminActor, setUserRoleAndStatus, getAuditLog }");
+  // The real limiter's own functions, when realLimits (to test it directly).
+  const limits = realLimits ? load("", "{ rateLimited, rateLimitCheck, rateLimitHit, rateLimitCheckGlobal, rateLimitHitGlobal, ipv6Prefix64 }") : null;
   // The orders endpoint — the 207 back-office actions — behind the real gate. Everything it does
   // AFTER the gate may fail here for want of data; tests of the gate only look at who is let past.
   let ordersPost = null;
@@ -70,7 +76,7 @@ async function makeAuth({ d1, passphrase = "abcd-efgh-jkmn-pqrs-tuvw-xyz2" } = {
   const raw = { "/api/admin-session": { POST: session.post, DELETE: session.del }, "/api/admin-password": { POST: password }, "/api/admin-users": { POST: users }, "/api/admin-2fa": { POST: twoFactor },
     "/api/orders": { POST: async (ctx) => { await orders({}, ""); return ordersPost(ctx); } } };
   return {
-    d1, env, hits, lib, raw, PRINTED: passphrase,
+    d1, env, hits, lib, limits, raw, PRINTED: passphrase,
     signIn: async (email, key, code) => answer(await session.post({ request: request("/api/admin-session", Object.assign({ email, key }, code ? { totpCode: code } : {})), env })),
     signOut: async (cookie) => answer(await session.del({ request: request("/api/admin-session", null, { cookie }), env })),
     password: call(password, "/api/admin-password"), users: call(users, "/api/admin-users"), twoFactor: call(twoFactor, "/api/admin-2fa"), orders,

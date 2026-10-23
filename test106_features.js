@@ -90,7 +90,7 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
   ok("nothing in the schema changed for this: it is one global_settings row", d1.q("SELECT count(*) n FROM global_settings WHERE key='features'")[0].n === 1);
 
   console.log("\n=== /api/catalog tells every page ===");
-  const catalog = new Function(hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => [];\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
+  const catalog = new Function(hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nlet getCatalogData;\n" + strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
   catalog.set(async () => lib.getPublicCatalogData(d1));
   const cat = async (host) => { const res = await catalog.get({ request: { url: `https://${host}.example.com/api/catalog` }, env }); return JSON.parse(await res.text()); };
   await admin({ action: "updateOrg", orgId: "acme", subdomain: "acme", name: "Acme", ready: true, deliveryOptions: [{ type: "pickup" }, { type: "shipping" }, { type: "custom", label: "Hand delivery", fee: 5 }] });
@@ -391,10 +391,13 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
       "listActiveRuns", "startRun", "completeRun", "getRunStats", "abortRun", "markHoopingDone",              // runs
       "listAbortReasons", "saveAbortReason", "deleteAbortReason",                                             // Abort reasons
       "getRunReportByDesign",                                                                                 // Run Times report
+      "setMachineStitchCount", "listMaintenanceTasks", "saveMaintenanceTask", "deleteMaintenanceTask", "recordMaintenance", "getMaintenanceLog", // Machine maintenance
+      "setDesignVersionStitches", "fillDesignStitchCounts",                                                   // design stitch counts
     ],
     bookkeeping: [
       "listExpenseCategories", "saveExpenseCategory", "deleteExpenseCategory", "listExpenses", "saveExpense", "deleteExpense", "getExpenseReport", "previewExpenseImport", "importExpenses", // Expenses
       "listAccounts", "saveAccount", "saveMoneyDefaults", "listMoney", "saveMoneyEntry", "deleteMoneyEntry", "setPaymentAccount", // Accounts & money
+      "getAccountRegister", "setRecordReceipt", "previewReceiptAccountChange", "setReceiptAccount",                       // Account viewer, Change account…
       "getReconciliation", "importStatement", "autoMatchStatement", "matchStatementLine", "unmatchStatementLine", "ignoreStatementLine", "createFromStatementLine", "reconcileMonth", "unreconcileMonth", "listCashoutPayments", // Reconcile
       "listClosedPeriods", "closePeriod", "reopenPeriod", "getAccountantExport",                              // Periods & Export
     ],
@@ -409,22 +412,22 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
   // Everything else the dispatcher answers: always available, whatever the switches say.
   const ALWAYS_ON = [
     // Orders, payments, fulfilment stages (incl. Mark manufactured, which uses blanks)
-    "listOrgs", "getOrders", "getOrdersAllShops", "getOpenOrders", "getPendingCommunications", "setOrderCompleted", "markPaidManual", "resendEmail",
+    "listOrgs", "getOrders", "getOrdersAllShops", "getOpenOrders", "getPendingCommunications", "sendTestEmail", "setOrderCompleted", "useBlanksFromStock", "markPaidManual", "resendEmail",
     "addPayment", "recordRefund", "setRefundShipping", "backfillStripeFees", "setPaymentDate", "deletePayment", "voidPayment", "setDiscount", "deleteOrder", "voidOrder",
     "updateCustomerInfo", "createLocalSale", "createTestTransaction", "setFulfillmentStage", "bulkSetFulfillmentStage", "cancelLineItem", "bulkCancelLineItems", "setLineItemRefund", "editOrder",
-    "recordTracking", "bulkRecordTracking", "setShippingInfo", "setShippingPaidAmount", "createShippingPaymentLink", "updateOrderDate", "setOrderDueDate", "bulkSetDueDate",
+    "recordTracking", "bulkRecordTracking", "setShippingInfo", "setShippingPaidAmount", "createShippingPaymentLink", "sendInvoice", "updateOrderDate", "setOrderDueDate", "bulkSetDueDate",
     "addBlankShipment", "updateBlankShipment", "deleteBlankShipment", "getBlankShipments", "getOrderItemFiles", "saveOrderItemFile", "deleteOrderItemFile",
     // Reports that aren't bookkeeping
     "getAuditLog", "getRevenueReport", "getSalesTaxReport", "getInventoryReport",
     // Shops, products, catalog, settings
-    "listOrgsAdmin", "createOrg", "setupOrgDomain", "getOrgDomainStatus", "updateOrg", "listProducts", "createProduct", "updateProduct", "importProducts", "setProductVisible", "getCatalogIssues", "publish",
+    "listOrgsAdmin", "createOrg", "setupOrgDomain", "getOrgDomainStatus", "updateOrg", "listProducts", "createProduct", "updateProduct", "importProducts", "setProductVisible", "setProductOrder", "createProductVersion", "copyProductVersionSettings", "separateProductVersion", "copyProductsFromOrg", "getCatalogIssues", "publish",
     "getGlobalSettings", "updateGlobalSettings", "getSetupStatus", "getBusinessProfile", "updateBusinessProfile", "getLocaleSettings", "updateLocaleSettings", "getFeatures", "updateFeatures", "getSalesTaxSettings", "updateSalesTaxSettings",
-    "listLocations", "saveLocation", "deleteLocation", "listProductGraphicImages", "setProductGraphicImage", "deleteProductGraphicImage",
+    "listLocations", "saveLocation", "deleteLocation", "listProductCategories", "saveProductCategory", "deleteProductCategory", "listProductGraphicImages", "setProductGraphicImage", "deleteProductGraphicImage",
     "listGraphics", "saveGraphic", "setProductGraphicColorBlocked", "deleteGraphic", "getTierPrices", "setTierPrices",
     // Inventory — always on in this release: blanks, transfers, stock movements, cost of goods
-    "getInventory", "createInventoryItem", "updateInventoryItem", "deleteInventoryItem", "getBlanks", "createBlank", "updateBlank", "deleteBlank", "mergeBlanks", "importBlanks", "getBlanksToOrder",
-    "receiveBlanks", "receiveBlankOrder", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement", "restoreInventoryMovement", "previewBlankCatchUp", "applyBlankCatchUp",
-    "getBlankLinks", "setBlankLink", "deleteBlankLink", "getReadyToShip", "setReadyToShipQty",
+    "getInventory", "createInventoryItem", "updateInventoryItem", "deleteInventoryItem", "getBlankReadyCounts", "getBlanks", "createBlank", "updateBlank", "deleteBlank", "mergeBlanks", "importBlanks", "previewVendorBlanks", "applyVendorBlanks", "copyVendorImage", "suggestColorGroups", "analyzePricing", "getPricingSettings", "updatePricingSettings", "removeBlankImages", "findOrphanImages", "deleteOrphanImages", "listVendorConnections", "fetchVendorProducts", "vendorDirectorySearch", "vendorDirectoryEndpoints", "saveVendorConnection", "deleteVendorConnection", "testVendorConnection", "linkVendorConnectionBlanks", "previewSupplierOrder", "placeSupplierOrder", "listSupplierOrders", "checkSupplierOrderShipments", "cancelSupplierOrder", "getBlanksToOrder", "freeShippingSuggestions", "getVendorShipping", "setVendorShipping", "recordRestockOrder", "cancelRestockOrder", "getPublishState", "getPreviewLink", "previewDiscardShopChanges", "discardShopChanges", "applyRulePrices", "setOrgReady", "getShopWizard", "saveShopWizard", "listShopWizards", "deleteShopWizard", "buildProductFromBlank", "getBrandRules", "updateBrandRules", "listBrandApprovals", "addBrandApproval", "revokeBrandApproval",
+    "receiveBlanks", "receiveBlankOrder", "addBlankSizes", "markBlankPricesChecked", "confirmProductPrices", "recomputeBlankAverageCosts", "getBlankVendorPriceHistory", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement", "restoreInventoryMovement", "previewBlankCatchUp", "applyBlankCatchUp",
+    "getBlankLinks", "setBlankLink", "deleteBlankLink", "getReadyToShip", "setReadyToShipQty", "makeForStock", "getFinishedGoodsMovements", "voidFinishedGoodsMovement",
     "listTransfers", "saveTransfer", "deleteTransfer", "receiveTransferSheet", "writeOffTransfers", "getTransferMovements", "voidTransferMovement", "restoreTransferMovement",
     "getTransferQueue", "getGangSheet", "setTransferReceived", "setTransfersApplied", "refreshOrderFromCatalog", "makeTransferLine",
   ];
@@ -481,11 +484,11 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
   const desktop = () => labels("#adminNav .admin-nav-row .admin-nav-btn"), mobile = () => labels("#adminNav .admin-nav-sheet .admin-nav-btn");
   const go = async (hash) => { w.location.hash = "#" + hash; await w.adminRoute(); await tick(60); };
   const NAV = {
-    production: ["Run Order", "Machines", "Machine Files", "Hoops", "Abort reasons", "Threads", "Run Times"],
-    bookkeeping: ["Expenses", "Accounts & money", "Reconcile", "Periods & Export"],
+    production: ["Run Order", "Machines", "Machine maintenance", "Machine files", "Hoops", "Abort reasons", "Threads", "Run times", "Designs"],
+    bookkeeping: ["Expenses", "Accounts & money", "Reconcile", "Account viewer", "Periods & export"],
     shipping: ["Package sizes"],
   };
-  const ROUTES = { production: ["runorder", "machines", "machinefiles", "hoops", "abortreasons", "threads", "runreport", "designs/acme", "designs/acme/3"], bookkeeping: ["expenses", "money", "reconcile", "books"], shipping: ["packages"] };
+  const ROUTES = { production: ["runorder", "machines", "machinefiles", "hoops", "abortreasons", "threads", "runreport", "designs/acme", "designs/acme/3"], bookkeeping: ["expenses", "money", "reconcile", "accountviewer", "books"], shipping: ["packages"] };
   ok("the page learned the switches from /api/catalog (all on)", KEYS.every(k => w.eval(`featureOn_("${k}")`) === true));
   w.renderAdminNav();
   const allOn = desktop();
@@ -497,7 +500,7 @@ const tick = (ms) => new Promise(res => setTimeout(res, ms || 40));
     w.eval(`applyFeatures_({ ${f}: false })`); w.renderAdminNav();
     const d = desktop(), m = mobile(), others = Object.entries(NAV).filter(([k]) => k !== f).flatMap(([, v]) => v);
     ok(`${f} off: its pages leave the desktop menu and the phone menu, and nothing else does`, NAV[f].every(l => !d.includes(l) && !m.includes(l)) && others.every(l => d.includes(l) && m.includes(l)) &&
-      ["Orders", "Manage catalog", "Blanks", "Transfers", "Audit Log", "Revenue Report", "Sales Tax Report", "Inventory & COGS", "Communications", "Global settings", "Sign out"].every(l => d.includes(l) && m.includes(l)));
+      ["Orders", "Manage catalog", "Blanks", "Transfers", "Audit log", "Revenue report", "Sales tax report", "Inventory & COGS", "Communications", "Global settings", "Sign out"].every(l => d.includes(l) && m.includes(l)));
     sent.length = 0; let allOff = true;
     for (const h of ROUTES[f]) { await go(h); const p = doc.getElementById("featureOffPanel"); allOff = allOff && !!p && p.dataset.feature === f && /This feature is turned off — turn it on under Global settings/.test(p.textContent); }
     ok(`${f} off: each of its routes shows the turned-off page instead of the screen, and asks the server for nothing`, allOff && sent.length === 0 && /is turned off/.test(doc.querySelector("#app h1").textContent));

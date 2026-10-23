@@ -26,11 +26,10 @@
  *   CF_PAGES_PROJECT (Pages mode, e.g. "opendecodesk")  or  CF_WORKER_NAME (Worker mode, e.g. this Worker's name)
  */
 
-import { rootDomain, adminSubdomains } from "./hostConfig.js";
+import { rootDomain, adminSubdomains, RESERVED_SUBDOMAINS } from "./hostConfig.js";
 
 const API = "https://api.cloudflare.com/client/v4";
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const RESERVED = ["www", "api", "images"];
 
 export function customDomainConfig(env) {
   const base = { token: env.CF_API_TOKEN, accountId: env.CF_ACCOUNT_ID, zoneId: env.CF_ZONE_ID };
@@ -43,7 +42,7 @@ export function customDomainConfig(env) {
 export function orgHostname(subdomain, env) {
   const label = String(subdomain || "").trim().toLowerCase();
   if (!LABEL_RE.test(label)) throw domainError_(`"${subdomain}" isn't a valid subdomain (letters, numbers and inner hyphens only).`);
-  if (RESERVED.includes(label) || adminSubdomains(env).includes(label)) throw domainError_(`"${label}" is reserved and can't be used for a shop.`);
+  if (RESERVED_SUBDOMAINS.includes(label) || adminSubdomains(env).includes(label)) throw domainError_(`"${label}" is reserved and can't be used for a shop.`);
   return label + "." + rootDomain(env);
 }
 

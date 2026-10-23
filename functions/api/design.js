@@ -31,14 +31,23 @@ import { requireAdmin, timingSafeEqual } from "../_lib/adminAuth.js";
 import { jsonResponse, featureOffResponse, featureIsOff } from "../_lib/http.js";
 import { readBodyWithLimit, hasValidMagicBytes } from "../_lib/fileUpload.js";
 
-// Common embroidery machine file formats, split by role: the native, editable design-software
-// project file (what you'd open to make an edit) vs. the actual stitch file a machine runs (what
-// gets sent over by the local send-agent). Deliberately broad rather than tied to
-// one brand — a shop's machines and whatever comes in from a customer/vendor may use any
-// of these. A line-item upload (itemId, no role) accepts either bucket, unioned.
-const DESIGN_NATIVE_EXTS = new Set(["emb", "jdx"]);
-const MACHINE_STITCH_EXTS = new Set(["dst", "pes", "exp", "vp3", "xxx", "hus", "jef", "csd", "shv", "u01", "edr", "dsz", "pcs"]);
-const EMBROIDERY_EXTS = new Set([...DESIGN_NATIVE_EXTS, ...MACHINE_STITCH_EXTS]);
+// Embroidery file formats: ANY embroidery extension is accepted. There are dozens of
+// formats across brands, so instead of an allowlist a file is accepted when its extension is a plain
+// 1–10 letter/digit word that isn't a known non-embroidery type (web pages, scripts, programs,
+// images, documents, archives — NOT_EMBROIDERY_EXTS). The two roles still can't be swapped for the
+// formats we know: a known stitch format can't be the Design (native project) file and a known
+// project format can't be the Machine file — "Send design to machine" relies on the machine file
+// being a stitch file. An unknown extension is trusted to be what the admin says it is. A line-item
+// upload (itemId, no role) accepts any embroidery file or an image.
+const DESIGN_NATIVE_EXTS = new Set(["emb", "jdx", "art", "ofm", "pxf"]);
+const MACHINE_STITCH_EXTS = new Set(["dst", "dsb", "dsz", "pes", "pec", "exp", "vp3", "vip", "xxx", "hus", "jef", "sew", "csd", "shv", "u01", "edr", "pcs", "pcm", "tap", "tbf", "fdr", "ksm", "10o", "gt", "inb", "max", "emd", "new", "stx", "sst", "phb", "phc"]);
+const NOT_EMBROIDERY_EXTS = new Set([
+  "html", "htm", "xhtml", "shtml", "mht", "svg", "svgz", "xml", "xsl", "js", "mjs", "cjs", "css", "json", "wasm",
+  "php", "phtml", "asp", "aspx", "jsp", "cgi", "pl", "py", "rb", "sh", "bash", "zsh", "ps1", "psm1", "vbs", "vbe", "wsf", "hta",
+  "exe", "com", "bat", "cmd", "msi", "msp", "dll", "scr", "cpl", "jar", "app", "dmg", "pkg", "deb", "rpm", "apk", "lnk", "reg",
+  "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "ico", "pdf", "doc", "docx", "docm", "xls", "xlsx", "xlsm",
+  "ppt", "pptx", "rtf", "txt", "csv", "zip", "rar", "7z", "gz", "tar", "iso"]);
+export const isEmbroideryExt = (ext) => /^[a-z0-9]{1,10}$/.test(ext) && !NOT_EMBROIDERY_EXTS.has(ext);
 const IMAGE_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
 const IMAGE_EXTS = new Set(Object.values(IMAGE_TYPES));
 
@@ -82,23 +91,26 @@ export async function onRequestPost({ request, env }) {
 
   const reqExt = String(url.searchParams.get("ext") || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const isImage = IMAGE_TYPES[contentType] === reqExt;
-  const isEmbroidery = !isImage && EMBROIDERY_EXTS.has(reqExt);
+  const isEmbroidery = !isImage && isEmbroideryExt(reqExt);
   const roleParam = url.searchParams.get("role") || "";
   if (productionOff && (designId || roleParam)) return featureOffResponse("production", "Production");
   if (designId || roleParam) {
     // A design version's two files are role-restricted — and so are an order-specific design's
-    // (a line-item upload that names a role, migrations/0032): the native project file must be a
-    // recognized editable format, the machine file must be a recognized stitch format — this is
-    // what lets the Run screen's "Send design to machine" trust it has the right kind of file.
+    // (a line-item upload that names a role, migrations/0032): any embroidery format, but a known
+    // stitch format can't be the native project file and a known project format can't be the
+    // machine file — this is what lets "Send design to machine" trust it has the right kind of file.
     const role = roleParam;
     if (role !== "design" && role !== "machine") {
       return jsonResponse({ status: "error", message: "Missing or invalid role (must be 'design' or 'machine')." }, 400);
     }
-    const allowed = role === "design" ? DESIGN_NATIVE_EXTS : MACHINE_STITCH_EXTS;
-    if (!allowed.has(reqExt)) {
-      return jsonResponse({ status: "error", message: role === "design"
-        ? `Design file must be a native design format (${[...DESIGN_NATIVE_EXTS].join(", ")}).`
-        : `Machine file must be a recognized stitch format (${[...MACHINE_STITCH_EXTS].join(", ")}).` }, 400);
+    if (!isEmbroideryExt(reqExt)) {
+      return jsonResponse({ status: "error", message: `A .${reqExt || "?"} file isn't an embroidery file.` }, 400);
+    }
+    if (role === "design" && MACHINE_STITCH_EXTS.has(reqExt)) {
+      return jsonResponse({ status: "error", message: `A .${reqExt} is a machine stitch file — the Design file must be the native design format (the editable project file). Upload the .${reqExt} as the Machine file.` }, 400);
+    }
+    if (role === "machine" && DESIGN_NATIVE_EXTS.has(reqExt)) {
+      return jsonResponse({ status: "error", message: `A .${reqExt} is a design-software project file — the Machine file must be a stitch format the machine runs (e.g. .dst, .dsb, .pes).` }, 400);
     }
   } else if (!isImage && !isEmbroidery) {
     return jsonResponse({ status: "error", message: "Unsupported file type." }, 400);
@@ -119,7 +131,7 @@ export async function onRequestPost({ request, env }) {
   const key = `${prefix}/${id}.${reqExt}`;
   const name = String(url.searchParams.get("name") || "").replace(/[^\w .()-]/g, "").trim().slice(0, 120) || `file.${reqExt}`;
   try {
-    await env.DESIGNS.put(key, bytes, { httpMetadata: { contentType: contentType || "application/octet-stream" }, customMetadata: { name } });
+    await env.DESIGNS.put(key, bytes, { httpMetadata: { contentType: isImage ? contentType : "application/octet-stream" }, customMetadata: { name } });
   } catch {
     return jsonResponse({ status: "error", message: "Upload failed — could not store the file." }, 502);
   }

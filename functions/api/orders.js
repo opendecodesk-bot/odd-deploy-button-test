@@ -11,40 +11,68 @@
  *   - Prices are recalculated server-side from D1 (priceItem()), never trusted from client
  */
 
-import { classifyHost, rootDomain } from "../_lib/hostConfig.js";
+import { classifyHost, rootDomain, adminSubdomains } from "../_lib/hostConfig.js";
 import { getCatalogData, invalidateCatalogVersionCache } from "../_lib/catalogCache.js";
 import { validateOrgFields, validateProductImages, cleanImageUrl, PRODUCT_ID_RE } from "../_lib/catalogValidation.js";
-import { requireAdmin, adminActor } from "../_lib/adminAuth.js";
+import { requireAdmin, adminActor, adminUser } from "../_lib/adminAuth.js";
+import { copyVendorImage } from "../_lib/vendorImages.js";
+import { countStitches } from "../_lib/stitchCount.js";
+import { findOrphanImages, deleteOrphanImages } from "../_lib/orphanImages.js";
+import { searchPsCompanies, getPsEndpoints, fetchVendorProduct, PS_OVERRIDES, psSendPO } from "../_lib/promostandards.js";
+import { supplierConnection, supplierShipMethods, supplierShipTo, planSupplierOrder, checkSupplierShipments, supplierOrderApprovalCheck } from "../_lib/supplierOrders.js";
+import { encryptVendorCredentials, decryptVendorCredentials, vendorCredentialsReady } from "../_lib/vendorCredentials.js";
+
+// Color price groups sent with a product (migrations/0064): checked against the product's pricing mode,
+// sizes and garment colors (as sent, else as stored), and turned into cents on body.colorGroupsCents.
+// Returns an error message or "".
+function colorGroupsProblem_(body, before) {
+  if (body.colorGroups === undefined) return "";
+  const pick = (k) => body[k] !== undefined ? body[k] : (before ? before[k] : undefined);
+  const product = { pricingMode: pick("pricingMode"), sizePricing: pick("sizePricing") || {}, garmentColors: pick("garmentColors") || [] };
+  if ((body.colorGroups || []).length && !(pick("configurable") && product.garmentColors.length)) return "Color price groups are for products customers pick a garment color on.";
+  const r = cleanColorGroups_(body.colorGroups || [], product);
+  if (r.error) return r.error;
+  body.colorGroupsCents = r.groups;
+  return "";
+}
+
+// Vendor-price changes (cents, from writeBlankColors_) in dollars for the audit log.
+const vendorPriceAudit_ = (list) => (list || []).slice(0, 200).map(c => ({ color: c.color, size: c.size,
+  from: c.from == null ? null : c.from / 100, to: c.to == null ? null : c.to / 100 }));
 import { checkShippedDeliveries, checkBlankShipments } from "../_lib/deliveryCheck.js";
 import { ensureOrgDomain, getOrgDomainStatus } from "../_lib/customDomain.js";
 import { setupStatus, setupSummary } from "../_lib/setupStatus.js";
 import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
-import { jsonResponse, featureOffResponse } from "../_lib/http.js";
+import { jsonResponse, featureOffResponse, signOrderToken } from "../_lib/http.js";
 import {
   getAllOrgs, getOrgById, createOrg, updateOrg, cleanDeliveryOptions, setOrgDeliveryOptions, defaultDeliveryOptions, cleanShippingAddress, stagePrereqError, getSystemIssues,
-  getProductsByOrg, createProduct, updateProduct, setProductVisible,
+  getProductsByOrg, productShipWeightOz, createProduct, updateProduct, setProductVisible,
   getGlobalSettings, setGlobalSettings, getMachineSettings, setMachineSettings,
   getShipFromAddress, setShipFromAddress, getBusinessProfile, setBusinessProfile, getLocaleSettings, setLocaleSettings, FEATURES, getFeatures, setFeatures, resolveTimeZone, setOrdersCompleted, getShippedAwaitingDelivery,
   getBoxPresets, setBoxPresets,
   addShippingPaidAmount, setShippingPaidAmount,
   getAllInventory, createInventoryItem, updateInventoryItem, deleteInventoryItem,
-  getAllBlanks, createBlank, updateBlank, deleteBlank, mergeBlanks, getBlanksToOrder, importBlanksCsv, importProductsCsv, IMPORT_MAX_ROWS,
+  getAllBlanks, createBlank, updateBlank, deleteBlank, mergeBlanks, getBlanksToOrder, getFreeShippingCandidates, getBlankLowStock, getVendorShipping, setVendorShipping, vendorShippingFor, recordRestockOrder, listRestockOrders, cancelRestockOrder, importBlanksCsv, importProductsCsv, IMPORT_MAX_ROWS,
   listThreads, createThread, updateThread, deleteThread, importThreadChart,
   listSpoolSizes, saveSpoolSize, deleteSpoolSize, saveThreadInventory, deleteThreadInventory,
   listNeedleSizes, saveNeedleSize, deleteNeedleSize, listNeedleTypes, saveNeedleType, deleteNeedleType, needleTypeExists,
+  listProductCategories, saveProductCategory, deleteProductCategory, getCategoryPackMap, setProductOrder, setProductVersion, copyProductsFromOrg,
+  sendOrderInvoice, getOrderInvoiceByOrder,
   listHoops, createHoop, updateHoop, deleteHoop,
   listLocations, saveLocation, deleteLocation,
   listProductGraphicImages, setProductGraphicImage, deleteProductGraphicImage, getProductLocationBaseImages,
-  listGraphics, getGraphic, createGraphic, updateGraphic, setProductGraphicColorBlocked, deleteGraphic,
+  listGraphics, getGraphic, createGraphic, updateGraphic, graphicGlobalProblem, setProductGraphicColorBlocked, deleteGraphic,
   getTierPrices, setTierPrices, setOrgReorderQr, setOrgReorderQrTransfer,
   listTransfers, createTransfer, updateTransfer, deleteTransfer, receiveTransferSheet, transferSheetShares, SHEET_PCT_TOLERANCE,
   writeOffTransfers, getTransferMovements, voidTransferMovement, restoreTransferMovement, getTransferMovementById, getTransferRestoreBlocker, transferMovementMonth, getTransferValuation, getTransferCogs,
   getTransferQueue, setTransferReceived, getGangSheet, makeTransferLine, setTransfersApplied, lineHasEmbroidery, refreshOrderLinesFromCatalog,
   listDesigns, getDesign, saveDesign, deleteDesign, listDesignVersions, addDesignVersion, updateDesignVersionThreads, setProductDesign,
-  listProductDesigns, setProductDesigns, listOrderItemDesigns, addOrderItemDesign, getCatalogIssues,
+  listProductDesigns, setProductDesigns, listOrderItemDesigns, addOrderItemDesign, getCatalogIssues, getBlankReadyByOrg,
+  setMachineStitchCount, listMaintenanceTasks, saveMaintenanceTask, deleteMaintenanceTask, recordMaintenance, getMaintenanceLog,
+  listDesignsMissingStitches, setDesignStitchCount, cleanStitchCount,
   getOrderItemFiles, addOrderItemFile, deleteOrderItemFile,
   listMachines, getMachine, saveMachine, deleteMachine, setMachineHoop, setMachineNeedle, setMachineNeedles,
-  recordMachineDiscovery, getProductionQueue, getOrdersAwaitingBlanks, getPaidUnrunOrders, markItemPieceManufactured,
+  recordMachineDiscovery, getProductionQueue, getOrdersAwaitingBlanks, getPaidUnrunOrders, markItemPieceManufactured, pullStockLines, useBlanksFromStock, getBlankReservations,
   addBlankShipment, updateBlankShipment, deleteBlankShipment, getBlankShipmentsForOrder,
   listAbortReasons, createAbortReason, updateAbortReason, deleteAbortReason,
   listActiveRuns, startProductionRun, startHooping, markHoopingDone, completeProductionRun, getRunStats, RUN_ISSUE_KINDS, abortProductionRun, getRunReportByDesign,
@@ -61,7 +89,8 @@ import {
   getLatestVerificationsByOrg,
   updateOrderShipping,
   addOrderPayment, getOrderPaymentById, setOrderDiscount,
-  getReadyToShipByOrg, upsertReadyToShipQty,
+  getReadyToShipByOrg, upsertReadyToShipQty, addBlankSizes, getFinishedStock, makeForStock, setFinishedCount, getFinishedGoodsMovements,
+  voidFinishedGoodsMovement, getFinishedGoodsValuation, WRITEOFF_REASONS,
   updateOrderPlacedAt, setOrderDueDate,
   insertAuditLog, getAuditLog,
   getRevenueData,
@@ -75,16 +104,21 @@ import {
   SCHEDULE_C_LINES, DEDUCTION_TYPES, DEPRECIATION_METHODS, listExpenseCategories, getExpenseCategory, findExpenseCategoryByName,
   saveExpenseCategory, deleteExpenseCategory, listExpenses, getExpense, saveExpense, deleteExpense, expenseMonth, getExpenseSummary,
   getRefundedCents, getDepositPayments, linkPaymentsToCashout, cashoutNetCents_,
-  receiveBlanks, writeOffBlanks, getBlankMovements, getInventoryValuation, getCogsReport, planBlankCatchUp, applyBlankCatchUp, voidInventoryMovement, getInventoryMovementById, restoreInventoryMovement, getInventoryRestoreBlocker,
+  receiveBlanks, writeOffBlanks, getBlankMovements, markBlankPricesChecked, getBlankVendorPriceHistory, getProductPriceChanges, confirmProductPrices, getBlankPriceReminder, getBlanksNeedingPriceCheck, getBlankProductUses, recomputeBlankAverageCosts, planVendorBlanks, applyVendorBlanks, cleanColorGroups_, suggestColorGroups, listVendorConnections, getVendorConnectionRow, saveVendorConnection, setVendorConnectionStatus, deleteVendorConnection, linkBlanksToVendorConnection,
+  getPublishedOrg, setOrgReady, getShopWizard, saveShopWizard, deleteShopWizard, listShopWizards, setProductLinksFromBlank, publishShop, getPublishState, getDraftCatalogShop, signPreviewToken,
+  planDiscardShopChanges, discardShopChanges, applyProductPrices,
+  getBrandRules, setBrandRules, DEFAULT_BRAND_RULES, brandRuleFor_, listBrandApprovals, addBrandApproval, revokeBrandApproval, getBrandApproval,
+  nextSupplierPoNumber, insertSupplierOrder, claimSupplierOrderRetry, setSupplierOrderResult, getSupplierOrder, listSupplierOrders, markItemsBlankOrdered, cancelSupplierOrder, getInventoryValuation, getCogsReport, planBlankCatchUp, applyBlankCatchUp, voidInventoryMovement, getInventoryMovementById, restoreInventoryMovement, getInventoryRestoreBlocker, removeBlankColorImages, analyzePricing, getPricingSettingsView, pricingBelowTargetForBlanks, setPricingSettings,
   voidOrder, voidPayment, getClosedPeriods, isMonthClosed, closePeriod, reopenPeriod, monthOf,
   orderMonth, itemOrderMonth, paymentMonth, movementMonth, getCashReport, getAccountantExport,
-  bumpCatalogVersion,
+  bumpCatalogVersion, listStockPurchases,
+  getAccountRegister, getReceiptRecords, receiptTargets, getRecordReceipt, setReceiptFile, receiptAccountBlockers, setReceiptAccount,
   lineQty, QTY_MESSAGE, zipStates, SHIPPING_QUOTE_PENDING, byId_,
 } from "../_lib/db.js";
 import {
   sendOrderReceivedEmail,
   sendPaymentConfirmedEmail, sendCancellationEmail, sendShippedEmail,
-  sendDesignVerificationEmail, sendShippingPaymentEmail,
+  sendDesignVerificationEmail, sendShippingPaymentEmail, sendInvoiceEmail, sendTestEmail,
 } from "../_lib/email.js";
 import { verifyQuote, canonicalItems } from "../_lib/quoteToken.js";
 import { selectBox } from "../_lib/boxSize.js";
@@ -94,35 +128,58 @@ const ORDER_ID_RE = /^[A-Za-z0-9\-]{1,64}$/;
 // "Quote pending" is a note for the shop, not a carrier: wherever a shipping method is printed for
 // a customer (the shipped email, a shipping payment link) it reads as no method.
 const shownMethod_ = (m) => (m === SHIPPING_QUOTE_PENDING ? "" : String(m || ""));
+
+// A purchase order's number prefix (migrations/0072): TEST on a supplier's test service, else the Business profile's
+// Purchase order prefix (blank = PO).
+const supplierPoPrefix_ = async (db, conn) => conn && conn.environment === "test" ? "TEST" : ((await getBusinessProfile(db)).poPrefix || "PO");
+
+// Reads a design's stitch count from its machine file in the private DESIGNS bucket (migrations/0071) — for runs of
+// designs uploaded before the browser sent the count. null when there's no bucket, no file, or a format it can't read.
+const stitchReader_ = (env) => (env && env.DESIGNS ? async (d) => {
+  const ext = String(d.machineFileExt || d.machineFileName || "").toLowerCase().replace(/^.*\./, "");
+  if (!["dst", "dsb"].includes(ext) || !d.machineFileKey) return null;
+  const obj = await env.DESIGNS.get(String(d.machineFileKey));
+  if (!obj) return null;
+  return countStitches(await obj.arrayBuffer(), ext);
+} : null);
 // Carrier rate quotes and labels work from US ZIP codes only (Region → country).
 const NO_CARRIER_SHIPPING_MSG = "Carrier shipping (rates by ZIP) is only available when the country in Global settings → Region is US. Use Local pickup or a custom delivery option with a flat fee instead.";
 
 const CATALOG_ADMIN_ACTIONS = new Set([
   "createOrg", "updateOrg", "listOrgsAdmin", "setupOrgDomain", "getOrgDomainStatus",
-  "listProducts", "createProduct", "updateProduct", "setProductVisible", "importProducts", "importBlanks", "getBlanksToOrder",
+  "listProducts", "createProduct", "updateProduct", "setProductVisible", "setProductOrder", "createProductVersion", "copyProductVersionSettings", "separateProductVersion", "copyProductsFromOrg", "importProducts", "importBlanks", "getBlanksToOrder",
+  "freeShippingSuggestions", "getVendorShipping", "setVendorShipping", "recordRestockOrder", "cancelRestockOrder",
   "getGlobalSettings", "updateGlobalSettings", "getSetupStatus", "getMachineSettings", "updateMachineSettings",
   "getShipFromAddress", "updateShipFromAddress", "getBusinessProfile", "updateBusinessProfile",
   "getLocaleSettings", "updateLocaleSettings", "getFeatures", "updateFeatures",
   "getSalesTaxSettings", "updateSalesTaxSettings",
   "getBoxPresets", "setBoxPresets",
   "getInventory", "createInventoryItem", "updateInventoryItem", "deleteInventoryItem",
-  "getBlanks", "createBlank", "updateBlank", "deleteBlank", "mergeBlanks",
+  "getBlanks", "createBlank", "updateBlank", "deleteBlank", "mergeBlanks", "markBlankPricesChecked", "getBlankVendorPriceHistory", "recomputeBlankAverageCosts", "confirmProductPrices",
+  "previewVendorBlanks", "applyVendorBlanks", "copyVendorImage", "getPricingSettings", "updatePricingSettings", "analyzePricing", "removeBlankImages", "findOrphanImages", "deleteOrphanImages", "suggestColorGroups",
+  "vendorDirectorySearch", "vendorDirectoryEndpoints", "listVendorConnections", "saveVendorConnection", "deleteVendorConnection", "testVendorConnection", "linkVendorConnectionBlanks", "fetchVendorProducts",
+  "previewSupplierOrder", "placeSupplierOrder", "listSupplierOrders", "checkSupplierOrderShipments", "cancelSupplierOrder",
+  "getBrandRules", "updateBrandRules", "listBrandApprovals", "addBrandApproval", "revokeBrandApproval",
+  "getPublishState", "getPreviewLink", "setOrgReady",
+  "getShopWizard", "saveShopWizard", "listShopWizards", "deleteShopWizard", "buildProductFromBlank",
   "listThreads", "saveThread", "deleteThread", "importThreadChart",
   "listSpoolSizes", "saveSpoolSize", "deleteSpoolSize", "saveThreadInventory", "deleteThreadInventory",
   "getNeedleSettings", "saveNeedleSize", "deleteNeedleSize", "saveNeedleType", "deleteNeedleType",
   "listHoops", "saveHoop", "deleteHoop",
   "listLocations", "saveLocation", "deleteLocation",
+  "listProductCategories", "saveProductCategory", "deleteProductCategory",
   "listProductGraphicImages", "setProductGraphicImage", "deleteProductGraphicImage",
   "listDesigns", "getDesign", "saveDesign", "deleteDesign", "saveDesignVersion", "updateDesignVersionColors", "setProductDesign",
-  "listProductDesigns", "setProductDesigns", "getOrderItemDesigns", "saveOrderItemDesign", "getCatalogIssues",
+  "listProductDesigns", "setProductDesigns", "getOrderItemDesigns", "saveOrderItemDesign", "getCatalogIssues", "getBlankReadyCounts",
   "getOrderItemFiles", "saveOrderItemFile", "deleteOrderItemFile",
   "listMachines", "getMachine", "saveMachine", "deleteMachine", "setMachineHoop", "setMachineNeedle",
   "recordMachineDiscovery", "getProductionQueue", "markManufacturedOnMachine",
   "listAbortReasons", "saveAbortReason", "deleteAbortReason",
   "listActiveRuns", "startRun", "completeRun", "getRunStats", "abortRun", "markHoopingDone", "getRunReportByDesign",
-  "receiveBlanks", "receiveBlankOrder", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement", "restoreInventoryMovement", "getInventoryReport", "previewBlankCatchUp", "applyBlankCatchUp",
+  "setMachineStitchCount", "listMaintenanceTasks", "saveMaintenanceTask", "deleteMaintenanceTask", "recordMaintenance", "getMaintenanceLog", "setDesignVersionStitches", "fillDesignStitchCounts",
+  "receiveBlanks", "receiveBlankOrder", "addBlankSizes", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement", "restoreInventoryMovement", "getInventoryReport", "previewBlankCatchUp", "applyBlankCatchUp",
   "getBlankLinks", "setBlankLink", "deleteBlankLink",
-  "getReadyToShip", "setReadyToShipQty",
+  "getReadyToShip", "setReadyToShipQty", "makeForStock", "getFinishedGoodsMovements", "voidFinishedGoodsMovement",
   "listGraphics", "saveGraphic", "deleteGraphic", "setProductGraphicColorBlocked", "getTierPrices", "setTierPrices",
   "listTransfers", "saveTransfer", "deleteTransfer", "receiveTransferSheet", "writeOffTransfers",
   "getTransferMovements", "voidTransferMovement", "restoreTransferMovement",
@@ -141,41 +198,82 @@ const CATALOG_ADMIN_ACTIONS = new Set([
 //   staff    everything else: orders, payments and refunds, shipping, production, inventory,
 //            catalog content, equipment lists, expenses, reports, design files — plus the few
 //            settings their screens read (package sizes, machine settings, the shop list)
+// The product's pricing-awareness numbers (migrations/0067), each optional: minutes to make one item (0–1440),
+// an extra DTF / transfer cost and a shop-supplies override per item ($0–$1,000). Blank / null clears it.
+function checkCosting_(b) {
+  const bad = (v, max) => v !== undefined && v !== null && v !== "" && !(Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= max);
+  if (bad(b.runMinutes, 1440)) return "Run time must be a number of minutes from 0 to 1440.";
+  if (bad(b.transferCost, 1000)) return "DTF / transfer cost must be between $0 and $1,000.";
+  if (bad(b.suppliesCost, 1000)) return "Shop supplies cost must be between $0 and $1,000.";
+  return "";
+}
+
+// A product's price must be entered: a flat price, or at least one size's (a blank box used to save as $0).
+// `before` is the stored product on an update (only what's sent is checked there).
+function checkProductPrice_(body, before) {
+  const mode = body.pricingMode !== undefined ? body.pricingMode : (before ? before.pricingMode : undefined);
+  const money = (v) => v !== null && v !== "" && v !== undefined && Number.isFinite(Number(v)) && Number(v) >= 0;
+  if (mode === "flat") {
+    if (body.flatPrice === undefined && before) return "";
+    if (!money(body.flatPrice)) return "Enter the product's price.";
+  } else if (mode === "sized") {
+    if (body.sizePricing === undefined && before) return "";
+    const entries = Object.entries(body.sizePricing && typeof body.sizePricing === "object" ? body.sizePricing : {});
+    if (!entries.length) return "Enter a price for at least one size.";
+    const bad = entries.filter(([, v]) => !money(v)).map(([k]) => k);
+    if (bad.length) return "Enter a price for " + bad.join(", ") + " (or leave the size out).";
+  }
+  return "";
+}
+
 const ADMIN_ONLY_ACTIONS = [
   "updateGlobalSettings", "updateFeatures", "updateBusinessProfile", "updateLocaleSettings", "updateSalesTaxSettings", "updateShipFromAddress",
-  "updateMachineSettings", "backfillStripeFees", "getAuditLog",
+  "updateMachineSettings", "backfillStripeFees", "getAuditLog", "sendTestEmail", "updatePricingSettings", "findOrphanImages", "deleteOrphanImages", "vendorDirectorySearch", "vendorDirectoryEndpoints", "saveVendorConnection", "deleteVendorConnection", "testVendorConnection", "linkVendorConnectionBlanks",
+  // Ordering from a supplier spends the shop's money (the card / terms the supplier has on file): admin only.
+  "previewSupplierOrder", "placeSupplierOrder", "listSupplierOrders", "checkSupplierOrderShipments", "cancelSupplierOrder",
+  "updateBrandRules",
 ];
 const MANAGER_ACTIONS = [
+  "getPublishState", "getPreviewLink",                            // publish per shop (migrations/0076)
+  "previewDiscardShopChanges", "discardShopChanges",              // Discard changes… (back to the published shop)
+  "applyRulePrices",                                              // Brand rules → Show price impact → Apply
+  "setOrgReady",                                                  // Shop setup → Go live
+  "getShopWizard", "saveShopWizard", "listShopWizards", "deleteShopWizard", "buildProductFromBlank",   // New shop setup wizard
   "createOrg", "updateOrg", "setupOrgDomain", "getOrgDomainStatus", "publish", "createTestTransaction", "getGlobalSettings", "getFeatures",
   "getBusinessProfile", "getLocaleSettings", "getSalesTaxSettings", "getShipFromAddress", "getSetupStatus", "setBoxPresets", "saveAccount",
   "saveMoneyDefaults", "listMoney", "saveMoneyEntry", "deleteMoneyEntry", "getReconciliation", "importStatement", "autoMatchStatement",
   "matchStatementLine", "unmatchStatementLine", "ignoreStatementLine", "createFromStatementLine", "reconcileMonth", "unreconcileMonth",
-  "listCashoutPayments", "saveExpenseCategory", "deleteExpenseCategory", "closePeriod", "reopenPeriod", "getAccountantExport",
+  "listCashoutPayments", "analyzePricing", "getPricingSettings", "setVendorShipping",
+  "getBrandRules", "addBrandApproval", "revokeBrandApproval",   // brand rules (migrations/0075)
+  "recomputeBlankAverageCosts", "getAccountRegister", "setRecordReceipt", "previewReceiptAccountChange", "setReceiptAccount", "saveExpenseCategory", "deleteExpenseCategory", "closePeriod", "reopenPeriod", "getAccountantExport",
 ];
 const STAFF_ACTIONS = [
-  "listOrgsAdmin", "listProducts", "createProduct", "updateProduct", "setProductVisible", "importProducts", "importBlanks", "getBlanksToOrder",
-  "getMachineSettings", "getBoxPresets", "getInventory", "createInventoryItem", "updateInventoryItem", "deleteInventoryItem", "getBlanks",
+  "listBrandApprovals",
+  "listOrgsAdmin", "listProducts", "createProduct", "updateProduct", "setProductVisible", "setProductOrder", "createProductVersion", "copyProductVersionSettings", "separateProductVersion", "copyProductsFromOrg", "importProducts", "importBlanks", "previewVendorBlanks", "applyVendorBlanks", "copyVendorImage", "suggestColorGroups", "removeBlankImages", "listVendorConnections", "fetchVendorProducts", "getBlanksToOrder", "freeShippingSuggestions", "getVendorShipping", "recordRestockOrder", "cancelRestockOrder",
+  "getMachineSettings", "getBoxPresets", "getInventory", "createInventoryItem", "updateInventoryItem", "deleteInventoryItem", "getBlankReadyCounts", "getBlanks",
   "createBlank", "updateBlank", "deleteBlank", "mergeBlanks", "listThreads", "saveThread", "deleteThread", "importThreadChart", "listSpoolSizes",
   "saveSpoolSize", "deleteSpoolSize", "saveThreadInventory", "deleteThreadInventory", "getNeedleSettings", "saveNeedleSize", "deleteNeedleSize",
   "saveNeedleType", "deleteNeedleType", "listHoops", "saveHoop", "deleteHoop", "listLocations", "saveLocation", "deleteLocation",
+  "listProductCategories", "saveProductCategory", "deleteProductCategory",
   "listProductGraphicImages", "setProductGraphicImage", "deleteProductGraphicImage", "listDesigns", "getDesign", "saveDesign", "deleteDesign",
   "saveDesignVersion", "updateDesignVersionColors", "setProductDesign", "listProductDesigns", "setProductDesigns", "getOrderItemDesigns",
   "saveOrderItemDesign", "getCatalogIssues", "getOrderItemFiles", "saveOrderItemFile", "deleteOrderItemFile", "listMachines", "getMachine",
   "saveMachine", "deleteMachine", "setMachineHoop", "setMachineNeedle", "recordMachineDiscovery", "getProductionQueue", "markManufacturedOnMachine",
   "listAbortReasons", "saveAbortReason", "deleteAbortReason", "listActiveRuns", "startRun", "completeRun", "getRunStats", "abortRun",
-  "markHoopingDone", "getRunReportByDesign", "receiveBlanks", "receiveBlankOrder", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement",
+  "setMachineStitchCount", "listMaintenanceTasks", "saveMaintenanceTask", "deleteMaintenanceTask", "recordMaintenance", "getMaintenanceLog", "setDesignVersionStitches", "fillDesignStitchCounts",
+  "markHoopingDone", "getRunReportByDesign", "receiveBlanks", "receiveBlankOrder", "addBlankSizes", "markBlankPricesChecked", "confirmProductPrices", "getBlankVendorPriceHistory", "writeOffBlanks", "getBlankMovements", "voidInventoryMovement",
   "restoreInventoryMovement", "getInventoryReport", "previewBlankCatchUp", "applyBlankCatchUp", "getBlankLinks", "setBlankLink", "deleteBlankLink",
-  "getReadyToShip", "setReadyToShipQty", "listGraphics", "saveGraphic", "deleteGraphic", "setProductGraphicColorBlocked", "getTierPrices",
+  "getReadyToShip", "setReadyToShipQty", "makeForStock", "getFinishedGoodsMovements", "voidFinishedGoodsMovement", "listGraphics", "saveGraphic", "deleteGraphic", "setProductGraphicColorBlocked", "getTierPrices",
   "setTierPrices", "listTransfers", "saveTransfer", "deleteTransfer", "receiveTransferSheet", "writeOffTransfers", "getTransferMovements",
   "voidTransferMovement", "restoreTransferMovement", "getTransferQueue", "setTransferReceived", "getGangSheet", "makeTransferLine",
   "setTransfersApplied", "refreshOrderFromCatalog", "listOrgs", "getOrders", "getOrdersAllShops", "getOpenOrders", "getRevenueReport",
   "listAccounts", "setPaymentAccount", "listExpenseCategories", "listExpenses", "getExpenseReport", "saveExpense", "previewExpenseImport",
   "importExpenses", "deleteExpense", "getPendingCommunications", "checkDeliveries", "checkBlankShipments", "setOrderCompleted", "getSalesTaxReport",
   "markPaidManual", "resendEmail", "addPayment", "recordRefund", "setRefundShipping", "setPaymentDate", "deletePayment", "voidPayment",
-  "setDiscount", "deleteOrder", "voidOrder", "updateCustomerInfo", "createLocalSale", "setFulfillmentStage", "addBlankShipment",
+  "setDiscount", "deleteOrder", "voidOrder", "updateCustomerInfo", "createLocalSale", "setFulfillmentStage", "useBlanksFromStock", "addBlankShipment",
   "updateBlankShipment", "deleteBlankShipment", "getBlankShipments", "bulkSetFulfillmentStage", "cancelLineItem", "bulkCancelLineItems",
   "setLineItemRefund", "editOrder", "recordTracking", "bulkRecordTracking", "getOrderForShipping", "sendDesignVerification",
-  "listDesignVerifications", "setShippingInfo", "setShippingPaidAmount", "createShippingPaymentLink", "updateOrderDate", "setOrderDueDate",
+  "listDesignVerifications", "setShippingInfo", "setShippingPaidAmount", "createShippingPaymentLink", "sendInvoice", "updateOrderDate", "setOrderDueDate",
   "bulkSetDueDate", "listClosedPeriods",
 ];
 const ACTION_ROLE = Object.create(null);   // no prototype: "constructor" is not an action
@@ -202,12 +300,14 @@ const FEATURE_ACTIONS = {
     "getProductionQueue", "markManufacturedOnMachine",
     "listAbortReasons", "saveAbortReason", "deleteAbortReason",
     "listActiveRuns", "startRun", "completeRun", "getRunStats", "abortRun", "markHoopingDone", "getRunReportByDesign",
+    "setMachineStitchCount", "listMaintenanceTasks", "saveMaintenanceTask", "deleteMaintenanceTask", "recordMaintenance", "getMaintenanceLog", "setDesignVersionStitches", "fillDesignStitchCounts",
   ],
   bookkeeping: [
     "listClosedPeriods", "closePeriod", "reopenPeriod", "getAccountantExport",
     "getReconciliation", "importStatement", "autoMatchStatement", "matchStatementLine", "unmatchStatementLine",
     "ignoreStatementLine", "createFromStatementLine", "reconcileMonth", "unreconcileMonth", "listCashoutPayments",
     "listAccounts", "saveAccount", "saveMoneyDefaults", "listMoney", "saveMoneyEntry", "deleteMoneyEntry", "setPaymentAccount",
+    "getAccountRegister", "setRecordReceipt", "previewReceiptAccountChange", "setReceiptAccount",
     "listExpenseCategories", "saveExpenseCategory", "deleteExpenseCategory",
     "listExpenses", "saveExpense", "deleteExpense", "getExpenseReport", "previewExpenseImport", "importExpenses",
   ],
@@ -230,6 +330,13 @@ export async function onRequestPost(context) {
   // "passphrase") and from WHERE (client IP).
   const clientIp = request.headers.get("CF-Connecting-IP") || null;
   const auditEntry = (args) => ({ ...args, actor: adminActor(request), ip: clientIp });
+  // Costs and margins (pricing awareness, migrations/0067) are a manager's. Staff save products and blanks
+  // too, so those replies leave the analysis / below-target list out for them. (No signed-in user — the
+  // installer's passphrase — sees everything, as with every other action.)
+  const seesPricing_ = () => { const u = typeof adminUser === "function" ? adminUser(request) : null; return !u || !u.role || u.role === "manager" || u.role === "admin"; };
+  // Products now below a target or a blank's MAP: all of it for a manager; a worker hears only of MAP (a vendor's
+  // public price), never of costs or targets.
+  const belowFor_ = (list) => seesPricing_() ? list : list.filter(p => p.belowMap).map(p => ({ orgId: p.orgId, productId: p.productId, name: p.name, problems: p.mapProblems || [], belowMap: true }));
   // Routine actions: written in context.waitUntil() so the runtime keeps the
   // D1 write alive after the response is sent. A failure is logged loudly,
   // never silently swallowed.
@@ -266,6 +373,8 @@ export async function onRequestPost(context) {
       if (id) months.push(await moneyEntryMonth(env.DB, b.kind, id));
     }
     if (a === "setPaymentAccount" && b.paymentId) months.push(await paymentMonth(env.DB, b.paymentId));
+    // Moving a whole receipt to another paying account changes both accounts' books for the receipt's month.
+    if (a === "setReceiptAccount" && b.movementId) months.push(b.kind === "transfers" ? await transferMovementMonth(env.DB, b.movementId) : await movementMonth(env.DB, b.movementId));
     if (a === "importExpenses" && Array.isArray(b.rows)) for (const r of b.rows.slice(0, 500)) if (/^\d{4}-\d{2}-\d{2}$/.test(String(r && r.date || ""))) months.push(String(r.date).slice(0, 7));
     if (["receiveBlanks", "receiveBlankOrder"].includes(a) && /^\d{4}-\d{2}-\d{2}$/.test(String(b.receivedAt || ""))) months.push(String(b.receivedAt).slice(0, 7));
     if (a === "writeOffBlanks" && /^\d{4}-\d{2}-\d{2}$/.test(String(b.occurredAt || ""))) months.push(String(b.occurredAt).slice(0, 7));
@@ -278,6 +387,12 @@ export async function onRequestPost(context) {
     if (["voidPayment", "deletePayment", "setRefundShipping"].includes(a) && b.paymentId) months.push(await paymentMonth(env.DB, b.paymentId));
     if ((a === "voidInventoryMovement" || a === "restoreInventoryMovement") && b.movementId) months.push(await movementMonth(env.DB, b.movementId));
     if ((a === "voidTransferMovement" || a === "restoreTransferMovement") && b.movementId) months.push(await transferMovementMonth(env.DB, b.movementId));
+    // Finished stock (migrations/0060): Make for stock by its date; a void by the entry's month.
+    if (a === "makeForStock" && /^\d{4}-\d{2}-\d{2}$/.test(String(b.occurredAt || ""))) months.push(String(b.occurredAt).slice(0, 7));
+    if (a === "voidFinishedGoodsMovement" && b.movementId) {
+      const r = await env.DB.prepare("SELECT occurredAt FROM finished_goods_movements WHERE id=?").bind(Number(b.movementId)).first().catch(() => null);
+      if (r) months.push(String(r.occurredAt).slice(0, 7));
+    }
     for (const m of [...new Set(months.filter(Boolean))]) {
       if (await isMonthClosed(env.DB, m)) {
         const label = new Date(m + "-15T12:00:00Z").toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -341,11 +456,12 @@ export async function onRequestPost(context) {
     const { vendor, vendorRef } = plan;
     const what = (vendor || String(fallbackName || "Blank order")).slice(0, 200) + (vendorRef ? ` #${vendorRef}` : "");
     const keys = [], parts = {};
+    const receiptGroup = newReceiptGroup_();
     for (const g of plan.groups) {
       const ids = await receiveBlanks(env.DB, { blankId: g.blankId, lines: g.lines, vendor, vendorRef,
         receivedAt: date + "T12:00:00.000Z", vendorChargedTax: plan.vendorChargedTax, accountId: paidPersonally ? null : accountId, paidPersonally,
         note: g.ship ? `Received (landed cost incl. $${(g.ship / 100).toFixed(2)} shipping & other costs)` : "Received",
-        receiptKey: plan.receiptKey, receiptName: plan.receiptName });
+        receiptKey: plan.receiptKey, receiptName: plan.receiptName, receiptGroup });
       audit({ orgId: null, orderId: null, action: "inventory.received", detail: { blankId: g.blankId, lines: g.lines, extraCost: g.ship / 100, vendor, vendorRef, ...source } });
       ids.forEach(id => keys.push(`blanks:${id}`));
     }
@@ -354,15 +470,18 @@ export async function onRequestPost(context) {
       const cat = plan.rdCat;
       const id = await saveExpense(env.DB, 0, { date, description: `R&D / testing — ${what}`, categoryId: cat.id, amount: plan.rdTotal / 100, vendor,
         businessUsePct: 100, receiptKey: plan.receiptKey || "", receiptName: plan.receiptName || "", placedInService: cat.deductionType === "depreciation" ? date : null,
-        depMethod: cat.deductionType === "depreciation" ? "ask_cpa" : null, vendorChargedTax: true, accountId: paidPersonally ? null : accountId, paidPersonally });
+        depMethod: cat.deductionType === "depreciation" ? "ask_cpa" : null, vendorChargedTax: true, accountId: paidPersonally ? null : accountId, paidPersonally, receiptGroup });
       keys.push(`expense:${id}`); parts.rd = plan.rdTotal / 100;
     }
     if (plan.personalTotal && !paidPersonally) {
-      const id = await saveMoneyEntry(env.DB, "owner", 0, { date, amount: plan.personalTotal / 100, kind: "draw", accountId, note: `Personal items — ${what}` });
+      const id = await saveMoneyEntry(env.DB, "owner", 0, { date, amount: plan.personalTotal / 100, kind: "draw", accountId, note: `Personal items — ${what}`, receiptGroup });
       keys.push(`owner:${id}`); parts.personal = plan.personalTotal / 100;
     }
     return { keys, parts };
   };
+  // One id for everything a single receive writes (stock rows, R&D / written-off expense, personal draw), so the
+  // whole receipt can be corrected together later (migrations/0061).
+  const newReceiptGroup_ = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, "0")).join("");
   const auditStrict = async (args) => {
     try { await insertAuditLog(env.DB, auditEntry(args)); return null; }
     catch (e) {
@@ -846,7 +965,8 @@ export async function onRequestPost(context) {
   }
 
   // ---- Accounts & money (migrations/0014) -------------------------------------
-  const MONEY_ACTIONS = ["listAccounts", "saveAccount", "saveMoneyDefaults", "listMoney", "saveMoneyEntry", "deleteMoneyEntry", "setPaymentAccount"];
+  const MONEY_ACTIONS = ["listAccounts", "saveAccount", "saveMoneyDefaults", "listMoney", "saveMoneyEntry", "deleteMoneyEntry", "setPaymentAccount",
+    "getAccountRegister", "setRecordReceipt", "previewReceiptAccountChange", "setReceiptAccount"];
   if (MONEY_ACTIONS.includes(body.action)) {
     const denied = await requireAdmin(env, host, body.key, request, "Admin access is only available from the admin subdomain.", ACTION_ROLE[body.action]);
     if (denied) return denied;
@@ -888,10 +1008,81 @@ export async function onRequestPost(context) {
     if (body.action === "listMoney") {
       const from = String(body.dateFrom || ""), to = String(body.dateTo || "");
       if (!ymd(from) || !ymd(to)) return bad("Invalid date range — expected YYYY-MM-DD");
-      const [income, owner, transfers, summary] = await Promise.all([
+      const [income, owner, transfers, summary, stockPurchases] = await Promise.all([
         listMoneyEntries(env.DB, "income", from, to), listMoneyEntries(env.DB, "owner", from, to),
-        listMoneyEntries(env.DB, "transfer", from, to), getMoneySummary(env.DB, from, to)]);
-      return jsonResponse({ status: "ok", dateFrom: from, dateTo: to, income, owner, transfers, summary, ...(await meta()) });
+        listMoneyEntries(env.DB, "transfer", from, to), getMoneySummary(env.DB, from, to), listStockPurchases(env.DB, from, to)]);
+      return jsonResponse({ status: "ok", dateFrom: from, dateTo: to, income, owner, transfers, summary, stockPurchases, ...(await meta()) });
+    }
+    // Account viewer: one account's register (MONEY_MOVE_SOURCES, newest first, with the running balance).
+    if (body.action === "getAccountRegister") {
+      const from = String(body.dateFrom || ""), to = String(body.dateTo || "");
+      if (!ymd(from) || !ymd(to)) return bad("Invalid date range — expected YYYY-MM-DD");
+      if (from > to) return bad("The start date is after the end date");
+      if ((Date.parse(to) - Date.parse(from)) / 86400000 > 740) return bad("Choose a range of two years or less");
+      const reg = await getAccountRegister(env.DB, Number(body.accountId), from, to);
+      if (!reg) return jsonResponse({ status: "error", message: "Account not found" }, 404);
+      return jsonResponse({ status: "ok", ...reg });
+    }
+    // Attach or replace the receipt on a money record (the file was uploaded through /api/receipt). Documentation only —
+    // no amounts change — so it is allowed in a closed month. For a blank / transfer-sheet purchase the receipt covers the
+    // whole receive, so it goes on every record that receive wrote.
+    if (body.action === "setRecordReceipt") {
+      const src = String(body.src || ""), srcId = Number(body.srcId);
+      const key = String(body.receiptKey || "");
+      if (!/^receipts\/\d{4}\/[a-z0-9]{32}\.(jpg|png|webp|pdf)$/.test(key)) return bad("Invalid receipt reference");
+      if (!Number.isInteger(srcId) || srcId <= 0) return bad("Invalid record");
+      const targets = await receiptTargets(env.DB, src, srcId);
+      if (!targets) return jsonResponse({ status: "error", message: "That record wasn't found (or has been voided or deleted)" }, 404);
+      if (env.RECEIPTS && typeof env.RECEIPTS.head === "function" && !(await env.RECEIPTS.head(key))) return bad("The receipt file wasn't found — upload it again");
+      const name = String(body.receiptName || "").slice(0, 200);
+      const before = await getRecordReceipt(env.DB, src, srcId);
+      const auditErr = await auditStrict({ orgId: null, orderId: null, action: before && before.key ? "receipt.replaced" : "receipt.attached",
+        detail: { src, srcId, records: targets.length, from: before ? before.key : "", to: key, name } });
+      if (auditErr) return auditErr;
+      await setReceiptFile(env.DB, targets, key, name);
+      return jsonResponse({ status: "ok", receiptKey: key, receiptName: name, records: targets.length });
+    }
+    // Correct the paying account of a whole received receipt (Accounts & money → Blanks & transfers bought → Change account…):
+    // the stock rows for every blank / sheet on it, its R&D / written-off expense and its personal-use owner draw move together.
+    // `previewReceiptAccountChange` says exactly what will move and what (if anything) stands in the way; `setReceiptAccount` does it.
+    if (body.action === "previewReceiptAccountChange" || body.action === "setReceiptAccount") {
+      const preview = body.action === "previewReceiptAccountChange";
+      const kind = body.kind === "blanks" || body.kind === "transfers" ? body.kind : "";
+      if (!kind) return bad("Unknown kind of purchase");
+      const movementId = Number(body.movementId);
+      const rec = Number.isInteger(movementId) && movementId > 0 ? await getReceiptRecords(env.DB, kind, movementId) : null;
+      if (!rec) return jsonResponse({ status: "error", message: "That purchase wasn't found (or has been voided)" }, 404);
+      let target = null;
+      if (body.paidPersonally === true) target = { accountId: null, paidPersonally: true };
+      else if (body.accountId) {
+        const a = await activeAccount(body.accountId);
+        if (!a) return bad("Choose an active account");
+        target = { accountId: a.id, paidPersonally: false };
+      }
+      const blockers = await receiptAccountBlockers(env.DB, rec, target);
+      const shape = {
+        via: rec.via, vendor: rec.vendor, vendorRef: rec.vendorRef, date: rec.date, accountId: rec.accountId, paidPersonally: rec.paidPersonally,
+        stock: rec.stock.map(x => ({ id: x.id, label: [x.name, x.color, x.size].filter(Boolean).join(" · "), qty: x.qty, amount: x.qty * x.unitCostCents / 100 })),
+        stockTotal: rec.stock.reduce((t, x) => t + x.qty * x.unitCostCents, 0) / 100,
+        expense: rec.expense && { id: rec.expense.id, description: rec.expense.description, amount: rec.expense.amountCents / 100 },
+        draw: rec.draw && { id: rec.draw.id, note: rec.draw.note, amount: rec.draw.amountCents / 100 } };
+      if (preview) return jsonResponse({ status: "ok", receipt: shape, blockers });
+      if (!target) return bad("Choose what it was paid from");
+      if (target.paidPersonally ? rec.paidPersonally : (!rec.paidPersonally && rec.stock.every(x => x.accountId === target.accountId) && (!rec.expense || rec.expense.accountId === target.accountId) && (!rec.draw || rec.draw.accountId === target.accountId))) {
+        return bad("This receipt is already paid from that account");
+      }
+      if (blockers.length) return jsonResponse({ status: "error", message: blockers[0] }, 409);
+      // The page showed this exact set of records; if the receipt has changed since (a line voided, an entry added), start over.
+      if (Array.isArray(body.expectStockIds) && body.expectStockIds.map(Number).sort().join() !== rec.stock.map(x => x.id).sort().join()) {
+        return jsonResponse({ status: "error", message: "This receipt changed since you opened it — close this window and try again." }, 409);
+      }
+      const total = (shape.stockTotal + (shape.expense ? shape.expense.amount : 0) + (shape.draw ? shape.draw.amount : 0));
+      const auditErr = await auditStrict({ orgId: null, orderId: null, action: kind === "transfers" ? "transfer.receipt_account_changed" : "inventory.receipt_account_changed",
+        detail: { kind, via: rec.via, vendor: rec.vendor, vendorRef: rec.vendorRef, date: rec.date, stockIds: rec.stock.map(x => x.id), expenseId: rec.expense ? rec.expense.id : null,
+          drawId: rec.draw ? rec.draw.id : null, from: { accountId: rec.accountId, paidPersonally: rec.paidPersonally }, to: target, total } });
+      if (auditErr) return auditErr;
+      await setReceiptAccount(env.DB, rec, target);
+      return jsonResponse({ status: "ok", moved: { stock: rec.stock.length, expense: rec.expense ? 1 : 0, draw: rec.draw && target.accountId ? 1 : 0 } });
     }
     if (body.action === "saveMoneyEntry" || body.action === "deleteMoneyEntry") {
       const kind = body.kind;
@@ -1125,9 +1316,12 @@ export async function onRequestPost(context) {
       getOrdersForDigest(env.DB, state), getUnsentOwnerNotices(env.DB), getAllOrgs(env.DB), getFailedAdminLogins(env.DB),
       getSystemIssues(env.DB).catch(() => null), getOrdersAwaitingBlanks(env.DB).catch(() => []),
     ]);
+    const priceReminder = await getBlankPriceReminder(env.DB).catch(() => null);
     const names = Object.fromEntries(orgs.map(o => [o.orgId, o.name]));
     return jsonResponse({ status: "ok", lastSentAt: (state && state.sentAt) || "", firstRun: !state, security, issues: issues || [],
       lastRun: await getDigestRun(env.DB).catch(() => null),
+      priceReminder: priceReminder && { ...priceReminder, products: priceReminder.products.map(p => ({ ...p, orgName: names[p.orgId] || p.orgId })),
+        blanks: priceReminder.blanks.map(b => ({ ...b, products: b.products.map(p => ({ ...p, orgName: names[p.orgId] || p.orgId })) })) },
       awaitingBlanks: (awaitingBlanks || []).map(o => ({ ...o, orgName: names[o.orgId] || o.orgId })),
       orders: orders.map(o => ({ orderId: o.orderId, orgId: o.orgId, orgName: names[o.orgId] || o.orgId, placedAt: o.placedAt,
         customerName: o.customerName, contact: o.contact, paymentMethod: o.paymentMethod, paid: !!o.paid, total: o.total,
@@ -1136,7 +1330,24 @@ export async function onRequestPost(context) {
       notices: notices.map(x => ({ ...x, orgName: names[x.orgId] || x.orgId })),
       inTransit: (deliveries.inTransit || []).map(x => ({ ...x, orgName: names[x.orgId] || x.orgId })),
       pickedUp: (deliveries.pickedUp || []).map(x => ({ ...x, orgName: names[x.orgId] || x.orgId })),
-      awaitingPickup: (deliveries.awaitingPickup || []).map(x => ({ ...x, orgName: names[x.orgId] || x.orgId })) });
+      awaitingPickup: (deliveries.awaitingPickup || []).map(x => ({ ...x, orgName: names[x.orgId] || x.orgId })),
+      // Machine maintenance that's due (migrations/0071) — the roll-up lists it.
+      maintenanceDue: (await getFeatures(env.DB).catch(() => ({ production: true }))).production
+        ? (await listMaintenanceTasks(env.DB).catch(() => [])).filter(t => t.status === "due") : [] });
+  }
+
+  // ---- sendTestEmail — one test message, and what the email provider said (Communications page) ----
+  // For finding out why email isn't arriving: the answer names the provider, the From address, the
+  // provider's own status and message, and what to do about the usual mistakes. Never a secret.
+  if (body.action === "sendTestEmail") {
+    const denied = await requireAdmin(env, host, body.key, request, "Admin access is only available from the admin subdomain.", ACTION_ROLE[body.action]);
+    if (denied) return denied;
+    const rl = await rateLimited(env, "email_test", request, 10);
+    if (rl.blocked) return rateLimitResponse(rl.retryAfter);
+    const to = String(body.to || "").trim().slice(0, 254);
+    const report = await sendTestEmail(env, to);
+    audit({ orgId: null, orderId: null, action: "email.test_sent", detail: { to, provider: report.provider, ok: report.ok, httpStatus: report.httpStatus } });
+    return jsonResponse({ status: "ok", report });
   }
 
   // ---- checkDeliveries — run the roll-up's delivery check now (Communications page) ----
@@ -1648,22 +1859,25 @@ export async function onRequestPost(context) {
           if (isCustomItem && !String(it.name || "").trim()) {
             throw Object.assign(new Error("Custom items require a description."), { userFacing: true });
           }
-          let unitPrice, personalizationFee, lineConfig;
+          let unitPrice, personalizationFee, lineConfig, catalogName = "", catalogType = "";
           if (hasCustom) {
             // For catalog products: validate the product exists but ignore its price.
             // For __custom__ items: no catalog lookup needed.
-            if (!isCustomItem) await priceItem(env.DB, org, it.productId, it.size, qty, false);
+            if (!isCustomItem) { const v = await priceItem(env.DB, org, it.productId, it.size, qty, false); catalogName = v.name; catalogType = v.type; }
             unitPrice = rawCustom;
             personalizationFee = 0;
           } else {
             const priced = await priceItem(env.DB, org, it.productId, it.size, qty, !!it.personalized, it.config);
             ({ unitPrice, personalizationFee } = priced);
             lineConfig = priced.config;
+            catalogName = priced.name; catalogType = priced.type;
           }
           const lineTotal = (unitPrice + personalizationFee) * qty;
           subtotal += lineTotal;
           return {
-            productId: it.productId, name: it.name, type: it.type, size: it.size || "",
+            // A catalog line's name and type come from the catalog (with a version's label — "Club Tee
+            // (Long sleeve)"), as on a storefront order; only a custom line names itself.
+            productId: it.productId, name: isCustomItem ? String(it.name || "").slice(0, 200) : (catalogName || it.name), type: isCustomItem ? it.type : (catalogType || it.type), size: it.size || "",
             qty, unitPrice, personalized: hasCustom ? false : !!it.personalized,
             persName: String(it.persName || "").slice(0, 200),
             personalizationFee, lineTotal,
@@ -1704,7 +1918,10 @@ export async function onRequestPost(context) {
       order.shippingAddress = ac.address;
     }
 
-    await insertOrder(env.DB, order, pricedItems);
+    // Lines for stocked products come out of the shop's finished stock (migrations/0060) — handed over
+    // now, so they're pulled at once.
+    await insertOrder(env.DB, order, pricedItems, { fillFromStock: true });
+    await pullStockLines(env.DB, orderId);
 
     if (body.paid)      await settleOrderBalance(env.DB, orderId,
                           "Local sale" + (order.paymentMethod ? " (" + order.paymentMethod + ")" : ""));
@@ -1816,6 +2033,24 @@ export async function onRequestPost(context) {
     audit({ orgId: body.org, orderId: body.orderId, action: "order.fulfillment_stage",
       detail: { stage: body.stage, ...extras } });
     return jsonResponse({ status: "ok", timestamp: now });
+  }
+
+  // Orders → stage "Use blanks from stock" / Run Order → "Use from stock": the order's waiting lines take
+  // their blanks from stock on hand (marked ordered + received now, "In stock") — refused, with what's
+  // short, unless the stock covers all of them (useBlanksFromStock in db.js).
+  if (body.action === "useBlanksFromStock") {
+    const denied = await requireAdmin(env, host, body.key, request, "Admin access is only available from the admin subdomain.", ACTION_ROLE[body.action]);
+    if (denied) return denied;
+    const order = body.orderId ? await getOrderById(env.DB, String(body.orderId)) : null;
+    if (!order || (body.org && order.orgId !== body.org)) return jsonResponse({ status: "error", message: "Order not found" }, 404);
+    const why = stagePrereqError(order, "blankOrdered");
+    if (why) return jsonResponse({ status: "error", message: `Can't use blanks from stock: ${why}.` }, 409);
+    let res;
+    try { res = await useBlanksFromStock(env.DB, order.orderId); }
+    catch (e) { if (e.userFacing) return jsonResponse({ status: "error", message: e.message }, 409); throw e; }
+    audit({ orgId: order.orgId, orderId: order.orderId, action: "order.blanks_from_stock",
+      detail: { lines: res.lines.map(l => ({ itemId: l.itemId, qty: l.qty, blank: l.blank, color: l.color, size: l.size })) } });
+    return jsonResponse({ status: "ok", lines: res.lines });
   }
 
   // ---- Blank shipments (migrations/0039): multiple tracking numbers per blank order ----------
@@ -2203,8 +2438,8 @@ export async function onRequestPost(context) {
 
     // Catalog/price edits are audited: what changed, from → to. Only the
     // fields that actually differ are recorded, so a price change reads as one line in the Audit Log.
-    const PRODUCT_AUDIT_FIELDS = ["name", "sub", "type", "pricingMode", "flatPrice", "sizePricing", "personalizationPrice", "noDesignNeeded",
-      "customDesign", "customDesignPrice", "personalizationOptions", "images", "features", "visible", "sortOrder", "weightOz", "taxable"];
+    const PRODUCT_AUDIT_FIELDS = ["name", "sub", "type", "pricingMode", "flatPrice", "sizePricing", "colorGroups", "personalizationPrice", "noDesignNeeded", "noBlankNeeded", "runMinutes", "transferCost", "suppliesCost",
+      "customDesign", "customDesignPrice", "personalizationOptions", "images", "features", "visible", "sortOrder", "weightOz", "taxable", "versionGroup", "versionLabel", "fixedTransfers", "mockupGraphics"];
     const ORG_AUDIT_FIELDS = ["subdomain", "name", "eyebrow", "accent", "desc", "ready", "shippingEnabled", "deliveryOptions", "enabledPayments",
       "orderDeadline", "closedMessage", "allowOrdersAfterDeadline", "designImageShirt", "designImageCap", "designImageDetail"];
     const diff_ = (before, after, fields) => {
@@ -2228,7 +2463,11 @@ export async function onRequestPost(context) {
       }
       const orgCheck = validateOrgFields(body, true);
       if (orgCheck.error) return jsonResponse({ status: "error", message: orgCheck.error }, 400);
+      // The admin's own label(s) (ADMIN_SUBDOMAIN) are reserved too — validateOrgFields doesn't know them.
+      if (adminSubdomains(env).includes(String(body.subdomain))) return jsonResponse({ status: "error", message: `“${body.subdomain}” is reserved — pick another web address.` }, 400);
       Object.assign(body, orgCheck.fields);
+      { const taken = (await getAllOrgs(env.DB)).find(o => o.orgId === body.orgId || o.subdomain === body.subdomain);
+        if (taken) return jsonResponse({ status: "error", message: taken.orgId === body.orgId ? `A shop already has the ID “${body.orgId}”.` : `Another shop already uses the web address “${body.subdomain}”.` }, 409); }
       // Delivery / pickup options (migrations/0045): the list decides whether shipping is on.
       let newDelivery = null;
       if (body.deliveryOptions !== undefined) {
@@ -2293,6 +2532,9 @@ export async function onRequestPost(context) {
       if (!subdomainChanged) body.subdomain = existingOrg.subdomain;
       const orgCheck = validateOrgFields({ ...body, subdomain: subdomainChanged ? body.subdomain : "" }, false);
       if (orgCheck.error) return jsonResponse({ status: "error", message: orgCheck.error }, 400);
+      if (subdomainChanged && adminSubdomains(env).includes(String(body.subdomain))) return jsonResponse({ status: "error", message: `“${body.subdomain}” is reserved — pick another web address.` }, 400);
+      if (subdomainChanged && (await getAllOrgs(env.DB)).some(o => o.orgId !== existingOrg.orgId && o.subdomain === body.subdomain))
+        return jsonResponse({ status: "error", message: `Another shop already uses the web address “${body.subdomain}”.` }, 409);
       Object.assign(body, orgCheck.fields);
       // Delivery / pickup options (migrations/0045). The form sends the whole list. A caller that only
       // knows the old "shipping enabled" switch still works: on a shop with a saved list the switch
@@ -2377,6 +2619,70 @@ export async function onRequestPost(context) {
 
     // The customer's own design (migrations/0054): how it's made, and an add-on of $0–$1,000 per
     // piece (blank = free). Only checked — and only saved — when the form sends it.
+    // A version's name ("Long sleeve"): short, plain text.
+    const checkVersionLabel_ = (label) => (label === undefined ? "" : (typeof label !== "string" || label.length > 40 || /[\u0000-\u001F\u007F]/.test(label))
+      ? "A version's name is up to 40 characters of plain text (e.g. Long sleeve)." : "");
+    // What versions of a product share — copied when a version is made, and by "Copy settings from the
+    // other version". Never prices, sizes, weight, images, blanks, colors, mockups or stock: those belong
+    // to each version's own blank. (The category is `type`; upload prices per location are in `locations`.)
+    const versionSharedFrom_ = (p) => ({
+      type: p.type, name: p.name, sub: p.sub, features: p.features, taxable: p.taxable,
+      personalizationPrice: p.personalizationPrice, personalizationOptions: p.personalizationOptions,
+      personalizationMode: p.personalizationMode, personalizationHoopId: p.personalizationHoopId, personalizationOptionDesigns: p.personalizationOptionDesigns,
+      noDesignNeeded: p.noDesignNeeded, noBlankNeeded: p.noBlankNeeded, customDesign: p.customDesign, customDesignPrice: p.customDesignPrice,
+      configurable: p.configurable, locations: p.locations, reorderQr: p.reorderQr, fixedTransfers: p.fixedTransfers, mockupGraphics: p.mockupGraphics,
+    });
+    // Embroidered graphics for mockups (migrations/0069): [{locationId, graphicId}] — this shop's EMBROIDERY graphic at a
+    // location from the Locations list, once per location. Pictures only: never on an order line. Not sent = left as it is.
+    const checkMockupGraphics_ = async (b) => {
+      if (b.mockupGraphics === undefined) return "";
+      if (b.mockupGraphics === null) { b.mockupGraphics = []; return ""; }
+      if (!Array.isArray(b.mockupGraphics)) return "Embroidered graphics must be a list.";
+      if (b.mockupGraphics.length > 10) return "A product can have at most 10 embroidered graphics for mockups.";
+      const graphics = new Map((await listGraphics(env.DB, b.org)).map(g => [g.id, g]));
+      const locations = new Map((await listLocations(env.DB).catch(() => [])).map(l => [Number(l.id), l]));
+      const out = [], seen = new Set();
+      for (const f of b.mockupGraphics) {
+        const g = graphics.get(Number(f && f.graphicId));
+        if (!g) return "Pick a graphic for each embroidered graphic.";
+        if (g.kind !== "embroidery") return `“${g.name}” is a transfer — add it under Printed transfers instead.`;
+        const loc = locations.get(Number(f.locationId));
+        if (!loc) return `Pick a location for “${g.name}”.`;
+        const key = loc.id + "|" + g.id;
+        if (seen.has(key)) return `“${g.name}” is on ${loc.name} twice.`;
+        seen.add(key);
+        out.push({ locationId: Number(loc.id), graphicId: g.id });
+      }
+      b.mockupGraphics = out;
+      return "";
+    };
+    // Printed transfers that are part of the product (migrations/0068): [{locationId, graphicId, ink}]. Each is one
+    // of THIS shop's transfer graphics at a location from the Locations list, an ink it offers (or none), and the
+    // same graphic once per location. Cleaned in place; not sent = left as it is.
+    const checkFixedTransfers_ = async (b) => {
+      if (b.fixedTransfers === undefined) return "";
+      if (b.fixedTransfers === null) { b.fixedTransfers = []; return ""; }
+      if (!Array.isArray(b.fixedTransfers)) return "Printed transfers must be a list.";
+      if (b.fixedTransfers.length > 10) return "A product can have at most 10 printed transfers.";
+      const graphics = new Map((await listGraphics(env.DB, b.org)).map(g => [g.id, g]));
+      const locations = new Map((await listLocations(env.DB).catch(() => [])).map(l => [Number(l.id), l]));
+      const out = [], seen = new Set();
+      for (const f of b.fixedTransfers) {
+        const g = graphics.get(Number(f && f.graphicId));
+        if (!g) return "Pick a graphic for each printed transfer.";
+        if (g.kind !== "transfer") return `“${g.name}” is embroidery — printed transfers take transfer graphics.`;
+        const loc = locations.get(Number(f.locationId));
+        if (!loc) return `Pick a location for “${g.name}”.`;
+        const ink = String(f.ink || "");
+        if (ink && !g.inkColors.includes(ink)) return `“${ink}” isn't an ink of “${g.name}”.`;
+        const key = loc.id + "|" + g.id;
+        if (seen.has(key)) return `“${g.name}” is on ${loc.name} twice.`;
+        seen.add(key);
+        out.push({ locationId: Number(loc.id), graphicId: g.id, ink });
+      }
+      b.fixedTransfers = out;
+      return "";
+    };
     const checkCustomDesign_ = (body) => {
       if (body.customDesign === undefined) return "";
       const kind = body.customDesign == null ? "" : String(body.customDesign);
@@ -2410,8 +2716,24 @@ export async function onRequestPost(context) {
       return "";
     };
 
+    // A product's category must be one from Tools → Product categories (migrations/0056). An
+    // existing product may keep a category that has since been removed from the list.
+    const checkCategory_ = async (b, current) => {
+      const type = String(b.type || "");
+      if (current != null && type === current) return "";
+      const cats = await listProductCategories(env.DB);
+      if (cats.some(c => c.key === type)) return "";
+      return `Pick a category for this product (${cats.map(c => c.name).join(", ")}).`;
+    };
+
     if (body.action === "createProduct") {
+      { const why = checkCosting_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = checkProductPrice_(body, null); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "Missing org or productId" }, 400);
+      { const why = await checkCategory_(body, null); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = colorGroupsProblem_(body, null); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkFixedTransfers_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkMockupGraphics_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = cleanLocationPrices_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = await checkPersonalization_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = checkCustomDesign_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
@@ -2427,8 +2749,100 @@ export async function onRequestPost(context) {
       return jsonResponse({ status: "ok" });
     }
 
+    // ---- Versions of a product (migrations/0059): short / long sleeve, or any two named versions ----
+    // A second version is its own product — own sizes and prices, blanks, colors, images, mockups,
+    // stock — linked to this one so the shop page shows them as one card with a toggle. It starts as a
+    // copy of the SHARED settings (versionSharedFrom_ + designs), hidden and right after this one.
+    if (body.action === "createProductVersion") {
+      const src = body.org && body.productId ? await productOf_(body.org, String(body.productId)) : null;
+      if (!src) return jsonResponse({ status: "error", message: "Product not found" }, 404);
+      const newId = String(body.newProductId || "").trim();
+      if (!PRODUCT_ID_RE.test(newId)) return jsonResponse({ status: "error", message: "Product ID must be 1-40 lowercase letters, numbers, or hyphens." }, 400);
+      if (await productOf_(body.org, newId)) return jsonResponse({ status: "error", message: `A product with the id “${newId}” already exists in this shop.` }, 409);
+      const label = body.label === undefined ? (src.versionLabel || "Short sleeve") : String(body.label);
+      const newLabel = body.newLabel === undefined ? "Long sleeve" : String(body.newLabel);
+      for (const l of [label, newLabel]) { const why = checkVersionLabel_(l); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      if (!label.trim() || !newLabel.trim()) return jsonResponse({ status: "error", message: "Give each version a name (e.g. Short sleeve, Long sleeve)." }, 400);
+      const group = src.versionGroup || src.productId;
+      await createProduct(env.DB, body.org, Object.assign(versionSharedFrom_(src), {
+        productId: newId, pricingMode: src.pricingMode, flatPrice: src.flatPrice, sizePricing: src.sizePricing, weightOz: src.weightOz,
+        images: [], garmentColors: [], visible: false, sortOrder: (Number(src.sortOrder) || 0) + 1, versionGroup: group, versionLabel: newLabel.trim() }));
+      await setProductVersion(env.DB, body.org, src.productId, { group, label: label.trim() });
+      try { await setProductDesigns(env.DB, body.org, newId, (await listProductDesigns(env.DB, body.org, src.productId)).map(d => ({ designId: d.designId, placement: d.placement, isMain: d.isMain }))); }
+      catch (e) { console.error("Copying designs to the new version failed:", e); }
+      // Right after the source in the shop's order (the whole order is renumbered, as ↑ ↓ does).
+      const ids = (await getProductsByOrg(env.DB, body.org, false)).map(x => x.productId).filter(id => id !== newId);
+      ids.splice(ids.indexOf(src.productId) + 1, 0, newId);
+      await setProductOrder(env.DB, body.org, ids);
+      audit({ orgId: body.org, orderId: null, action: "product.version_created", detail: { productId: newId, from: src.productId, group, label: label.trim(), newLabel: newLabel.trim() } });
+      return jsonResponse({ status: "ok", productId: newId, versionGroup: group });
+    }
+
+    if (body.action === "copyProductVersionSettings") {
+      const me = body.org && body.productId ? await productOf_(body.org, String(body.productId)) : null;
+      if (!me) return jsonResponse({ status: "error", message: "Product not found" }, 404);
+      const from = body.fromProductId ? await productOf_(body.org, String(body.fromProductId)) : null;
+      if (!from || !me.versionGroup || from.versionGroup !== me.versionGroup || from.productId === me.productId) {
+        return jsonResponse({ status: "error", message: "That isn't another version of this product." }, 400);
+      }
+      // The whole product as it is, with the shared settings taken from the other version.
+      await updateProduct(env.DB, body.org, Object.assign({}, me, versionSharedFrom_(from), { productId: me.productId }));
+      try { await setProductDesigns(env.DB, body.org, me.productId, (await listProductDesigns(env.DB, body.org, from.productId)).map(d => ({ designId: d.designId, placement: d.placement, isMain: d.isMain }))); }
+      catch (e) { console.error("Copying designs between versions failed:", e); }
+      audit({ orgId: body.org, orderId: null, action: "product.version_settings_copied", detail: { productId: me.productId, from: from.productId,
+        changes: diff_(me, await productOf_(body.org, me.productId), PRODUCT_AUDIT_FIELDS) } });
+      return jsonResponse({ status: "ok" });
+    }
+
+    // Takes a product out of its pair; the other one, left on its own, is a plain product again.
+    if (body.action === "separateProductVersion") {
+      const me = body.org && body.productId ? await productOf_(body.org, String(body.productId)) : null;
+      if (!me) return jsonResponse({ status: "error", message: "Product not found" }, 404);
+      if (!me.versionGroup) return jsonResponse({ status: "ok" });
+      const group = me.versionGroup;
+      await setProductVersion(env.DB, body.org, me.productId, { group: "", label: "" });
+      const rest = (await getProductsByOrg(env.DB, body.org, false)).filter(x => x.versionGroup === group);
+      if (rest.length === 1) await setProductVersion(env.DB, body.org, rest[0].productId, { group: "", label: "" });
+      audit({ orgId: body.org, orderId: null, action: "product.version_separated", detail: { productId: me.productId, group, alsoSeparated: rest.length === 1 ? rest[0].productId : null } });
+      return jsonResponse({ status: "ok" });
+    }
+
+    // Products → Copy from another shop: the picked products of `fromOrg`, each under the id, name,
+    // subtitle, category, version name and visibility typed in the window, with or without their photos
+    // (copyProductsFromOrg in db.js says what comes along). Nothing is written unless every copy is valid.
+    if (body.action === "copyProductsFromOrg") {
+      const to = String(body.org || ""), from = String(body.fromOrg || "");
+      if (!to || !from) return jsonResponse({ status: "error", message: "Pick the shop to copy from." }, 400);
+      if (to === from) return jsonResponse({ status: "error", message: "Pick a different shop to copy from." }, 400);
+      if (!(await getOrgById(env.DB, from)) || !(await getOrgById(env.DB, to))) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
+      const rows = Array.isArray(body.products) ? body.products : [];
+      if (!rows.length) return jsonResponse({ status: "error", message: "Tick at least one product to copy." }, 400);
+      if (rows.length > 200) return jsonResponse({ status: "error", message: "Copy at most 200 products at a time." }, 400);
+      const plain = (v, max) => typeof v === "string" && v.length <= max && !/[\u0000-\u001F\u007F]/.test(v);
+      const clean = [];
+      for (const r of rows) {
+        const x = r || {};
+        const productId = String(x.productId || "").trim(), name = typeof x.name === "string" ? x.name.trim() : "", sub = typeof x.sub === "string" ? x.sub.trim() : "";
+        const label = `“${name || productId || x.fromProductId}”`;
+        if (!PRODUCT_ID_RE.test(productId)) return jsonResponse({ status: "error", message: `${label}: the product ID must be 1-40 lowercase letters, numbers, or hyphens.` }, 400);
+        if (!name || !plain(name, 120)) return jsonResponse({ status: "error", message: `${label}: give it a name (up to 120 characters).` }, 400);
+        if (!plain(sub, 300)) return jsonResponse({ status: "error", message: `${label}: the subtitle is up to 300 characters.` }, 400);
+        { const why = await checkCategory_({ type: x.type }, null); if (why) return jsonResponse({ status: "error", message: `${label}: ${why}` }, 400); }
+        if (x.versionLabel !== undefined) { const why = checkVersionLabel_(x.versionLabel); if (why) return jsonResponse({ status: "error", message: `${label}: ${why}` }, 400); }
+        clean.push({ fromProductId: String(x.fromProductId || ""), productId, name, sub, type: String(x.type),
+          versionLabel: x.versionLabel === undefined ? undefined : String(x.versionLabel).trim(), visible: x.visible === true });
+      }
+      let copied;
+      try { copied = await copyProductsFromOrg(env.DB, from, to, clean, { copyImages: body.copyImages === true }); }
+      catch (e) { if (e.userFacing) return jsonResponse({ status: "error", message: e.message }, 400); throw e; }
+      for (const c of copied) audit({ orgId: to, orderId: null, action: "product.copied",
+        detail: { productId: c.productId, fromOrg: from, fromProductId: c.fromProductId, copyImages: body.copyImages === true, notes: c.notes } });
+      return jsonResponse({ status: "ok", copied });
+    }
+
     if (body.action === "updateProduct") {
       if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "Missing org or productId" }, 400);
+      { const why = checkCosting_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = cleanLocationPrices_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = await checkPersonalization_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
       { const why = checkCustomDesign_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
@@ -2436,10 +2850,53 @@ export async function onRequestPost(context) {
       if (imgCheck.error) return jsonResponse({ status: "error", message: imgCheck.error }, 400);
       body.images = imgCheck.images;
       const beforeProduct = await productOf_(body.org, body.productId);
+      { const why = checkProductPrice_(body, beforeProduct || {}); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkCategory_(body, beforeProduct ? beforeProduct.type : null); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = colorGroupsProblem_(body, beforeProduct); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkFixedTransfers_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkMockupGraphics_(body); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      // MAP (migrations/0070): no price below the minimum advertised price of the blank sizes it's linked to — checked on
+      // the prices being saved, before anything is written.
+      { const draft = { pricingMode: body.pricingMode, flatPrice: body.flatPrice, sizePricing: body.sizePricing, colorGroups: body.colorGroups, noBlankNeeded: body.noBlankNeeded };
+        const a = (await analyzePricing(env.DB, { orgId: body.org, productId: String(body.productId), draft }).catch(() => ({ products: [] }))).products[0];
+        if (a && a.belowMap) return jsonResponse({ status: "error", code: "belowMap", message: "Below the vendor's minimum advertised price (MAP): " + a.mapProblems.join("; ") + ". Raise the price to at least the MAP." }, 400); }
+      // Versions (migrations/0059): the label can be edited here; the group can only be LEFT ("" =
+      // separate from the other versions) — a pair is made with createProductVersion.
+      { const why = checkVersionLabel_(body.versionLabel); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      if (body.versionGroup !== undefined && body.versionGroup !== (beforeProduct && beforeProduct.versionGroup)) {
+        return jsonResponse({ status: "error", message: "Versions are linked with “Add a version” and unlinked with “Separate” on the product, not by editing the product." }, 400);
+      }
+      if (beforeProduct && !beforeProduct.versionGroup) delete body.versionLabel;   // a label only means something on a version
       await updateProduct(env.DB, body.org, body);
-      const changes = diff_(beforeProduct, await productOf_(body.org, body.productId), PRODUCT_AUDIT_FIELDS);
+      const afterProduct = await productOf_(body.org, body.productId);
+      const changes = diff_(beforeProduct, afterProduct, PRODUCT_AUDIT_FIELDS);
       if (Object.keys(changes).length) audit({ orgId: body.org, orderId: null, action: "product.updated", detail: { productId: body.productId, changes } });
-      return jsonResponse({ status: "ok" });
+      // New prices are set against the blanks' vendor prices as they are now (migrations/0062).
+      const priceKey = (p) => p ? JSON.stringify([p.pricingMode, p.flatPrice, p.sizePricing, p.personalizationPrice, p.customDesignPrice, p.locations, p.colorGroups]) : "";
+      const priceChanged = beforeProduct && priceKey(beforeProduct) !== priceKey(afterProduct);
+      if (priceChanged) await confirmProductPrices(env.DB, body.org, body.productId).catch((e) => console.error("confirmProductPrices failed:", e));
+      // A changed price (or run time / cost) comes back with the product's pricing analysis (migrations/0067).
+      const costKey = (p) => p ? JSON.stringify([p.runMinutes, p.transferCost, p.suppliesCost, p.taxable, p.noBlankNeeded, p.reorderQr, p.fixedTransfers]) : "";
+      const pricing = seesPricing_() && (priceChanged || (beforeProduct && costKey(beforeProduct) !== costKey(afterProduct)))
+        ? ((await analyzePricing(env.DB, { orgId: body.org, productId: body.productId }).catch(() => ({ products: [] }))).products[0] || null) : null;
+      return jsonResponse({ status: "ok", pricing });
+    }
+
+    // Suggested color price groups from the blank prices behind each color (migrations/0064).
+    if (body.action === "suggestColorGroups") {
+      if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "Missing org or productId" }, 400);
+      const r = await suggestColorGroups(env.DB, body.org, String(body.productId));
+      return r ? jsonResponse({ status: "ok", ...r }) : jsonResponse({ status: "error", message: "Product not found" }, 404);
+    }
+
+    // "Prices still OK": the product's prices are right for its blanks' current vendor prices.
+    if (body.action === "confirmProductPrices") {
+      if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "Missing org or productId" }, 400);
+      const pending = (await getProductPriceChanges(env.DB, { orgId: body.org })).find(p => p.productId === body.productId);
+      const at = await confirmProductPrices(env.DB, body.org, body.productId);
+      if (!at) return jsonResponse({ status: "error", message: "Product not found" }, 404);
+      audit({ orgId: body.org, orderId: null, action: "product.prices_confirmed", detail: { productId: body.productId, changes: pending ? pending.changes : [] } });
+      return jsonResponse({ status: "ok", pricesReviewedAt: at });
     }
 
     // ---- CSV import (Blanks → Import CSV, a shop's Products → Import CSV) ----
@@ -2453,7 +2910,7 @@ export async function onRequestPost(context) {
       // A long file arrives in batches: rowOffset keeps the row numbers right, seen = keys already sent.
       const batch = { dryRun, rowOffset: Number(body.rowOffset) || 0, seen: Array.isArray(body.seen) ? body.seen.slice(0, 5000).map(String) : [] };
       if (body.action === "importBlanks") {
-        const result = await importBlanksCsv(env.DB, rows, batch);
+        const result = await importBlanksCsv(env.DB, rows, { ...batch, actor: adminActor(request) });
         if (!dryRun) audit({ orgId: null, orderId: null, action: "blanks.imported",
           detail: { created: result.created, updated: result.updated, skipped: result.skipped,
             styles: result.results.filter(x => x.action !== "skip").map(x => x.style).slice(0, 200) } });
@@ -2470,6 +2927,13 @@ export async function onRequestPost(context) {
       if (!dryRun) audit({ orgId: body.org, orderId: null, action: "products.imported",
         detail: { created: result.created, updated: result.updated, skipped: result.skipped, linked: result.linked,
           productIds: result.results.filter(x => x.action !== "skip").map(x => x.productId).slice(0, 200) } });
+      // MAP (migrations/0070): imported products left below a blank's minimum advertised price are named (they're also
+      // catalog errors, and can't be saved again until raised).
+      if (!dryRun) {
+        const ids = new Set(result.results.filter(x => x.action !== "skip").map(x => String(x.productId)));
+        result.belowMap = ids.size ? (await analyzePricing(env.DB, { orgId: body.org }).catch(() => ({ products: [] }))).products
+          .filter(a => ids.has(String(a.productId)) && a.belowMap).map(a => ({ productId: a.productId, name: a.name, problems: a.mapProblems })) : [];
+      }
       return jsonResponse({ status: "ok", ...result });
     }
 
@@ -2478,6 +2942,16 @@ export async function onRequestPost(context) {
       await setProductVisible(env.DB, body.org, body.productId, !!body.visible);
       audit({ orgId: body.org, orderId: null, action: body.visible ? "product.shown" : "product.hidden", detail: { productId: body.productId } });
       return jsonResponse({ status: "ok" });
+    }
+
+    // The order the shop's products are listed in (Products → ↑ ↓): every product id, in order.
+    if (body.action === "setProductOrder") {
+      if (!body.org || !Array.isArray(body.productIds)) return jsonResponse({ status: "error", message: "Missing org or productIds" }, 400);
+      let changed;
+      try { changed = await setProductOrder(env.DB, body.org, body.productIds); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, 409); }
+      if (changed) audit({ orgId: body.org, orderId: null, action: "products.reordered", detail: { products: body.productIds.length, moved: body.moved ? String(body.moved).slice(0, 60) : undefined } });
+      return jsonResponse({ status: "ok", products: await getProductsByOrg(env.DB, body.org, false) });
     }
 
     if (body.action === "getGlobalSettings") {
@@ -2499,6 +2973,32 @@ export async function onRequestPost(context) {
     if (body.action === "updateGlobalSettings") {
       await setGlobalSettings(env.DB, body.globalSettings || {});
       return jsonResponse({ status: "ok" });
+    }
+
+    // ---- Pricing awareness (migrations/0067): fees, supplies, targets, and the analysis itself ----
+    if (body.action === "getPricingSettings") {
+      return jsonResponse({ status: "ok", pricing: await getPricingSettingsView(env.DB) });
+    }
+    if (body.action === "updatePricingSettings") {
+      const b = body.pricing || {};
+      const money = (v) => v === null || v === undefined || v === "" ? null : Math.round(Number(v) * 100);
+      let saved;
+      try {
+        saved = await setPricingSettings(env.DB, { cardPctBps: b.cardPct === "" || b.cardPct == null ? null : Math.round(Number(b.cardPct) * 100), cardFixedCents: money(b.cardFixed),
+          suppliesCents: money(b.supplies), targetHourlyCents: money(b.targetHourly), targetIncomeCents: money(b.targetIncome) });
+      } catch (e) { if (e && e.userFacing) return jsonResponse({ status: "error", message: e.message }, 400); throw e; }
+      audit({ orgId: null, orderId: null, action: "settings.pricing_set", detail: saved });
+      // A new fee, supplies cost or target re-flags products straight away: say which are now below a target.
+      const all = await analyzePricing(env.DB);
+      const below = all.products.filter(p => p.visible && p.belowTarget).map(p => ({ orgId: p.orgId, productId: p.productId, name: p.name, problems: p.problems }));
+      return jsonResponse({ status: "ok", pricing: all.settings, belowTarget: below });
+    }
+    // The analysis of one product (productId, optionally with the form's unsaved `draft`), one shop (org) or every shop.
+    if (body.action === "analyzePricing") {
+      const draft = body.draft && typeof body.draft === "object" && body.productId ? body.draft : null;
+      if (draft) { const why = checkCosting_(draft); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      const r = await analyzePricing(env.DB, { orgId: body.org || null, productId: body.org && body.productId ? String(body.productId) : null, draft });
+      return jsonResponse({ status: "ok", ...r });
     }
 
     if (body.action === "getMachineSettings") {
@@ -2625,7 +3125,9 @@ export async function onRequestPost(context) {
       try { await bumpCatalogVersion(env.DB); invalidateCatalogVersionCache(); } catch (e) { console.error("catalog version bump failed:", e); }
       audit({ orgId: null, orderId: null, action: "settings.sales_tax_set",
         detail: { from: { rateBps: before.rateBps, jurisdiction: before.jurisdiction, taxMode: before.taxMode }, to: { rateBps: salesTax.rateBps, jurisdiction, taxMode: salesTax.taxMode } } });
-      return jsonResponse({ status: "ok", salesTax: { ...salesTax, ratePercent: salesTax.rateBps / 100 } });
+      const all = await analyzePricing(env.DB).catch(() => ({ products: [] }));
+      const belowTarget = all.products.filter(p => p.visible && p.belowTarget).map(p => ({ orgId: p.orgId, productId: p.productId, name: p.name, problems: p.problems }));
+      return jsonResponse({ status: "ok", salesTax: { ...salesTax, ratePercent: salesTax.rateBps / 100 }, belowTarget });
     }
 
     if (body.action === "getBoxPresets") {
@@ -2666,12 +3168,84 @@ export async function onRequestPost(context) {
 
     // Inventory → Blanks to Order: what to buy from each supplier for the open orders (read-only).
     if (body.action === "getBlanksToOrder") {
-      return jsonResponse({ status: "ok", ...(await getBlanksToOrder(env.DB, { includeUnpaid: !!body.includeUnpaid })) });
+      const [report, shipping, restockOrders] = await Promise.all([getBlanksToOrder(env.DB, { includeUnpaid: !!body.includeUnpaid }), getVendorShipping(env.DB), listRestockOrders(env.DB)]);
+      // Each supplier's free-shipping threshold (by vendor name), and every vendor named on a blank (Start an order for…).
+      for (const sup of report.suppliers) sup.freeShipping = vendorShippingFor(shipping, sup.vendor);
+      const { results: vend } = await env.DB.prepare("SELECT vendor, COUNT(*) AS n FROM blanks WHERE vendor <> '' GROUP BY vendor ORDER BY vendor").all();
+      const vendors = vend.map(v => ({ vendor: v.vendor, blanks: Number(v.n), freeShipping: vendorShippingFor(shipping, v.vendor) }));
+      return jsonResponse({ status: "ok", ...report, vendors, restockOrders });
+    }
+    // "Get me to free shipping" (2026-10): the vendor's blanks and their use, its threshold, and whether it can be
+    // ordered through a connection. Works for any vendor name on a blank, connected or not.
+    if (body.action === "freeShippingSuggestions") {
+      const vendor = String(body.vendor || "").trim();
+      if (!vendor) return jsonResponse({ status: "error", message: "Pick a vendor." }, 400);
+      const [candidates, shipping] = await Promise.all([getFreeShippingCandidates(env.DB, vendor), getVendorShipping(env.DB)]);
+      return jsonResponse({ status: "ok", vendor, freeShipping: vendorShippingFor(shipping, vendor), candidates });
+    }
+    if (body.action === "getVendorShipping") {
+      const saved = await getVendorShipping(env.DB);
+      const { results: vend } = await env.DB.prepare("SELECT vendor, COUNT(*) AS n FROM blanks WHERE vendor <> '' GROUP BY vendor ORDER BY vendor").all();
+      return jsonResponse({ status: "ok", saved, vendors: vend.map(v => ({ vendor: v.vendor, blanks: Number(v.n), freeShipping: vendorShippingFor(saved, v.vendor) })) });
+    }
+    if (body.action === "setVendorShipping") {
+      const vendor = String(body.vendor || "").trim();
+      try {
+        const r = await setVendorShipping(env.DB, vendor, { over: body.over, minQty: body.minQty, reset: !!body.reset });
+        audit({ orgId: null, orderId: null, action: "settings.vendor_shipping", detail: { vendor, from: r.before, to: r.after, reset: !!body.reset } });
+        return jsonResponse({ status: "ok", vendor, freeShipping: r.after });
+      } catch (e) {
+        if (!e || !e.userFacing) throw e;
+        return jsonResponse({ status: "error", message: e.message }, 400);
+      }
+    }
+    if (body.action === "recordRestockOrder") {
+      try {
+        const r = await recordRestockOrder(env.DB, { vendor: body.vendor, reference: body.reference, lines: body.lines, actor: adminActor(request) });
+        audit({ orgId: null, orderId: null, action: "blank.restock_ordered", detail: { id: r.id, vendor: String(body.vendor || ""), reference: String(body.reference || ""),
+          lines: r.lines.map(l => `${l.blankId} ${l.color} ${l.size} ×${l.qty}`) } });
+        return jsonResponse({ status: "ok", id: r.id });
+      } catch (e) {
+        if (!e || !e.userFacing) throw e;
+        return jsonResponse({ status: "error", message: e.message }, 400);
+      }
+    }
+    if (body.action === "cancelRestockOrder") {
+      const ok = await cancelRestockOrder(env.DB, body.id);
+      if (!ok) return jsonResponse({ status: "error", message: "That restock order wasn't found (or is already cancelled)." }, 404);
+      audit({ orgId: null, orderId: null, action: "blank.restock_cancelled", detail: { id: Number(body.id) } });
+      return jsonResponse({ status: "ok" });
+    }
+
+    // Blanks → Find duplicate photos: take the ticked photos off a blank's colors (the files stay in storage).
+    if (body.action === "removeBlankImages") {
+      const blankId = Number(body.blankId);
+      if (!blankId || !Array.isArray(body.removals)) return jsonResponse({ status: "error", message: "Missing blank or photos" }, 400);
+      const r = await removeBlankColorImages(env.DB, blankId, body.removals.slice(0, 200));
+      if (r.removed) audit({ orgId: null, orderId: null, action: "inventory.blank_images_removed", detail: { blankId, removed: r.removed, removals: body.removals.slice(0, 200) } });
+      return jsonResponse({ status: "ok", ...r });
+    }
+    // Tools → Orphaned images: files in the image store nothing points to; delete re-checks each one first.
+    if (body.action === "findOrphanImages" || body.action === "deleteOrphanImages") {
+      try {
+        if (body.action === "findOrphanImages") return jsonResponse({ status: "ok", ...(await findOrphanImages(env, env.DB)) });
+        const r = await deleteOrphanImages(env, env.DB, body.keys);
+        if (r.deleted.length) audit({ orgId: null, orderId: null, action: "images.orphans_deleted", detail: { count: r.deleted.length, keys: r.deleted.slice(0, 500) } });
+        return jsonResponse({ status: "ok", ...r });
+      } catch (e) { if (e && e.userFacing) return jsonResponse({ status: "error", message: e.message }, 400); throw e; }
     }
 
     if (body.action === "getBlanks") {
       const blanks = await getAllBlanks(env.DB);
-      return jsonResponse({ status: "ok", blanks });
+      // Pieces set aside per "<blankId>|<color>|<size>" — still on the shelf, promised to orders.
+      const reserved = await getBlankReservations(env.DB).catch((e) => { console.error("getBlankReservations failed:", e); return {}; });
+      // Blanks for sale on visible products whose vendor prices haven't been checked in 30 days (migrations/0062).
+      const needsPriceCheck = (await getBlanksNeedingPriceCheck(env.DB).catch(() => [])).map(b => b.id);
+      // The products each blank is used by (a blank not in the map isn't linked to any).
+      const products = await getBlankProductUses(env.DB).catch((e) => { console.error("getBlankProductUses failed:", e); return {}; });
+      // Sizes below their reorder point (migrations/0074).
+      const lowStock = await getBlankLowStock(env.DB).catch((e) => { console.error("getBlankLowStock failed:", e); return {}; });
+      return jsonResponse({ status: "ok", blanks, reserved, needsPriceCheck, products, lowStock });
     }
 
     // A blank's needle type must be one from Threads → Needle settings ("" / null = not set).
@@ -2682,15 +3256,464 @@ export async function onRequestPost(context) {
     }
 
     if (body.action === "createBlank") {
-      const result = await createBlank(env.DB, body, Array.isArray(body.sizes) ? body.sizes : []);
+      const result = await createBlank(env.DB, body, Array.isArray(body.sizes) ? body.sizes : [], { actor: adminActor(request) });
+      if (result.priceChanges.length) audit({ orgId: null, orderId: null, action: "inventory.vendor_prices_changed", detail: { blankId: result.id, changes: vendorPriceAudit_(result.priceChanges) } });
       return jsonResponse({ status: "ok", id: result.id, createdAt: result.createdAt });
+    }
+
+    // Import from PDF → Receive order: an invoice line's color / size the blank doesn't have yet is added to it
+    // (nothing in stock, no cost) so the line can be received — instead of left out of the order.
+    if (body.action === "addBlankSizes") {
+      const id = Number(body.blankId);
+      if (!id || !(await env.DB.prepare("SELECT id FROM blanks WHERE id=?").bind(id).first())) return jsonResponse({ status: "error", message: "Blank not found" }, 404);
+      const list = Array.isArray(body.sizes) ? body.sizes : [];
+      if (!list.length || list.length > 100) return jsonResponse({ status: "error", message: "Send 1–100 sizes" }, 400);
+      const added = await addBlankSizes(env.DB, id, list);
+      if (added) audit({ orgId: null, orderId: null, action: "inventory.blank_sizes_added", detail: { blankId: id, sizes: list.slice(0, 100).map(x => ({ color: String(x && x.color || ""), size: String(x && x.size || "") })) } });
+      return jsonResponse({ status: "ok", added });
     }
 
     if (body.action === "updateBlank") {
       const id = Number(body.id);
       if (!id) return jsonResponse({ status: "error", message: "id required" }, 400);
-      await updateBlank(env.DB, id, body, Array.isArray(body.sizes) ? body.sizes : null);
-      return jsonResponse({ status: "ok" });
+      // The for-testing flag moves the blank between inventory groups (migrations/0060) — audited when it changes.
+      const before = body.forTesting !== undefined ? await env.DB.prepare("SELECT forTesting FROM blanks WHERE id=?").bind(id).first().catch(() => null) : null;
+      const priceChanges = await updateBlank(env.DB, id, body, Array.isArray(body.sizes) ? body.sizes : null, { actor: adminActor(request) });
+      if (before && !!Number(before.forTesting) !== !!body.forTesting) audit({ orgId: null, orderId: null, action: "inventory.blank_testing_changed", detail: { blankId: id, forTesting: !!body.forTesting } });
+      if (priceChanges.length) audit({ orgId: null, orderId: null, action: "inventory.vendor_prices_changed", detail: { blankId: id, changes: vendorPriceAudit_(priceChanges) } });
+      // Products priced on the old vendor prices — the form offers to open them.
+      const repricing = priceChanges.length ? (await getProductPriceChanges(env.DB).catch(() => [])).filter(p => p.changes.some(c => c.blankId === id)) : [];
+      // A new vendor price or MAP (migrations/0070): the products using this blank now below a target or its MAP.
+      const belowTarget = belowFor_(await pricingBelowTargetForBlanks(env.DB, [id]).catch(() => []));
+      return jsonResponse({ status: "ok", priceChanges: priceChanges.length, repricing: repricing.map(p => ({ orgId: p.orgId, productId: p.productId, name: p.name })), belowTarget });
+    }
+
+    // Vendor prices (migrations/0062). "The prices are current": checked with the vendor, nothing changed.
+    if (body.action === "markBlankPricesChecked") {
+      const id = Number(body.id);
+      const at = id ? await markBlankPricesChecked(env.DB, id) : "";
+      if (!at) return jsonResponse({ status: "error", message: "Blank not found" }, 404);
+      audit({ orgId: null, orderId: null, action: "inventory.vendor_prices_checked", detail: { blankId: id } });
+      return jsonResponse({ status: "ok", pricesCheckedAt: at });
+    }
+
+    // ---- Vendor blanks (2026-10): complete blanks + per-color prices from a vendor product file ----
+    // The browser reads the vendor's file and sends the styles picked, as vendor products (cleanVendorProduct_).
+    if (body.action === "previewVendorBlanks" || body.action === "applyVendorBlanks") {
+      const products = Array.isArray(body.products) ? body.products.slice(0, 51) : [];
+      if (!products.length || products.length > 50) return jsonResponse({ status: "error", message: "Send 1–50 styles at a time" }, 400);
+      const aliases = body.aliases && typeof body.aliases === "object" ? body.aliases : {};
+      if (body.action === "previewVendorBlanks") return jsonResponse({ status: "ok", plans: await planVendorBlanks(env.DB, products, { blankIds: body.blankIds || {}, aliases }) });
+      const selections = Array.isArray(body.selections) ? body.selections.slice(0, 50) : [];
+      // Image addresses land in an <img src> — the same allowlist as every catalog image.
+      for (const sel of selections) for (const im of (Array.isArray(sel && sel.images) ? sel.images : [])) {
+        const clean = cleanImageUrl(im && im.url);
+        if (!clean) return jsonResponse({ status: "error", message: "One of the image addresses isn't allowed" }, 400);
+        im.url = clean;
+      }
+      const note = String(body.source || "Vendor file").replace(/[^\w &+.,()'-]/g, "").slice(0, 60) || "Vendor file";
+      // A product fetched through a vendor connection carries its connectionId; only a connection that exists counts.
+      if (products.some(p => p && p.connectionId != null)) {
+        const known = new Set((await listVendorConnections(env.DB)).map(c => Number(c.id)));
+        for (const p of products) if (p && p.connectionId != null && !known.has(Number(p.connectionId))) delete p.connectionId;
+      }
+      const results = await applyVendorBlanks(env.DB, products, selections, { actor: adminActor(request), note, aliases });
+      for (const r of results) audit({ orgId: null, orderId: null, action: r.created ? "inventory.blank_created_from_vendor" : "inventory.blank_updated_from_vendor",
+        detail: { ...r, source: note } });
+      // Prices / new blanks just changed: the products using them that are now below a pricing target.
+      const belowTarget = belowFor_(await pricingBelowTargetForBlanks(env.DB, results.map(r => r.blankId)).catch(() => []));
+      return jsonResponse({ status: "ok", results, blanks: await getAllBlanks(env.DB), belowTarget });
+    }
+
+    // ---- Vendor connections through PromoStandards (migrations/0065) ----
+    // The directory and the connection settings are the admin's; reading connections and fetching prices,
+    // a manager's. Credentials are encrypted before they're stored and never sent back.
+    if (body.action === "vendorDirectorySearch") {
+      const q = String(body.q || "").trim();
+      if (q.length < 2) return jsonResponse({ status: "error", message: "Type at least 2 letters" }, 400);
+      try { return jsonResponse({ status: "ok", companies: await searchPsCompanies(q) }); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message || "The PromoStandards directory couldn't be reached" }, 502); }
+    }
+    if (body.action === "vendorDirectoryEndpoints") {
+      const code = String(body.code || "").trim();
+      if (!code) return jsonResponse({ status: "error", message: "Which company?" }, 400);
+      try { return jsonResponse({ status: "ok", endpoints: await getPsEndpoints(code), labels: PS_OVERRIDES[code] || null, credentialsReady: vendorCredentialsReady(env) }); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message || "The PromoStandards directory couldn't be reached" }, 502); }
+    }
+    if (body.action === "listVendorConnections") {
+      return jsonResponse({ status: "ok", connections: await listVendorConnections(env.DB), credentialsReady: vendorCredentialsReady(env), labels: PS_OVERRIDES });
+    }
+    if (body.action === "saveVendorConnection") {
+      const okUrl = (u) => !u || (/^https:\/\/[a-z0-9.-]+\.[a-z]{2,}(:\d{2,5})?\/[^\s"'<>`]*$/i.test(String(u)) && String(u).length <= 300);
+      const ep = body.endpoints && typeof body.endpoints === "object" ? body.endpoints : {};
+      // Product Data and Pricing are required; Media, Inventory, Purchase Order and Order Shipment Notification optional
+      // (the last three are what ordering from Blanks to Order uses — migrations/0072).
+      const EP_KEYS = ["product", "ppc", "media", "inv", "po", "osn"];
+      const vers = ep.versions && typeof ep.versions === "object" ? ep.versions : null;
+      const endpoints = { environment: ep.environment === "test" ? "test" : "production", versions: {} };
+      for (const k of EP_KEYS) { endpoints[k] = String(ep[k] || ""); if (vers) endpoints.versions[k] = String(vers[k] || "").slice(0, 20); }
+      if (!EP_KEYS.every(k => okUrl(endpoints[k])) || !endpoints.product || !endpoints.ppc) return jsonResponse({ status: "error", message: "Product Data and Pricing need https:// service addresses (and any other service, an https:// address)" }, 400);
+      const name = String(body.name || "").trim(), code = String(body.companyCode || "").trim();
+      if (!name || (!body.id && !code)) return jsonResponse({ status: "error", message: "Name and company are required" }, 400);
+      const ov = body.overrides && typeof body.overrides === "object" ? body.overrides : {};
+      const overrides = { productIdFormat: String(ov.productIdFormat || "").slice(0, 60), fobId: String(ov.fobId || "").slice(0, 40) };
+      let credentialsEnc;
+      if (body.clearCredentials) credentialsEnc = "";
+      else if (body.credentials && (body.credentials.id || body.credentials.password)) {
+        if (!vendorCredentialsReady(env)) return jsonResponse({ status: "error", message: "Set the VENDOR_CREDENTIALS_KEY variable (a long random string) in Cloudflare first — the vendor login is stored encrypted with it." }, 400);
+        credentialsEnc = await encryptVendorCredentials(env, { id: String(body.credentials.id || "").slice(0, 200), password: String(body.credentials.password || "").slice(0, 500) });
+      }
+      if (body.id && !(await getVendorConnectionRow(env.DB, body.id))) return jsonResponse({ status: "error", message: "Connection not found" }, 404);
+      const id = await saveVendorConnection(env.DB, { id: body.id ? Number(body.id) : null, companyCode: code, name, endpoints, overrides, credentialsEnc });
+      audit({ orgId: null, orderId: null, action: body.id ? "vendor.connection_updated" : "vendor.connection_created",
+        detail: { id, companyCode: code || undefined, name, endpoints, overrides, credentials: credentialsEnc === undefined ? "unchanged" : (credentialsEnc ? "set" : "cleared") } });
+      return jsonResponse({ status: "ok", id, connections: await listVendorConnections(env.DB) });
+    }
+    if (body.action === "deleteVendorConnection") {
+      const row = await getVendorConnectionRow(env.DB, body.id);
+      if (!row) return jsonResponse({ status: "error", message: "Connection not found" }, 404);
+      await deleteVendorConnection(env.DB, row.id);
+      audit({ orgId: null, orderId: null, action: "vendor.connection_deleted", detail: { id: row.id, name: row.name } });
+      return jsonResponse({ status: "ok", connections: await listVendorConnections(env.DB) });
+    }
+    if (body.action === "linkVendorConnectionBlanks") {
+      const row = await getVendorConnectionRow(env.DB, body.id);
+      if (!row) return jsonResponse({ status: "error", message: "Connection not found" }, 404);
+      const n = await linkBlanksToVendorConnection(env.DB, row.id, Array.isArray(body.blankIds) ? body.blankIds : []);
+      audit({ orgId: null, orderId: null, action: "vendor.blanks_linked", detail: { id: row.id, count: n } });
+      return jsonResponse({ status: "ok", linked: n, connections: await listVendorConnections(env.DB) });
+    }
+    // Test connection / fetch products: the stored login is decrypted here, used for the calls, and dropped.
+    if (body.action === "testVendorConnection" || body.action === "fetchVendorProducts") {
+      const rl = await rateLimited(env, "vendor_api", request, 30);
+      if (rl.blocked) return rateLimitResponse(rl.retryAfter);
+      const row = await getVendorConnectionRow(env.DB, body.connectionId || body.id);
+      if (!row) return jsonResponse({ status: "error", message: "Connection not found" }, 404);
+      let credentials;
+      try { credentials = await decryptVendorCredentials(env, row.credentialsEnc); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, 400); }
+      if (!credentials) return jsonResponse({ status: "error", message: "This connection has no login yet — add it under Vendor integrations." }, 400);
+      const conn = { id: row.id, name: row.name, companyCode: row.companyCode, endpoints: JSON.parse(row.endpointsJson || "{}"), overrides: JSON.parse(row.overridesJson || "{}"), credentials };
+      if (body.action === "testVendorConnection") {
+        const style = String(body.style || "").trim().slice(0, 60);
+        if (!style) return jsonResponse({ status: "error", message: "Which style should the test look up?" }, 400);
+        try {
+          const p = await fetchVendorProduct(conn, style, { brand: String(body.brand || "") });
+          await setVendorConnectionStatus(env.DB, row.id, { ok: true, tested: true });
+          audit({ orgId: null, orderId: null, action: "vendor.connection_tested", detail: { id: row.id, style, ok: true } });
+          return jsonResponse({ status: "ok", product: p });
+        } catch (e) {
+          await setVendorConnectionStatus(env.DB, row.id, { ok: false, error: e.message, tested: true });
+          return jsonResponse({ status: "error", message: e.message || "The test failed" }, 502);
+        }
+      }
+      const styles = (Array.isArray(body.styles) ? body.styles : []).slice(0, 6).map(x => ({ style: String((x && x.style) || (typeof x === "string" ? x : "")).trim().slice(0, 60), brand: String((x && x.brand) || "").slice(0, 100) })).filter(x => x.style);
+      if (!styles.length) return jsonResponse({ status: "error", message: "Send 1–6 styles at a time" }, 400);
+      const products = [], errors = [];
+      for (const x of styles) {
+        // Each product says which connection it came from, so creating / updating a blank from it links the blank
+        // to that connection (applyVendorBlanks) — what Order from <supplier> and Refresh from vendor go by.
+        try { products.push({ ...(await fetchVendorProduct(conn, x.style, { brand: x.brand, media: body.media !== false })), connectionId: row.id }); }
+        catch (e) { errors.push({ style: x.style, message: e.message || "Failed" }); }
+      }
+      await setVendorConnectionStatus(env.DB, row.id, { ok: products.length > 0 || !errors.length, error: errors.length && !products.length ? errors[0].message : "", refreshed: products.length > 0 });
+      return jsonResponse({ status: "ok", products, errors });
+    }
+
+    // ---- Publish per shop (migrations/0076): what's unpublished, and a signed link to preview a shop's draft ----
+    if (body.action === "getPublishState") return jsonResponse({ status: "ok", publishState: await getPublishState(env.DB) });
+    if (body.action === "getPreviewLink") {
+      const org = await getOrgById(env.DB, String(body.org || ""));
+      if (!org) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
+      const token = await signPreviewToken(env, org.orgId);
+      if (!token) return jsonResponse({ status: "error", message: "Set the SIGNING_SECRET variable first — the preview link is signed with it." }, 400);
+      const root = rootDomain(env);   // the install's root domain (ROOT_DOMAIN), where every shop's address lives
+      return jsonResponse({ status: "ok", url: `https://${org.subdomain}.${root}/?preview=${encodeURIComponent(token)}`, expiresInMinutes: 60 });
+    }
+
+    // ---- New shop setup wizard: where each shop's setup is, and building a product from a blank in one go ----
+    if (body.action === "listShopWizards") return jsonResponse({ status: "ok", wizards: await listShopWizards(env.DB) });
+    if (body.action === "getShopWizard" || body.action === "saveShopWizard" || body.action === "deleteShopWizard") {
+      const org = await getOrgById(env.DB, String(body.org || ""));
+      if (!org) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
+      if (body.action === "getShopWizard") return jsonResponse({ status: "ok", state: await getShopWizard(env.DB, org.orgId) });
+      if (body.action === "deleteShopWizard") { await deleteShopWizard(env.DB, org.orgId); return jsonResponse({ status: "ok" }); }
+      try { return jsonResponse({ status: "ok", state: await saveShopWizard(env.DB, org.orgId, body.state) }); }
+      catch (e) { if (e && e.userFacing) return jsonResponse({ status: "error", message: e.message }, 400); throw e; }
+    }
+    // One product made from one blank, with its colors, sizes, prices, decoration and designs, and every color × size
+    // linked to the blank — what the product form needs several screens and a call per link to do. Always saved
+    // hidden (Go live / Publish shows it). The same checks as Create / Save product; a new product never takes the id
+    // of one that exists. The prices are the wizard's; MAP is checked once the links exist, and a product below MAP
+    // stays saved (hidden) with the problems returned so the wizard can say what to raise.
+    if (body.action === "buildProductFromBlank") {
+      const org = await getOrgById(env.DB, String(body.org || ""));
+      if (!org) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
+      const blank = (await getAllBlanks(env.DB)).find(b => b.id === Number(body.blankId));
+      if (!blank) return jsonResponse({ status: "error", message: "That blank wasn't found" }, 404);
+      const list = (v) => Array.isArray(v) ? [...new Set(v.map(x => String(x == null ? "" : x).trim()).filter(Boolean))] : [];
+      const colors = list(body.colors), sizes = list(body.sizes);
+      if (!sizes.length) return jsonResponse({ status: "error", message: "Pick at least one size" }, 400);
+      const all = await getProductsByOrg(env.DB, org.orgId, false);
+      const before = body.productId ? all.find(p => p.productId === String(body.productId)) || null : null;
+      if (body.productId && !before) return jsonResponse({ status: "error", message: "Product not found" }, 404);
+      const name = String(body.name || before && before.name || blank.name || "").trim().slice(0, 120);
+      if (!name) return jsonResponse({ status: "error", message: "Give the product a name" }, 400);
+      let productId = before ? before.productId : "";
+      if (!productId) {
+        const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36) || "product";
+        const used = new Set(all.map(p => p.productId));
+        productId = base; for (let n = 2; used.has(productId); n++) productId = base + "-" + n;
+      }
+      const decoration = ["embroidery", "dtf", "both"].includes(body.decoration) ? body.decoration : "embroidery";
+      const p = {
+        org: org.orgId, productId, name, sub: String(body.sub == null ? (before ? before.sub : "") : body.sub).slice(0, 300),
+        type: String(body.type || (before && before.type) || blank.productType || ""),
+        // The product's own weight is an optional override of its blank's (migrations/0077); kept unless sent.
+        weightOz: body.weightOz !== undefined ? (body.weightOz === "" || body.weightOz == null || !(Number(body.weightOz) > 0) ? null : Math.min(1000, Number(body.weightOz)))
+          : before ? before.weightOz : null,
+        personalizationPrice: body.personalizationPrice === "" || body.personalizationPrice == null ? null : Number(body.personalizationPrice),
+        personalizationOptions: before ? before.personalizationOptions || [] : [],
+        pricingMode: body.pricingMode === "flat" ? "flat" : "sized",
+        flatPrice: body.pricingMode === "flat" ? Number(body.flatPrice) : null,
+        sizePricing: body.pricingMode === "flat" ? {} : Object.fromEntries(Object.entries(body.sizePricing || {}).filter(([k]) => sizes.includes(k)).map(([k, v]) => [k, Number(v)])),
+        images: Array.isArray(body.images) ? body.images : (before ? before.images : []),
+        features: before ? before.features || [] : (blank.features || []),
+        // Shown while the shop isn't open yet (it says "Coming soon" to shoppers, and Preview needs them); in an open shop a
+        // new product starts hidden and Go live / the Products page shows it.
+        visible: !org.ready ? true : before ? !!before.visible : false,
+        sortOrder: before ? before.sortOrder : (all.reduce((m, x) => Math.max(m, Number(x.sortOrder) || 0), 0) + 10),
+        taxable: before ? before.taxable !== false : true,
+        configurable: true,
+        garmentColors: colors,
+        locations: Array.isArray(body.locations) ? body.locations : [],
+        fixedTransfers: Array.isArray(body.fixedTransfers) ? body.fixedTransfers : [],
+        // The picture of its embroidery on the shop page (an embroidery graphic at a decoration location, migrations/0069).
+        mockupGraphics: Array.isArray(body.mockupGraphics) ? body.mockupGraphics : (before ? before.mockupGraphics || [] : []),
+        colorGroups: Array.isArray(body.colorGroups) ? body.colorGroups : [],
+        noDesignNeeded: decoration === "dtf",
+      };
+      if (p.pricingMode === "flat" && !sizes.includes("OSFA")) sizes.splice(0, sizes.length, "OSFA");
+      { const why = checkProductPrice_(p, before); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkCategory_(p, before ? before.type : null); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = cleanLocationPrices_(p); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkPersonalization_(p); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = colorGroupsProblem_(p, before); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkFixedTransfers_(p); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      { const why = await checkMockupGraphics_(p); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      if (!PRODUCT_ID_RE.test(productId)) return jsonResponse({ status: "error", message: "That name doesn't make a usable product ID — add some letters or numbers." }, 400);
+      const imgCheck = validateProductImages(p.images);
+      if (imgCheck.error) return jsonResponse({ status: "error", message: imgCheck.error }, 400);
+      p.images = imgCheck.images;
+      if (before) await updateProduct(env.DB, org.orgId, p); else await createProduct(env.DB, org.orgId, p);
+      const links = await setProductLinksFromBlank(env.DB, org.orgId, productId, blank, colors, sizes);
+      if (Array.isArray(body.designs)) {
+        try { await setProductDesigns(env.DB, org.orgId, productId, body.designs); }
+        catch (e) { return jsonResponse({ status: "error", message: e.message, productId }, 400); }
+      }
+      const afterProduct = await productOf_(org.orgId, productId);
+      audit({ orgId: org.orgId, orderId: null, action: before ? "product.updated" : "product.created",
+        detail: { productId, changes: diff_(before, afterProduct, PRODUCT_AUDIT_FIELDS) } });
+      audit({ orgId: org.orgId, orderId: null, action: "product.built_from_blank",
+        detail: { productId, blankId: blank.id, colors: colors.length, sizes, linked: links.linked, missing: links.missing, decoration } });
+      const pricing = (await analyzePricing(env.DB, { orgId: org.orgId, productId }).catch(() => ({ products: [] }))).products[0] || null;
+      return jsonResponse({ status: "ok", productId, created: !before, linked: links.linked, missing: links.missing,
+        belowMap: !!(pricing && pricing.belowMap), mapProblems: pricing && pricing.belowMap ? pricing.mapProblems : [], pricing });
+    }
+
+    if (body.action === "setOrgReady") {
+      const before = await getOrgById(env.DB, String(body.orgId || ""));
+      if (!before) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
+      const ready = !!body.ready;
+      if (!!before.ready !== ready) {
+        await setOrgReady(env.DB, before.orgId, ready);
+        audit({ orgId: before.orgId, orderId: null, action: "org.updated", detail: { changes: { ready: { from: !!before.ready, to: ready } } } });
+      }
+      return jsonResponse({ status: "ok", ready });
+    }
+
+    // ---- Brand rules: restricted brands and the supplier's logo approvals (migrations/0075) ----
+    if (body.action === "getBrandRules") return jsonResponse({ status: "ok", rules: await getBrandRules(env.DB), defaults: DEFAULT_BRAND_RULES });
+    if (body.action === "updateBrandRules") {
+      let rules;
+      try { rules = await setBrandRules(env.DB, body.rules); }
+      catch (e) { if (e && e.userFacing) return jsonResponse({ status: "error", message: e.message }, 400); throw e; }
+      audit({ orgId: null, orderId: null, action: "settings.brand_rules_set", detail: { largeQty: rules.largeQty, brands: rules.brands.map(b => b.brand + (b.largeQty ? " " + b.largeQty : "")), concerns: rules.concerns } });
+      return jsonResponse({ status: "ok", rules });
+    }
+    if (body.action === "listBrandApprovals") {
+      return jsonResponse({ status: "ok", approvals: await listBrandApprovals(env.DB, { orgId: body.org || null, productId: body.productId || null }) });
+    }
+    if (body.action === "addBrandApproval") {
+      const org = String(body.org || ""), brand = String(body.brand || "").trim();
+      const productIds = (Array.isArray(body.productIds) ? body.productIds : []).map(x => String(x || "")).filter(Boolean).slice(0, 200);
+      const key = String(body.fileKey || "");
+      const approvedOn = String(body.approvedOn || "");
+      const maxQty = body.maxQty === "" || body.maxQty == null ? null : Number(body.maxQty);
+      if (!org || !productIds.length) return jsonResponse({ status: "error", message: "Which products does the approval cover?" }, 400);
+      if (!brandRuleFor_(await getBrandRules(env.DB), brand)) return jsonResponse({ status: "error", message: "That brand isn't on the brand rules list." }, 400);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(approvedOn) || approvedOn > new Date().toISOString().slice(0, 10)) return jsonResponse({ status: "error", message: "Enter the date the supplier approved it (not in the future)." }, 400);
+      if (maxQty !== null && !(Number.isInteger(maxQty) && maxQty > 0 && maxQty <= 1000000)) return jsonResponse({ status: "error", message: "The approved quantity must be a whole number, or blank for any amount." }, 400);
+      // The supplier's reply is required: a file already uploaded to the private receipts bucket (receipt.js).
+      if (!/^receipts\/\d{4}\/[a-z0-9]{32}\.(jpg|png|webp|pdf)$/.test(key)) return jsonResponse({ status: "error", message: "Attach the supplier's approval (a PDF of the email, or a picture of it)." }, 400);
+      if (env.RECEIPTS && typeof env.RECEIPTS.head === "function" && !(await env.RECEIPTS.head(key))) return jsonResponse({ status: "error", message: "The approval file wasn't found — attach it again." }, 400);
+      const known = new Set((await getProductsByOrg(env.DB, org, false)).map(p => p.productId));
+      const unknown = productIds.filter(p => !known.has(p));
+      if (unknown.length) return jsonResponse({ status: "error", message: "Unknown product: " + unknown.join(", ") }, 400);
+      const ids = await addBrandApproval(env.DB, { orgId: org, productIds, brand, approvedOn, maxQty, note: String(body.note || "").trim(), fileKey: key, fileName: String(body.fileName || ""), createdBy: adminActor(request) });
+      audit({ orgId: org, orderId: null, action: "brand.approval_added", detail: { ids, brand, productIds, approvedOn, maxQty, file: key } });
+      return jsonResponse({ status: "ok", ids, approvals: await listBrandApprovals(env.DB, { orgId: org }) });
+    }
+    if (body.action === "revokeBrandApproval") {
+      const a = await getBrandApproval(env.DB, body.id);
+      if (!a) return jsonResponse({ status: "error", message: "That approval wasn't found" }, 404);
+      const note = String(body.note || "").trim();
+      if (note.length < 3) return jsonResponse({ status: "error", message: "Say why it's being revoked." }, 400);
+      if (!(await revokeBrandApproval(env.DB, a.id, note))) return jsonResponse({ status: "error", message: "It's already revoked." }, 409);
+      audit({ orgId: a.orgId, orderId: null, action: "brand.approval_revoked", detail: { id: a.id, brand: a.brand, productId: a.productId, note } });
+      return jsonResponse({ status: "ok", approvals: await listBrandApprovals(env.DB, { orgId: a.orgId }) });
+    }
+
+    // ---- Ordering blanks from a supplier (migrations/0072, PromoStandards Purchase Order) ----
+    // Admin only (ADMIN_ONLY_ACTIONS): it spends the shop's money. Everything about parts, prices and stock is
+    // worked out here (planSupplierOrder), never taken from the browser.
+    if (body.action === "listSupplierOrders") {
+      const all = await listVendorConnections(env.DB);
+      // Every connection's company (a blank links to one connection; any connection of the same company that can
+      // take orders — production or the supplier's test service — can order it).
+      const companies = Object.fromEntries(all.map(c => [c.id, c.companyCode]));
+      const conns = all.filter(c => c.endpoints && c.endpoints.po)
+        .map(c => ({ id: c.id, name: c.name, companyCode: c.companyCode, environment: c.endpoints.environment === "test" ? "test" : "production", hasCredentials: c.hasCredentials,
+          stock: !!c.endpoints.inv, shipments: !!c.endpoints.osn, shipMethods: supplierShipMethods(c.companyCode) }));
+      return jsonResponse({ status: "ok", orders: await listSupplierOrders(env.DB, { limit: Number(body.limit) || 30 }), connections: conns, companies });
+    }
+    if (body.action === "previewSupplierOrder" || body.action === "placeSupplierOrder") {
+      const rl = await rateLimited(env, "vendor_api", request, 30);
+      if (rl.blocked) return rateLimitResponse(rl.retryAfter);
+      const retry = body.action === "placeSupplierOrder" && body.retryId ? await getSupplierOrder(env.DB, body.retryId) : null;
+      if (body.retryId && body.action === "placeSupplierOrder" && !retry) return jsonResponse({ status: "error", message: "That supplier order wasn't found" }, 404);
+      const c = await supplierConnection(env, retry ? retry.connectionId : (body.connectionId || body.id));
+      if (c.error) return jsonResponse({ status: "error", message: c.error }, c.code);
+      const conn = c.conn;
+      if (!conn.endpoints.po) return jsonResponse({ status: "error", message: `${conn.name} has no Purchase Order service set up — add it under Tools → Vendor integrations (the supplier has to turn ordering on for your account first).` }, 400);
+      const { shipTo, missing } = await supplierShipTo(env);
+      const methods = supplierShipMethods(conn.companyCode);
+
+      if (body.action === "previewSupplierOrder") {
+        const plan = await planSupplierOrder(env, conn, body.lines);
+        if (plan.error) return jsonResponse({ status: "error", message: plan.error }, 400);
+        const brandCheck = await supplierOrderApprovalCheck(env, plan.lines, Array.isArray(body.itemIds) ? body.itemIds : []);
+        return jsonResponse({ status: "ok", ...plan, brandCheck, shipTo, shipToMissing: missing, shipMethods: methods, environment: conn.environment, connection: { id: conn.id, name: conn.name },
+          orderHelp: (PS_OVERRIDES[conn.companyCode] && PS_OVERRIDES[conn.companyCode].orderHelp) || "",
+          poNumber: await nextSupplierPoNumber(env.DB, await supplierPoPrefix_(env.DB, conn)) });
+      }
+
+      // ---- placeSupplierOrder ----
+      if (missing.length) return jsonResponse({ status: "error", message: `Fill in the shop's ship-from address first (Global settings → Ship-from address): ${missing.join(", ")}.` }, 400);
+      let order, sendLines, brandCheck = null, overrideReason = "";
+      if (retry) {
+        // Sending again an order the supplier refused or never answered: the same lines and PO number (a supplier
+        // ignores a PO number it has already received), claimed so two retries can't both send.
+        if (!["unknown", "failed"].includes(retry.status)) return jsonResponse({ status: "error", message: `That order is ${retry.status}; only one that failed or got no answer can be sent again.` }, 409);
+        if (!(await claimSupplierOrderRetry(env.DB, retry.id))) return jsonResponse({ status: "error", message: "That order is already being sent." }, 409);
+        order = retry;
+        sendLines = retry.lines;
+      } else {
+        const method = methods.find(m => m.carrier === body.carrier && m.service === body.service) || (!body.carrier && !body.service ? methods[0] : null);
+        if (!method) return jsonResponse({ status: "error", message: "Pick a ship method." }, 400);
+        const poNumber = body.poNumber ? String(body.poNumber).trim() : await nextSupplierPoNumber(env.DB, await supplierPoPrefix_(env.DB, conn));
+        if (!/^[A-Za-z0-9-]{1,28}$/.test(poNumber)) return jsonResponse({ status: "error", message: "A PO number is 1–28 letters, digits or dashes." }, 400);
+        const plan = await planSupplierOrder(env, conn, body.lines);
+        if (plan.error) return jsonResponse({ status: "error", message: plan.error }, 400);
+        if (plan.problems) return jsonResponse({ status: "error", code: "problems", message: "Some lines can't be ordered — see each line.", ...plan }, 409);
+        // Restricted brands (migrations/0075): a large quantity needs the supplier's logo approval on file for each product,
+        // unless an admin overrides it with a reason (audited).
+        brandCheck = await supplierOrderApprovalCheck(env, plan.lines, Array.isArray(body.itemIds) ? body.itemIds : []);
+        overrideReason = body.overrideApproval && typeof body.overrideApproval === "object" ? String(body.overrideApproval.reason || "").trim().slice(0, 300) : "";
+        if (brandCheck.needsApproval.length && overrideReason.length < 5)
+          return jsonResponse({ status: "error", code: "needsApproval", message: "The supplier's logo approval isn't on file for " +
+            brandCheck.needsApproval.map(n => `${n.brand} ${n.style} ×${n.pieces} (${n.missing.map(m => m.name).join(", ")})`).join("; ") +
+            ". Add the approval on the product, or override with a reason.", brandCheck }, 409);
+        // The order lines it's for: only lines that are still waiting on exactly these blanks (Blanks to Order's
+        // rows, unpaid ones included since they can be bought on purpose) — whatever ids the browser sent.
+        const want = new Set((Array.isArray(body.itemIds) ? body.itemIds : []).slice(0, 5000).map(Number).filter(Boolean));
+        const keys = new Set(plan.lines.map(l => l.blankId + "\u0001" + l.color + "\u0001" + l.size));
+        const bto = await getBlanksToOrder(env.DB, { includeUnpaid: true });
+        const itemIds = [];
+        for (const sup of bto.suppliers) for (const r of sup.rows) if (keys.has(r.blankId + "\u0001" + r.color + "\u0001" + r.size)) for (const id of r.items) if (want.has(id)) itemIds.push(id);
+        // restockQty: what a line buys beyond the order lines it's for (a reorder point / "get me to free shipping") —
+        // counted as on its way so the restock isn't suggested again (restockOnOrder_ in db.js).
+        sendLines = plan.lines.map(l => ({ blankId: l.blankId, blank: l.blank, color: l.color, size: l.size, style: l.style, productId: l.productId, partId: l.partId, qty: l.qty, unitCents: l.unitCents,
+          restockQty: Math.min(l.qty, Math.max(0, Math.floor(Number(l.restockQty) || 0))) }));
+        const id = await insertSupplierOrder(env.DB, { connectionId: conn.id, vendor: conn.name, environment: conn.environment, poNumber, carrier: method.carrier, service: method.service,
+          shipTo, totalCents: plan.totalCents, lines: sendLines, itemIds, createdBy: adminActor(request) });
+        if (!id) return jsonResponse({ status: "error", message: `PO number ${poNumber} has already been used — each order needs its own.` }, 409);
+        order = await getSupplierOrder(env.DB, id);
+      }
+      let result;
+      try {
+        // On a supplier's test service, say so on the order itself — a supplier's "test" address may still process it.
+        const r = await psSendPO(conn, { poNumber: order.poNumber, orderDate: new Date().toISOString(), carrier: order.carrier, service: order.service, shipTo: order.shipTo,
+          comments: order.environment === "test" ? "TEST ORDER — DO NOT PROCESS OR SHIP" : "",
+          lines: sendLines.map(l => ({ partId: l.partId, qty: l.qty, unitCents: l.unitCents, description: [l.style, l.color, l.size].filter(Boolean).join(" ") })) });
+        result = { status: "placed", transactionId: r.transactionId };
+      } catch (e) {
+        // No answer at all (couldn't connect, timed out): the supplier may or may not have it.
+        const noAnswer = /couldn't be reached|timed? ?out|abort/i.test(String(e && e.message));
+        result = { status: noAnswer ? "unknown" : "failed", error: (e && e.message) || "The supplier refused the order" };
+      }
+      await setSupplierOrderResult(env.DB, order.id, result);
+      let marked = [];
+      if (result.status === "placed") marked = await markItemsBlankOrdered(env.DB, order.itemIds, { vendor: conn.name, vendorOrderId: order.poNumber });
+      if (brandCheck && brandCheck.needsApproval.length && overrideReason)
+        audit({ orgId: null, orderId: null, action: "supplier_order.approval_overridden",
+          detail: { id: order.id, poNumber: order.poNumber, reason: overrideReason, styles: brandCheck.needsApproval.map(n => ({ brand: n.brand, style: n.style, pieces: n.pieces, products: n.missing.map(m => m.productId) })) } });
+      audit({ orgId: null, orderId: null, action: result.status === "placed" ? "supplier_order.placed" : "supplier_order.failed",
+        detail: { id: order.id, poNumber: order.poNumber, vendor: conn.name, environment: conn.environment, status: result.status, total: order.total, error: result.error || undefined, retry: !!retry,
+          lines: sendLines.map(l => `${l.style} ${l.color} ${l.size} ×${l.qty}`), linesMarked: marked.length } });
+      const saved = await getSupplierOrder(env.DB, order.id);
+      if (result.status !== "placed") return jsonResponse({ status: "error", code: result.status, message: result.status === "unknown"
+        ? `${conn.name} didn't answer, so it isn't known whether order ${order.poNumber} went through. Check your orders on the supplier's site before sending it again (sending again uses the same PO number).`
+        : `${conn.name} refused order ${order.poNumber}: ${result.error}`, order: saved }, 502);
+      return jsonResponse({ status: "ok", order: saved, marked: marked.length });
+    }
+    if (body.action === "cancelSupplierOrder") {
+      const r = await cancelSupplierOrder(env.DB, body.id, { note: String(body.note || "").trim() });
+      if (r.error) return jsonResponse({ status: "error", message: r.error }, r.code || 400);
+      audit({ orgId: null, orderId: null, action: "supplier_order.cancelled",
+        detail: { id: r.order.id, poNumber: r.order.poNumber, vendor: r.order.vendor, note: r.order.cancelNote || undefined, linesUnmarked: r.unmarked.length } });
+      return jsonResponse({ status: "ok", order: r.order, unmarked: r.unmarked.length, orders: await listSupplierOrders(env.DB, { limit: 30 }) });
+    }
+    if (body.action === "checkSupplierOrderShipments") {
+      const rl = await rateLimited(env, "vendor_api", request, 30);
+      if (rl.blocked) return rateLimitResponse(rl.retryAfter);
+      let one = null;
+      if (body.id) { one = await getSupplierOrder(env.DB, body.id); if (!one) return jsonResponse({ status: "error", message: "That supplier order wasn't found" }, 404); }
+      const r = await checkSupplierShipments(env, one ? { order: one } : { limit: 10 });
+      return jsonResponse({ status: "ok", ...r, orders: await listSupplierOrders(env.DB, { limit: 30 }) });
+    }
+
+    // An image a vendor lists that isn't in the downloaded image folder: fetched once into our image bucket.
+    if (body.action === "copyVendorImage") {
+      // Signed-in managers only; "download every image" on a big style can be a few hundred in a couple of minutes.
+      const rl = await rateLimited(env, "vendor_image", request, 300);
+      if (rl.blocked) return rateLimitResponse(rl.retryAfter);
+      const r = await copyVendorImage(env, body.url);
+      return r.ok ? jsonResponse({ status: "ok", url: r.url, id: r.id }) : jsonResponse({ status: "error", message: r.message }, 400);
+    }
+
+    if (body.action === "getBlankVendorPriceHistory") {
+      return jsonResponse({ status: "ok", history: await getBlankVendorPriceHistory(env.DB, Number(body.blankId)) });
+    }
+
+    // The average cost of what's on hand is worked out from the stock history, never typed. This rebuilds
+    // it (and the on-hand count) from that history, for a blank whose stored figure drifted.
+    if (body.action === "recomputeBlankAverageCosts") {
+      const id = Number(body.id);
+      if (!id || !(await env.DB.prepare("SELECT id FROM blanks WHERE id=?").bind(id).first())) return jsonResponse({ status: "error", message: "Blank not found" }, 404);
+      const changed = await recomputeBlankAverageCosts(env.DB, id);
+      if (changed.length) audit({ orgId: null, orderId: null, action: "inventory.average_cost_recomputed", detail: { blankId: id, changes: changed } });
+      return jsonResponse({ status: "ok", changed, blanks: await getAllBlanks(env.DB) });
     }
 
     if (body.action === "deleteBlank") {
@@ -2814,6 +3837,30 @@ export async function onRequestPost(context) {
       catch (e) { return jsonResponse({ status: "error", message: e.message }, 400); }
     }
 
+    // ---- Product categories — the managed list a product's type is picked from (migrations/0056) ----
+    // Every change answers with the list (with how many products and blanks use each one) and makes
+    // the storefront re-read the catalog, since its section headings and their order come from here.
+    if (body.action === "listProductCategories") {
+      return jsonResponse({ status: "ok", categories: await listProductCategories(env.DB, { withCounts: true }) });
+    }
+    if (body.action === "saveProductCategory" || body.action === "deleteProductCategory") {
+      const c = body.category || {};
+      try {
+        if (body.action === "saveProductCategory") {
+          const key = await saveProductCategory(env.DB, c);
+          audit({ orgId: null, orderId: null, action: c.key ? "category.updated" : "category.created", detail: { key, name: String(c.name || "").trim() } });
+        } else {
+          // `categoryKey`, not `key`: every admin request's `key` field is the sign-in credential.
+          if (!body.categoryKey) return jsonResponse({ status: "error", message: "categoryKey required" }, 400);
+          await deleteProductCategory(env.DB, body.categoryKey);
+          audit({ orgId: null, orderId: null, action: "category.deleted", detail: { key: String(body.categoryKey) } });
+        }
+      } catch (e) { return jsonResponse({ status: "error", message: e.message }, 400); }
+      await bumpCatalogVersion(env.DB);
+      invalidateCatalogVersionCache();
+      return jsonResponse({ status: "ok", categories: await listProductCategories(env.DB, { withCounts: true }) });
+    }
+
     // ---- Per-location graphic × color mockups for configurable products (migrations/0042) ----
     if (body.action === "listProductGraphicImages") {
       if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "org and productId required" }, 400);
@@ -2843,10 +3890,17 @@ export async function onRequestPost(context) {
       if (!body.org) return jsonResponse({ status: "error", message: "org required" }, 400);
       if (!String(g.name || "").trim()) return jsonResponse({ status: "error", message: "Name is required" }, 400);
       for (const u of [g.imageUrl, g.thumbUrl]) if (u && !cleanImageUrl(u)) return jsonResponse({ status: "error", message: "Invalid image URL" }, 400);
-      if (g.kind === "embroidery" && !g.designId) return jsonResponse({ status: "error", message: "Pick a design for an embroidery option" }, 400);
-      if (g.id) { await updateGraphic(env.DB, Number(g.id), g); audit({ orgId: body.org, orderId: null, action: "graphic.updated", detail: { id: Number(g.id), name: g.name } }); return jsonResponse({ status: "ok", id: Number(g.id) }); }
-      const id = await createGraphic(env.DB, body.org, g);
-      audit({ orgId: body.org, orderId: null, action: "graphic.created", detail: { id, name: g.name } });
+      // An embroidery graphic can exist before its design (stitch file) — it's the picture shoppers pick; the design is
+      // linked when it's digitized (Run Order and the catalog check say what's missing until then).
+      // A shop edits its own graphics and any global one (migrations/0078) — one edit updates it for every shop.
+      const cur = g.id ? await getGraphic(env.DB, Number(g.id)) : null;
+      if (g.id && (!cur || (cur.orgId !== body.org && !cur.isGlobal))) return jsonResponse({ status: "error", message: "Graphic not found" }, 404);
+      { const why = await graphicGlobalProblem(env.DB, cur, g); if (why) return jsonResponse({ status: "error", message: why }, 400); }
+      const globalChange = g.isGlobal !== undefined && !!g.isGlobal !== !!(cur ? cur.isGlobal : false);
+      let id;
+      if (g.id) { await updateGraphic(env.DB, Number(g.id), g); id = Number(g.id); audit({ orgId: body.org, orderId: null, action: "graphic.updated", detail: { id, name: g.name } }); }
+      else { id = await createGraphic(env.DB, body.org, g); audit({ orgId: body.org, orderId: null, action: "graphic.created", detail: { id, name: g.name } }); }
+      if (globalChange) audit({ orgId: body.org, orderId: null, action: g.isGlobal ? "graphic.made_global" : "graphic.made_shop_only", detail: { id, name: g.name, homeOrgId: cur ? cur.orgId : body.org } });
       return jsonResponse({ status: "ok", id });
     }
     if (body.action === "setProductGraphicColorBlocked") {
@@ -2943,7 +3997,8 @@ export async function onRequestPost(context) {
         if (!woCat) return jsonResponse({ status: "error", message: "Choose an expense category for the written-off part" }, 400);
       }
       const { writeoffCents, personalCents } = transferSheetShares(pcts, woPct, pePct, totalCents);
-      const ids = await receiveTransferSheet(env.DB, { rows, totalCents, writeoffPct: woPct, personalPct: pePct,
+      const receiptGroup = newReceiptGroup_();
+      const ids = await receiveTransferSheet(env.DB, { rows, totalCents, writeoffPct: woPct, personalPct: pePct, receiptGroup,
         vendor: body.vendor, vendorRef: body.vendorRef, receivedAt: date,
         accountId: body.accountId, paidPersonally: !!body.paidPersonally, note: body.note, receiptKey: body.receiptKey, receiptName: body.receiptName });
       const sheet = (String(body.vendor || "").trim() || "Transfer sheet").slice(0, 120) + (body.vendorRef ? ` #${String(body.vendorRef).slice(0, 60)}` : "");
@@ -2955,14 +4010,14 @@ export async function onRequestPost(context) {
           woRecorded.expenseId = await saveExpense(env.DB, 0, { date, description: `Transfer sheet written off — ${woWhat} (${sheet})`, categoryId: woCat.id, amount: writeoffCents / 100,
             vendor: String(body.vendor || "").trim().slice(0, 100), businessUsePct: 100, receiptKey: String(body.receiptKey || ""), receiptName: String(body.receiptName || "").slice(0, 200),
             placedInService: woCat.deductionType === "depreciation" ? date : null, depMethod: woCat.deductionType === "depreciation" ? "ask_cpa" : null,
-            vendorChargedTax: true, accountId, paidPersonally: !!body.paidPersonally });
+            vendorChargedTax: true, accountId, paidPersonally: !!body.paidPersonally, receiptGroup });
         }
       }
       if (pePct > 0) {
         peRecorded = { pct: Math.round(pePct * 100) / 100, amount: personalCents / 100, description: peWhat };
         if (body.paidPersonally) peRecorded.notRecorded = true; // paid with personal funds: not a business transaction at all
         else if (personalCents > 0) {
-          peRecorded.ownerEntryId = await saveMoneyEntry(env.DB, "owner", 0, { date, amount: personalCents / 100, kind: "draw", accountId, note: `Personal items — ${peWhat} (${sheet})` });
+          peRecorded.ownerEntryId = await saveMoneyEntry(env.DB, "owner", 0, { date, amount: personalCents / 100, kind: "draw", accountId, note: `Personal items — ${peWhat} (${sheet})`, receiptGroup });
         }
       }
       audit({ orgId: null, orderId: null, action: "transfer.received", detail: { rows, total: Number(body.total) || 0, vendorRef: body.vendorRef || "",
@@ -3113,6 +4168,12 @@ export async function onRequestPost(context) {
     // What's missing in the catalog (⚠ markers on Manage catalog / Products / Designs).
     if (body.action === "getCatalogIssues") {
       return jsonResponse({ status: "ok", issues: await getCatalogIssues(env.DB, body.org || null) });
+    }
+
+    // "Ready to decorate": each product's linked blank, free stock per color + size (the Products list).
+    if (body.action === "getBlankReadyCounts") {
+      if (!body.org) return jsonResponse({ status: "error", message: "Missing org" }, 400);
+      return jsonResponse({ status: "ok", ready: await getBlankReadyByOrg(env.DB, body.org) });
     }
 
     // A product's designs in run order, one MAIN (migrations/0032).
@@ -3320,32 +4381,109 @@ export async function onRequestPost(context) {
       if (!body.runId) return jsonResponse({ status: "error", message: "Missing runId" }, 400);
       let res;
       // issues / issueNote / finishedAt come from the finish prompt (migrations/0046); all optional.
-      try { res = await completeProductionRun(env.DB, Number(body.runId), { issues: body.issues, issueNote: body.issueNote, finishedAt: body.finishedAt }); }
+      try { res = await completeProductionRun(env.DB, Number(body.runId), { issues: body.issues, issueNote: body.issueNote, finishedAt: body.finishedAt,
+        readStitches: stitchReader_(env), actor: adminActor(request) }); }
       catch (e) { return jsonResponse({ status: "error", message: e.message || "Could not finish the job" }, 400); }
       audit({ orgId: body.org || null, orderId: body.orderId || null, action: "run.completed", detail: { runId: Number(body.runId),
         pieceNo: res.pieceNo ?? null, stepNo: res.stepNo ?? null, pieceComplete: !!res.pieceComplete, orderComplete: !!res.orderComplete,
-        ...(Object.keys(res.issues || {}).length ? { issues: res.issues } : {}), ...(res.issueNote ? { issueNote: res.issueNote } : {}) } });
+        ...(Object.keys(res.issues || {}).length ? { issues: res.issues } : {}), ...(res.issueNote ? { issueNote: res.issueNote } : {}),
+        ...(res.counted ? { stitches: res.counted.stitches, seconds: res.counted.seconds } : {}) } });
       return jsonResponse({ status: "ok", orderComplete: !!res.orderComplete, pieceComplete: !!res.pieceComplete,
-        pieceNo: res.pieceNo ?? null, nextStepNo: res.nextStepNo ?? null });
+        pieceNo: res.pieceNo ?? null, nextStepNo: res.nextStepNo ?? null, counted: res.counted || null });
     }
     // "Mark done (no timing)" for one hooping of one piece (pieceNo omitted = a new piece).
     if (body.action === "markHoopingDone") {
       if (!body.org || !body.orderId || !body.itemId) return jsonResponse({ status: "error", message: "Missing org, orderId or itemId" }, 400);
       let res;
       try { res = await markHoopingDone(env.DB, { orgId: body.org, orderId: body.orderId, itemId: Number(body.itemId), machineId: body.machineId,
-        pieceNo: body.pieceNo, stepNo: body.stepNo, hoopId: body.hoopId }); }
+        pieceNo: body.pieceNo, stepNo: body.stepNo, hoopId: body.hoopId, readStitches: stitchReader_(env), actor: adminActor(request) }); }
       catch (e) { return jsonResponse({ status: "error", message: e.message || "Could not mark it done" }, 400); }
       audit({ orgId: body.org, orderId: body.orderId, action: "run.hooping_marked_done", detail: { itemId: Number(body.itemId),
-        pieceNo: res.pieceNo, stepNo: res.stepNo, pieceComplete: !!res.pieceComplete, orderComplete: !!res.orderComplete, machineId: body.machineId ?? null } });
-      return jsonResponse({ status: "ok", orderComplete: !!res.orderComplete, pieceComplete: !!res.pieceComplete, pieceNo: res.pieceNo, nextStepNo: res.nextStepNo ?? null });
+        pieceNo: res.pieceNo, stepNo: res.stepNo, pieceComplete: !!res.pieceComplete, orderComplete: !!res.orderComplete, machineId: body.machineId ?? null,
+        ...(res.counted ? { stitches: res.counted.stitches, seconds: res.counted.seconds, estimated: res.counted.estimated } : {}) } });
+      return jsonResponse({ status: "ok", orderComplete: !!res.orderComplete, pieceComplete: !!res.pieceComplete, pieceNo: res.pieceNo, nextStepNo: res.nextStepNo ?? null,
+        counted: res.counted || null });
     }
     if (body.action === "abortRun") {
       if (!body.runId) return jsonResponse({ status: "error", message: "Missing runId" }, 400);
-      try { await abortProductionRun(env.DB, Number(body.runId), { abortReasonId: body.abortReasonId, abortNote: body.abortNote }); }
+      // How many stitches it got through (optional, migrations/0071): blank = none.
+      const hasStitches = body.stitchesRun !== undefined && body.stitchesRun !== null && body.stitchesRun !== "";
+      if (hasStitches && cleanStitchCount(body.stitchesRun) == null) return jsonResponse({ status: "error", message: "Stitches run must be a whole number" }, 400);
+      let res;
+      try { res = await abortProductionRun(env.DB, Number(body.runId), { abortReasonId: body.abortReasonId, abortNote: body.abortNote,
+        stitchesRun: hasStitches ? body.stitchesRun : null, actor: adminActor(request) }); }
       catch (e) { return jsonResponse({ status: "error", message: e.message || "Could not abort the job" }, 400); }
-      audit({ orgId: body.org || null, orderId: body.orderId || null, action: "run.aborted", detail: { runId: Number(body.runId), abortReasonId: body.abortReasonId ?? null, abortNote: body.abortNote || "" } });
-      return jsonResponse({ status: "ok" });
+      audit({ orgId: body.org || null, orderId: body.orderId || null, action: "run.aborted", detail: { runId: Number(body.runId), abortReasonId: body.abortReasonId ?? null, abortNote: body.abortNote || "",
+        ...(res && res.counted ? { stitches: res.counted.stitches, seconds: res.counted.seconds } : {}) } });
+      return jsonResponse({ status: "ok", counted: (res && res.counted) || null });
     }
+    // ---- Machine counters & maintenance (migrations/0071) -------------------
+    // A reading typed from the machine's display (and optionally its run hours).
+    if (body.action === "setMachineStitchCount") {
+      const machineId = Number(body.machineId);
+      if (!machineId) return jsonResponse({ status: "error", message: "machineId required" }, 400);
+      let r;
+      try { r = await setMachineStitchCount(env.DB, machineId, { reading: body.reading, runHours: body.runHours, note: body.note, actor: adminActor(request) }); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, /not found/i.test(e.message) ? 404 : 400); }
+      audit({ orgId: null, orderId: null, action: "machine.counter_reading", detail: { machineId, from: r.before, to: { stitchCount: r.stitchCount, runSeconds: r.runSeconds }, note: body.note || "" } });
+      return jsonResponse({ status: "ok", ...r, machines: await listMachines(env.DB) });
+    }
+    if (body.action === "listMaintenanceTasks") {
+      return jsonResponse({ status: "ok", tasks: await listMaintenanceTasks(env.DB, body.machineId ? Number(body.machineId) : null) });
+    }
+    if (body.action === "saveMaintenanceTask") {
+      const t = body.task || {};
+      let id;
+      try { id = await saveMaintenanceTask(env.DB, t); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, /not found/i.test(e.message) ? 404 : 400); }
+      audit({ orgId: null, orderId: null, action: "machine.maintenance_task_saved", detail: { id, machineId: t.machineId ?? null, name: t.name || "",
+        everyHours: t.everyHours ?? null, everyStitches: t.everyStitches ?? null, active: t.active !== false, created: !t.id } });
+      return jsonResponse({ status: "ok", id, machines: await listMachines(env.DB) });
+    }
+    if (body.action === "deleteMaintenanceTask") {
+      let gone;
+      try { gone = await deleteMaintenanceTask(env.DB, Number(body.taskId)); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, 404); }
+      audit({ orgId: null, orderId: null, action: "machine.maintenance_task_deleted", detail: { id: gone.id, machineId: gone.machineId, name: gone.name } });
+      return jsonResponse({ status: "ok", machines: await listMachines(env.DB) });
+    }
+    if (body.action === "recordMaintenance") {
+      let r;
+      try { r = await recordMaintenance(env.DB, { machineId: body.machineId, taskId: body.taskId, name: body.name, note: body.note, doneAt: body.doneAt, actor: adminActor(request) }); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, /not found/i.test(e.message) ? 404 : 400); }
+      audit({ orgId: null, orderId: null, action: "machine.maintenance_done", detail: { machineId: Number(body.machineId), taskId: body.taskId ? Number(body.taskId) : null,
+        task: r.taskName, doneAt: r.doneAt, stitchCountAt: r.stitchCountAt, runSecondsAt: r.runSecondsAt, note: body.note || "" } });
+      return jsonResponse({ status: "ok", entry: r, machines: await listMachines(env.DB) });
+    }
+    if (body.action === "getMaintenanceLog") {
+      return jsonResponse({ status: "ok", ...(await getMaintenanceLog(env.DB, { machineId: body.machineId, from: body.from, to: body.to })),
+        tasks: await listMaintenanceTasks(env.DB, body.machineId ? Number(body.machineId) : null) });
+    }
+    // A stitch count typed in for a design version (or an order design, `kind: "order"`) whose file can't be read.
+    if (body.action === "setDesignVersionStitches") {
+      const id = Number(body.versionId);
+      if (!id) return jsonResponse({ status: "error", message: "versionId required" }, 400);
+      let r;
+      try { r = await setDesignStitchCount(env.DB, body.kind === "order" ? "order_item_designs" : "design_versions", id, body.stitchCount); }
+      catch (e) { return jsonResponse({ status: "error", message: e.message }, /not found/i.test(e.message) ? 404 : 400); }
+      audit({ orgId: body.org || null, orderId: null, action: "design.stitch_count_set", detail: { versionId: id, kind: body.kind === "order" ? "order" : "version", ...r } });
+      return jsonResponse({ status: "ok", stitchCount: r.to });
+    }
+    // Reads the stitch count of every design file that has none yet (DST / DSB), a batch at a time.
+    if (body.action === "fillDesignStitchCounts") {
+      const read = stitchReader_(env);
+      if (!read) return jsonResponse({ status: "error", message: "The designs bucket isn't set up here" }, 503);
+      const todo = await listDesignsMissingStitches(env.DB, 40);
+      let filled = 0, unreadable = 0;
+      for (const d of todo) {
+        let n = null;
+        try { n = cleanStitchCount(await read(d)); } catch (e) { n = null; }
+        if (n == null) { unreadable++; continue; }
+        await setDesignStitchCount(env.DB, d.table, d.id, n); filled++;
+      }
+      return jsonResponse({ status: "ok", checked: todo.length, filled, unreadable, more: todo.length >= 40 && filled > 0 });
+    }
+
     if (body.action === "getRunReportByDesign") {
       return jsonResponse({ status: "ok", report: await getRunReportByDesign(env.DB, { from: body.from, to: body.to }) });
     }
@@ -3396,7 +4534,9 @@ export async function onRequestPost(context) {
       }
       const { keys, parts } = await commitBlankOrder_(plan, { date, accountId, paidPersonally, fallbackName: "Blank order", source: { blankOrder: true } });
       audit({ orgId: null, orderId: null, action: "inventory.order_received", detail: { date, accountId, paidPersonally, keys, parts, total: plan.totalCents / 100 } });
-      return jsonResponse({ status: "ok", parts, total: plan.totalCents / 100, blanks: await getAllBlanks(env.DB) });
+      // The received blanks' average cost moved: products using them that are now below a pricing target.
+      const belowTarget = belowFor_(await pricingBelowTargetForBlanks(env.DB, plan.groups.map(g => g.blankId)).catch(() => []));
+      return jsonResponse({ status: "ok", parts, total: plan.totalCents / 100, blanks: await getAllBlanks(env.DB), belowTarget });
     }
     if (body.action === "receiveBlanks") {
       const blankId = Number(body.blankId);
@@ -3422,7 +4562,7 @@ export async function onRequestPost(context) {
       const landed = extraCost > 0
         ? landedCostLines(lines.map(l => ({ color: l.color || "", size: l.size, qty: Number(l.qty), cents: Number(l.qty) * Math.round(Number(l.unitCost) * 100) })), Math.round(extraCost * 100))
         : lines;
-      await receiveBlanks(env.DB, { blankId, lines: landed, vendor, vendorRef, receivedAt, vendorChargedTax, accountId, paidPersonally,
+      await receiveBlanks(env.DB, { blankId, lines: landed, vendor, vendorRef, receivedAt, vendorChargedTax, accountId, paidPersonally, receiptGroup: newReceiptGroup_(),
         note: extraCost ? `Received (landed cost incl. $${extraCost.toFixed(2)} shipping & other costs)` : "Received" });
       audit({ orgId: null, orderId: null, action: "inventory.received", detail: { blankId, lines, extraCost, vendor, vendorRef, receivedAt: receivedAt || null, vendorChargedTax } });
       return jsonResponse({ status: "ok", blanks: await getAllBlanks(env.DB) });
@@ -3444,8 +4584,12 @@ export async function onRequestPost(context) {
         occurredAt = body.occurredAt + "T12:00:00.000Z";
       }
       const note = String(body.note || "Write-off").trim().slice(0, 300);
-      await writeOffBlanks(env.DB, { blankId, color, size, qty, note, occurredAt });
-      audit({ orgId: null, orderId: null, action: "inventory.written_off", detail: { blankId, color, size, qty, note, occurredAt: occurredAt || null } });
+      // The reason (migrations/0060) — testing use is reported apart from damage and loss. An older page
+      // that sends only the note gets the reason worked out from it.
+      const reason = WRITEOFF_REASONS.includes(body.reason) ? body.reason
+        : /test|sample|scrap/i.test(note) ? "testing" : /damage/i.test(note) ? "damaged" : /lost|miscount/i.test(note) ? "lost" : "other";
+      await writeOffBlanks(env.DB, { blankId, color, size, qty, note, occurredAt, reason });
+      audit({ orgId: null, orderId: null, action: "inventory.written_off", detail: { blankId, color, size, qty, note, reason, occurredAt: occurredAt || null } });
       return jsonResponse({ status: "ok", blanks: await getAllBlanks(env.DB) });
     }
     if (body.action === "getBlankMovements") {
@@ -3519,7 +4663,7 @@ export async function onRequestPost(context) {
       }
       // Beginning inventory = end of the day before dateFrom; ending = end of dateTo.
       const dayBefore = new Date(Date.parse(dateFrom + "T00:00:00.000Z") - 1).toISOString();
-      const [beginning, ending, cogs, taxedResale, tBeginning, tEnding, tCogs] = await Promise.all([
+      const [beginning, ending, cogs, taxedResale, tBeginning, tEnding, tCogs, fBeginning, fEnding] = await Promise.all([
         getInventoryValuation(env.DB, dayBefore),
         getInventoryValuation(env.DB, dateTo + "T23:59:59.999Z"),
         getCogsReport(env.DB, dateFrom + "T00:00:00.000Z", dateTo + "T23:59:59.999Z"),
@@ -3527,15 +4671,34 @@ export async function onRequestPost(context) {
         getTransferValuation(env.DB, dayBefore),
         getTransferValuation(env.DB, dateTo + "T23:59:59.999Z"),
         getTransferCogs(env.DB, dateFrom + "T00:00:00.000Z", dateTo + "T23:59:59.999Z"),
+        getFinishedGoodsValuation(env.DB, dayBefore),
+        getFinishedGoodsValuation(env.DB, dateTo + "T23:59:59.999Z"),
       ]);
-      const sum = (k) => Math.round(cogs.rows.reduce((a, r) => a + r[k] * 100, 0)) / 100;
+      const sum = (k) => Math.round(cogs.rows.reduce((a, r) => a + (r[k] || 0) * 100, 0)) / 100;
       const tsum = (k) => Math.round(tCogs.reduce((a, r) => a + r[k] * 100, 0)) / 100;
       // Transfer-sheet inventory is a parallel section (migrations/0036), same beginning/purchases −
       // COGS − write-offs = ending shape as blanks.
       const transfers = { beginning: tBeginning, ending: tEnding, cogs: tCogs,
         totals: { cogs: tsum("cogs"), purchases: tsum("purchases"), writeoffs: tsum("writeoffs") } };
+      // The three inventory groups (migrations/0060): blanks for sale, blanks for testing / shop use, and
+      // finished stock. Their roll-forward — beginning + purchases + corrections − COGS (on blanks and
+      // finished stock; estimates have no stock movement, so they're left out) − write-offs = ending. Blanks
+      // decorated into finished stock move between groups and net to $0. `check` is what doesn't add up
+      // (a few cents of average-cost rounding is normal; more means stock went below zero somewhere).
+      const totals = { cogs: sum("cogs"), estimatedPart: sum("estimatedPart"), purchases: sum("purchases"), writeoffs: sum("writeoffs"),
+        cogsBlanks: sum("cogsBlanks"), cogsFinished: sum("cogsFinished"), writeoffsTesting: sum("writeoffsTesting"),
+        writeoffsDamagedLost: sum("writeoffsDamagedLost"), writeoffsOther: sum("writeoffsOther"), toFinished: sum("toFinished"), corrections: sum("corrections") };
+      const c = (x) => Math.round(Number(x || 0) * 100);
+      const begAll = c(beginning.value) + c(fBeginning.value), endAll = c(ending.value) + c(fEnding.value);
+      const rollForward = { beginning: begAll / 100, ending: endAll / 100,
+        check: (begAll + c(totals.purchases) + c(totals.corrections) - c(totals.cogsBlanks) - c(totals.cogsFinished) - c(totals.writeoffs) - endAll) / 100 };
+      const groups = {
+        forSale: { beginning: beginning.groups.forSale, ending: ending.groups.forSale },
+        testing: { beginning: beginning.groups.testing, ending: ending.groups.testing },
+        finished: { beginning: { units: fBeginning.units, value: fBeginning.value }, ending: { units: fEnding.units, value: fEnding.value } },
+      };
       return jsonResponse({ status: "ok", dateFrom, dateTo, beginning, ending, cogs, taxedResale, transfers,
-        totals: { cogs: sum("cogs"), estimatedPart: sum("estimatedPart"), purchases: sum("purchases"), writeoffs: sum("writeoffs") } });
+        finished: { beginning: fBeginning, ending: fEnding }, groups, rollForward, totals });
     }
 
     if (body.action === "getBlankLinks") {
@@ -3547,7 +4710,24 @@ export async function onRequestPost(context) {
     if (body.action === "setBlankLink") {
       const { org, productId, productColor, productSize, blankId, blankColor, blankSize } = body;
       if (!org || !productId || !blankId) return jsonResponse({ status: "error", message: "org, productId, blankId required" }, 400);
+      // MAP (migrations/0070): a link may not put one of the product's prices below the blank's minimum advertised
+      // price. Compared before / after, so a size that was already below MAP doesn't block linking another one.
+      const mapCheck = async () => {
+        const x = (await analyzePricing(env.DB, { orgId: org, productId: String(productId) }).catch(() => ({ products: [] }))).products[0] || { rows: [], mapProblems: [] };
+        return { keys: new Set(x.rows.filter(r => r.flags.includes("map")).map(r => r.group + "|" + r.size)), problems: x.mapProblems || [] };
+      };
+      const before = await mapCheck();
+      const prev = await env.DB.prepare("SELECT blankId, blankColor, blankSize FROM product_blank_links WHERE orgId=? AND productId=? AND productColor=? AND productSize=?")
+        .bind(org, productId, String(productColor || ""), productSize || "").first();
       await setBlankLink(env.DB, org, productId, String(productColor || ""), productSize || "", Number(blankId), String(blankColor || ""), blankSize || "");
+      const after = await mapCheck();
+      if ([...after.keys].some(k => !before.keys.has(k))) {
+        // Put the link back as it was.
+        if (prev) await setBlankLink(env.DB, org, productId, String(productColor || ""), productSize || "", Number(prev.blankId), prev.blankColor || "", prev.blankSize || "");
+        else await deleteBlankLink(env.DB, org, productId, String(productColor || ""), productSize || "");
+        const why = after.problems.filter(t => !before.problems.includes(t)).join("; ") || "a price would be below this blank's MAP";
+        return jsonResponse({ status: "error", code: "belowMap", message: `Not linked — ${why}. Raise the price first.` }, 409);
+      }
       return jsonResponse({ status: "ok" });
     }
 
@@ -3569,28 +4749,128 @@ export async function onRequestPost(context) {
       return jsonResponse({ status: "ok", ...result, blanks: await getAllBlanks(env.DB) });
     }
 
+    // Finished stock (migrations/0060). getReadyToShip: the shop's AVAILABLE counts (what its site shows),
+    // and with a productId that product's full picture for the Stock window (getFinishedStock).
     if (body.action === "getReadyToShip") {
       if (!body.org) return jsonResponse({ status: "error", message: "org required" }, 400);
       const stock = await getReadyToShipByOrg(env.DB, body.org);
-      return jsonResponse({ status: "ok", stock });
+      const finished = body.productId ? await getFinishedStock(env.DB, body.org, String(body.productId)) : undefined;
+      return jsonResponse({ status: "ok", stock, finished });
     }
 
+    // Stock window → Correct count: the counted number, recorded as a correction (setFinishedCount).
     if (body.action === "setReadyToShipQty") {
       const { org, productId, size, quantity } = body;
       if (!org || !productId) return jsonResponse({ status: "error", message: "org, productId required" }, 400);
-      if (quantity == null || Number(quantity) < 0) return jsonResponse({ status: "error", message: "quantity must be >= 0" }, 400);
-      await upsertReadyToShipQty(env.DB, org, productId, size ?? "", quantity);
+      if (quantity == null || !Number.isInteger(Number(quantity)) || Number(quantity) < 0) return jsonResponse({ status: "error", message: "Enter a whole count of 0 or more" }, 400);
+      let r;
+      try { r = await setFinishedCount(env.DB, { orgId: org, productId: String(productId), size: size ?? "", quantity: Number(quantity), note: body.note }); }
+      catch (e) { if (e.userFacing) return jsonResponse({ status: "error", message: e.message }, 409); throw e; }
+      if (r.delta) audit({ orgId: org, orderId: null, action: "inventory.finished_counted", detail: { productId, size: size ?? "", quantity: Number(quantity), delta: r.delta } });
+      return jsonResponse({ status: "ok", delta: r.delta });
+    }
+
+    // Stock window → Make for stock: blanks decorated into finished pieces (makeForStock).
+    if (body.action === "makeForStock") {
+      const locked = await periodGuard(body); if (locked) return locked;
+      const { org, productId, size } = body, qty = Number(body.qty);
+      if (!org || !productId) return jsonResponse({ status: "error", message: "org, productId required" }, 400);
+      if (!Number.isInteger(qty) || qty <= 0 || qty > 10000) return jsonResponse({ status: "error", message: "Enter how many were made" }, 400);
+      let occurredAt;
+      if (body.occurredAt) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(body.occurredAt)) return jsonResponse({ status: "error", message: "Date must be YYYY-MM-DD" }, 400);
+        if (body.occurredAt > new Date().toISOString().slice(0, 10)) return jsonResponse({ status: "error", message: "The date can't be in the future" }, 400);
+        occurredAt = body.occurredAt + "T12:00:00.000Z";
+      }
+      let r;
+      try { r = await makeForStock(env.DB, { orgId: org, productId: String(productId), size: size ?? "", qty, occurredAt }); }
+      catch (e) { if (e.userFacing) return jsonResponse({ status: "error", message: e.message }, 409); throw e; }
+      if (!r.claimed) return jsonResponse({ status: "error", message: "Those blanks were just used by something else — reopen the Stock window and try again." }, 409);
+      audit({ orgId: org, orderId: null, action: "inventory.made_for_stock", detail: { productId, size: size ?? "", qty, unitCost: r.unitCost, blank: r.blank } });
+      return jsonResponse({ status: "ok", unitCost: r.unitCost, blank: r.blank });
+    }
+
+    if (body.action === "getFinishedGoodsMovements") {
+      if (!body.org || !body.productId) return jsonResponse({ status: "error", message: "org, productId required" }, 400);
+      return jsonResponse({ status: "ok", movements: await getFinishedGoodsMovements(env.DB, body.org, String(body.productId)) });
+    }
+
+    if (body.action === "voidFinishedGoodsMovement") {
+      const locked = await periodGuard(body); if (locked) return locked;
+      const reason = String(body.reason || "").trim();
+      if (!body.movementId) return jsonResponse({ status: "error", message: "movementId required" }, 400);
+      if (!reason) return jsonResponse({ status: "error", message: "Say why it's being voided" }, 400);
+      let row;
+      try { row = await voidFinishedGoodsMovement(env.DB, body.movementId, reason); }
+      catch (e) { if (e.userFacing) return jsonResponse({ status: "error", message: e.message }, 409); throw e; }
+      audit({ orgId: row.orgId, orderId: null, action: "inventory.finished_movement_voided", detail: { id: Number(row.id), kind: row.kind, productId: row.productId, size: row.size, qtyDelta: Number(row.qtyDelta), reason } });
       return jsonResponse({ status: "ok" });
     }
   }
 
   // ---- publish — bump the catalog version to invalidate the edge cache -------
+  // Publish (migrations/0076): one shop ({org}) or every shop (no org). Its current rows become what shoppers see
+  // and orders are priced from; the cache version is bumped so the change shows at once.
   if (body.action === "publish") {
     const denied = await requireAdmin(env, host, body.key, request, "Not available here.", ACTION_ROLE[body.action]);
     if (denied) return denied;
+    const orgIds = body.org ? [String(body.org)] : (await getAllOrgs(env.DB)).map(o => o.orgId);
+    const published = [];
+    for (const id of orgIds) { const r = await publishShop(env.DB, id, adminActor(request)); if (r) published.push(id); }
+    if (body.org && !published.length) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
     const next = await bumpCatalogVersion(env.DB);
     invalidateCatalogVersionCache();
-    return jsonResponse({ status: "ok", version: next });
+    audit({ orgId: body.org || null, orderId: null, action: "catalog.published", detail: { shops: published } });
+    return jsonResponse({ status: "ok", version: next, published, publishState: await getPublishState(env.DB) });
+  }
+
+  // ---- Apply these prices (Brand rules → Show price impact): changes [{org, productId, group, size, price}] ----
+  // All checked first; nothing is written if any is wrong. The products are drafts until each shop is published.
+  if (body.action === "applyRulePrices") {
+    const denied = await requireAdmin(env, host, body.key, request, "Not available here.", ACTION_ROLE[body.action]);
+    if (denied) return denied;
+    const list = Array.isArray(body.changes) ? body.changes.slice(0, 2000) : [];
+    if (!list.length) return jsonResponse({ status: "error", message: "No prices to apply." }, 400);
+    const byProduct = new Map();
+    for (const c of list) { const k = String(c.org || "") + "\u0001" + String(c.productId || ""); (byProduct.get(k) || byProduct.set(k, []).get(k)).push(c); }
+    // A dry run of every product first (applyProductPrices writes only when its own list is clean), then the real one.
+    const problems = [];
+    for (const [k, cs] of byProduct) {
+      const [org, productId] = k.split("\u0001");
+      const row = await env.DB.prepare("SELECT * FROM products WHERE orgId=? AND productId=?").bind(org, productId).first();
+      if (!row) { problems.push(`${productId || "?"}: no such product`); continue; }
+      for (const c of cs) { const n = Number(c.price); if (!Number.isFinite(n) || n < 0 || n > 10000) problems.push(`${row.name || productId}: not a price`); }
+    }
+    if (problems.length) return jsonResponse({ status: "error", message: problems.slice(0, 5).join("; ") }, 400);
+    const done = [], skipped = [];
+    for (const [k, cs] of byProduct) {
+      const [org, productId] = k.split("\u0001");
+      const r = await applyProductPrices(env.DB, org, productId, cs);
+      if (r.problems.length) { skipped.push(...r.problems); continue; }
+      if (r.changed.length) {
+        done.push({ org, productId, changed: r.changed });
+        audit({ orgId: org, orderId: null, action: "product.prices_applied", detail: { productId, source: "price rule", changed: r.changed } });
+      }
+    }
+    return jsonResponse({ status: "ok", products: done, prices: done.reduce((n, p) => n + p.changed.length, 0), skipped, publishState: await getPublishState(env.DB) });
+  }
+
+  // ---- Discard a shop's unpublished changes: back to what was last published (planDiscardShopChanges) ----
+  if (body.action === "previewDiscardShopChanges" || body.action === "discardShopChanges") {
+    const denied = await requireAdmin(env, host, body.key, request, "Not available here.", ACTION_ROLE[body.action]);
+    if (denied) return denied;
+    const org = String(body.org || "");
+    if (body.action === "previewDiscardShopChanges") {
+      const plan = await planDiscardShopChanges(env.DB, org);
+      if (!plan) return jsonResponse({ status: "error", message: "This shop hasn't been published yet, so there's nothing to go back to." }, 409);
+      const { snap, live, ...view } = plan;
+      return jsonResponse({ status: "ok", plan: view });
+    }
+    const r = await discardShopChanges(env.DB, org);
+    if (!r) return jsonResponse({ status: "error", message: "This shop hasn't been published yet, so there's nothing to go back to." }, 409);
+    const { removedRows, ...res } = r;
+    audit({ orgId: org, orderId: null, action: "catalog.changes_discarded", detail: { ...res, removedProducts: removedRows } });
+    return jsonResponse({ status: "ok", ...res, publishState: await getPublishState(env.DB) });
   }
 
   // ---- sendDesignVerification — batch email design proofs to customers ---------
@@ -3827,6 +5107,40 @@ export async function onRequestPost(context) {
     return jsonResponse({ status: "ok", url: session.url, emailSent });
   }
 
+  // ---- sendInvoice — email the customer a link to their invoice page -----------
+  // The page (/?invoice=<token> on the shop's own address, functions/api/invoice.js) shows what's
+  // owed, lets the customer choose how they'll get the order (unless `allowDelivery` is false) and
+  // pay the balance. Sending again reuses the order's token, so an earlier email's link still works.
+  // If the email can't be sent the invoice still exists — the answer carries the link to pass on.
+  if (body.action === "sendInvoice") {
+    const denied = await requireAdmin(env, host, body.key, request, "Admin access is only available from the admin subdomain.", ACTION_ROLE[body.action]);
+    if (denied) return denied;
+    const orderId = String(body.orderId || "").trim();
+    if (!ORDER_ID_RE.test(orderId)) return jsonResponse({ status: "error", message: "Invalid order ID" }, 400);
+    let order = await getOrderById(env.DB, orderId);
+    if (!order || (body.org && order.orgId !== body.org)) return jsonResponse({ status: "error", message: "Order not found" }, 404);
+    if (order.voidedAt) return jsonResponse({ status: "error", message: "This order was voided — there's nothing to invoice" }, 400);
+    if (!(order.items || []).some(it => !it.cancelDate)) return jsonResponse({ status: "error", message: "Every item on this order is cancelled — there's nothing to invoice" }, 400);
+    if (!(Number(order.balanceDue) > 0)) return jsonResponse({ status: "error", message: "This order is already paid in full" }, 400);
+    // The address to send to: the one typed in the Send invoice window (which then becomes the
+    // order's contact, so receipts and the shipped email reach the same person), else the order's.
+    const typed = String(body.email || "").trim().slice(0, 200);
+    const email = typed || String(order.contact || "").trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return jsonResponse({ status: "error", message: "Enter the customer's email address to send the invoice to" }, 400);
+    if (typed && typed !== order.contact) { await updateOrderCustomerInfo(env.DB, orderId, { contact: typed }); order = await getOrderById(env.DB, orderId); }
+    const org = await getOrgById(env.DB, order.orgId);
+    if (!org) return jsonResponse({ status: "error", message: "Unknown org" }, 404);
+    const allowDelivery = body.allowDelivery !== false;
+    const inv = await sendOrderInvoice(env.DB, { orderId, orgId: order.orgId, sentTo: email, message: body.message, allowDelivery });
+    const base = org.subdomain ? `https://${org.subdomain}.${rootDomain(env)}` : new URL(request.url).origin;
+    const url = `${base}/?invoice=${inv.token}`;
+    const emailSent = await sendInvoiceEmail(env, { order: { ...order, manualShipping: inv.deliveryChoice === "shipping-quote" },
+      orgName: org.name || "", invoiceUrl: url, message: inv.message, allowDelivery });
+    audit({ orgId: order.orgId, orderId, action: "order.invoice_sent",
+      detail: { to: email, emailSent: !!emailSent, balanceDue: order.balanceDue, allowDelivery, sendCount: inv.sendCount } });
+    return jsonResponse({ status: "ok", url, emailSent: !!emailSent, sentTo: email, invoice: (await getOrderById(env.DB, orderId)).invoice });
+  }
+
   // ---- updateOrderDate — admin edits the placedAt date on an order -------------
   if (body.action === "updateOrderDate") {
     const denied = await requireAdmin(env, host, body.key, request, "Admin access is only available from the admin subdomain.", ACTION_ROLE[body.action]);
@@ -3900,6 +5214,15 @@ export async function onRequestPost(context) {
   if (!featureOn("storefront")) return jsonResponse({ status: "error", feature: "storefront", message: "Online ordering isn't available here." }, 403);
   if (host.kind === "locked") {
     body.orgId = host.orgId;
+  } else {
+    // An order is placed from the shop's own address, which is what says which shop it's for — the
+    // same rule the catalog and the customer's design uploads follow. Taking the shop from the request
+    // on the bare domain would let shop ids be guessed and an order dropped into any shop. One answer
+    // whether or not the shop exists. (localhost keeps it, for running the site on a developer's machine.)
+    const h = new URL(request.url).hostname;
+    if (h !== "localhost" && h !== "127.0.0.1") {
+      return jsonResponse({ status: "error", message: "Orders are placed from a shop's own page." }, 403);
+    }
   }
 
   const orderRl = await rateLimited(env, "order_submit", request, 20);
@@ -3931,7 +5254,8 @@ export async function onRequestPost(context) {
 
   // Org must exist, be open for orders, and not past a hard deadline —
   // enforced here, not just in the browser.
-  const orgRow = await getOrgById(env.DB, orgId);
+  // The shop as PUBLISHED (migrations/0076): open / deadline / delivery fees are what the shopper saw.
+  const orgRow = await getPublishedOrg(env.DB, orgId);
   if (!orgRow || !orgRow.ready) {
     return jsonResponse({ status: "error", message: "This shop is not currently accepting orders." }, 403);
   }
@@ -4041,11 +5365,13 @@ export async function onRequestPost(context) {
     try {
       const products = await getProductsByOrg(env.DB, orgId, true);
       const weightOf = new Map(products.map(p => [String(p.productId), p.weightOz]));
-      let presets = null;
+      let presets = null, packAs = null;
       try { presets = await getBoxPresets(env.DB); } catch (_) {}
+      // The same package-size limits /api/shipping uses (product categories, migrations/0056).
+      try { packAs = await getCategoryPackMap(env.DB); } catch (_) {}
       fitsABox = !!selectBox(pricedItems.map(it => ({
         type: it.type, qty: it.qty, weightOz: typeof weightOf.get(it.productId) === "number" ? weightOf.get(it.productId) : 0,
-      })), presets);
+      })), presets, packAs);
     } catch (e) {
       console.error("Could not check the box for a quote-to-follow order:", e);
     }
@@ -4105,7 +5431,7 @@ export async function onRequestPost(context) {
     const products = await getProductsByOrg(env.DB, orgId, false);
     const byId = Object.fromEntries(products.map(p => [p.productId, p]));
     serverWeightOz = pricedItems.reduce((sum, it) => {
-      const w = byId[it.productId] && Number(byId[it.productId].weightOz);
+      const w = productShipWeightOz(byId[it.productId], it.size);
       return sum + (w > 0 ? w : 8) * it.qty;
     }, 0);
   } catch (_) {}
@@ -4123,7 +5449,8 @@ export async function onRequestPost(context) {
   // on top it's part of the total). The storefront shows these figures, never its own estimate.
   let placed;
   try {
-    placed = (await insertOrder(env.DB, order, pricedItems)) || {};
+    // A line for a product + size in the shop's finished stock is filled from it (migrations/0060).
+    placed = (await insertOrder(env.DB, order, pricedItems, { fillFromStock: true })) || {};
   } catch (e) {
     // The same order id twice (a double click, a retry after a lost answer): the order is already
     // there, so say so plainly instead of failing with an error page.
@@ -4156,9 +5483,11 @@ export async function onRequestPost(context) {
   if (typeof context.waitUntil === "function") context.waitUntil(sendReceived);
   else await sendReceived;
 
+  // checkoutToken: what lets THIS customer start a card payment for this order (see http.js).
+  const checkoutToken = await signOrderToken(env, orderId);
   return jsonResponse(placed.taxMode === "exclusive"
-    ? { status: "ok", taxMode: "exclusive", salesTax: placed.salesTax, total: placed.total }
-    : { status: "ok" });
+    ? { status: "ok", taxMode: "exclusive", salesTax: placed.salesTax, total: placed.total, checkoutToken }
+    : { status: "ok", checkoutToken });
 }
 
 export async function onRequestGet() {

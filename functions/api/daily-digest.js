@@ -11,9 +11,11 @@ import { jsonResponse } from "../_lib/http.js";
 import { timingSafeEqual } from "../_lib/adminAuth.js";
 import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
 import { getDigestState, setDigestState, setDigestRun, getOrdersForDigest, getAllOrgs, getUnsentOwnerNotices, markOwnerNoticesSent,
-  getFailedAdminLogins, clearFailedAdminLogins, getSystemIssues, clearSystemIssues, getOrdersAwaitingBlanks, localToday } from "../_lib/db.js";
+  getFailedAdminLogins, clearFailedAdminLogins, getSystemIssues, clearSystemIssues, getOrdersAwaitingBlanks, localToday,
+  getBlankPriceReminder, setBlankPriceReminderSent, getNewPricingAlerts, listMaintenanceTasks, getFeatures } from "../_lib/db.js";
 import { sendDailyDigestEmail, sendDigestHeartbeatEmail } from "../_lib/email.js";
 import { checkShippedDeliveries, checkBlankShipments } from "../_lib/deliveryCheck.js";
+import { checkSupplierShipments } from "../_lib/supplierOrders.js";
 
 const SECURITY_ALERT_THRESHOLD = 5;
 
@@ -74,7 +76,15 @@ async function runDailyDigestInner_(env, trigger) {
   // Poll blank (garment) shipments with the remaining budget (migrations/0039): stores scan history
   // + updates each shipment's status, which the "Blanks ordered, not yet received" section then
   // shows live. A delivered one queues an owner notice (so it rides the roll-up); never auto-receives.
-  const blankBudget = Math.max(0, TRACKING_LOOKUP_BUDGET - (deliveries.checked || 0));
+  // First, orders placed with a supplier from Blanks to Order (migrations/0072): its shipment notices turn into
+  // blank shipments (one supplier call per order, from the same budget, at most 10), so the Shippo check below
+  // follows them the same morning.
+  let afterDeliveries = Math.max(0, TRACKING_LOOKUP_BUDGET - (deliveries.checked || 0));
+  if (afterDeliveries > 0) {
+    try { const r = await checkSupplierShipments(env, { limit: Math.min(10, afterDeliveries) }); afterDeliveries -= (r.checked || 0) + (r.errors || []).length; }
+    catch (e) { console.error("Supplier-shipment check failed — sending the roll-up without it:", e); }
+  }
+  const blankBudget = Math.max(0, afterDeliveries);
   if (blankBudget > 0) {
     try { await checkBlankShipments(env, { limit: blankBudget }); }
     catch (e) { console.error("Blank-shipment check failed — sending the roll-up without it:", e); }
@@ -104,29 +114,45 @@ async function runDailyDigestInner_(env, trigger) {
     return { ...o, orderedDate, expected, overdue, daysWaiting, daysLate, statusLabel };
   });
   const blanksOverdue = awaitingBlanks.filter(o => o.overdue);
+  // Every 30 days (migrations/0062): blanks for sale on visible products whose vendor prices haven't
+  // been checked in 30 days, and products priced on blank prices that have since changed. A reason to
+  // send on its own when due; once sent, the next one is 30 days later.
+  const reminder = await getBlankPriceReminder(env.DB).catch((e) => { console.error("getBlankPriceReminder failed:", e); return null; });
+  const priceReminder = reminder && reminder.due && (reminder.blanks.length || reminder.products.length) ? reminder : null;
+  // Products that slipped below a pricing target since the last roll-up (migrations/0067) — a blank's cost, a fee
+  // or a target changed. Each is reported once; a reason to send on its own.
+  const alerts = await getNewPricingAlerts(env.DB).catch((e) => { console.error("getNewPricingAlerts failed:", e); return { products: [], commit: async () => {} }; });
+  const belowTarget = alerts.products;
+  // Machine maintenance that's due (migrations/0071): listed whenever an email goes out, never a reason on its own.
+  // (Not while the production feature is switched off.)
+  const maintenanceDue = (await getFeatures(env.DB).catch(() => ({ production: true }))).production
+    ? (await listMaintenanceTasks(env.DB).catch(() => [])).filter(t => t.status === "due") : [];
   const inTransit = deliveries.inTransit || [];
   // Picked up by the carrier (marked shipped this run) is news; a label still waiting for a scan is
   // listed in the email for the record but never a reason to send one on its own.
   const pickedUp = deliveries.pickedUp || [], awaitingPickup = deliveries.awaitingPickup || [];
   // In transit alone isn't news: otherwise the email would go out every day while any package
   // was on its way, with nothing new in it. It's still listed whenever something else sends one.
-  if (!orders.length && !notices.length && !securityAlert && !deliveries.delivered.length && !pickedUp.length && !issues.length && !blanksOverdue.length) {
+  if (!orders.length && !notices.length && !securityAlert && !deliveries.delivered.length && !pickedUp.length && !issues.length && !blanksOverdue.length && !priceReminder && !belowTarget.length) {
     // Nothing to report; move the marker past any test/voided orders.
     await setDigestState(env.DB, { ...cursor, sentAt: state ? state.sentAt || "" : "" });
+    await alerts.commit().catch(() => {});   // nothing new below target — remember the recoveries
     // A quiet morning still gets a short "nothing new" email from the SCHEDULED run, so silence can
     // never mean "it didn't run". (A manual run doesn't — it would send one every time it's pressed.)
     // It reports nothing, so the last-sent time above is left alone; a failed send is recorded as an
     // email problem by send_ and turns up in the next roll-up.
     let heartbeat = "";
     if (trigger === "scheduled") {
-      const ok = await sendDigestHeartbeatEmail(env, { lastSentAt: state ? state.sentAt || "" : "", inTransit, awaitingPickup, awaitingBlanks });
+      const ok = await sendDigestHeartbeatEmail(env, { lastSentAt: state ? state.sentAt || "" : "", inTransit, awaitingPickup, awaitingBlanks, maintenanceDue });
       heartbeat = ok ? "sent" : "failed";
     }
     return jsonResponse({ status: "ok", sent: false, heartbeat, orders: 0, notices: 0, delivered: deliveries.delivered.length, inTransit: 0 });
   }
   const orgNames = Object.fromEntries((await getAllOrgs(env.DB)).map(o => [o.orgId, o.name]));
-  const sent = await sendDailyDigestEmail(env, { orders, notices, orgNames, security, inTransit, pickedUp, awaitingPickup, issues, awaitingBlanks });
+  const sent = await sendDailyDigestEmail(env, { orders, notices, orgNames, security, inTransit, pickedUp, awaitingPickup, issues, awaitingBlanks, priceReminder, belowTarget, maintenanceDue });
   if (!sent) return jsonResponse({ status: "error", message: "Email could not be sent — will retry next run" }, 502);
+  if (priceReminder) await setBlankPriceReminderSent(env.DB).catch((e) => console.error("setBlankPriceReminderSent failed:", e));
+  await alerts.commit().catch((e) => console.error("pricing alerts commit failed:", e));
   await setDigestState(env.DB, { ...cursor, sentAt: new Date().toISOString() });
   await markOwnerNoticesSent(env.DB, notices.map(x => x.id));
   if (security) await clearFailedAdminLogins(env.DB);

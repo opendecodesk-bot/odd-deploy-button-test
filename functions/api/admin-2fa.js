@@ -31,7 +31,14 @@ import {
   requireAdmin, adminActor, adminUser, require2fa, refreshPending, generateRecoveryCodes, saveRecoveryCodes, recoveryCodesLeft,
   looksLikeRecoveryCode, spendRecoveryCode,
 } from "../_lib/adminAuth.js";
-import { insertAuditLog, getUserById, updateUser, claimUserTotpCounter } from "../_lib/db.js";
+import { insertAuditLog, getUserById, updateUser, claimUserTotpCounter, deleteUserSessions } from "../_lib/db.js";
+import { rateLimitCheck, rateLimitHit, rateLimitResponse } from "../_lib/rateLimit.js";
+
+// Wrong codes typed here (turning two-step on or off, new recovery codes) per address per minute. A
+// signed-in session is needed to get this far, but the code is what stands between a borrowed session
+// and switching two-step off, so it can't be guessed at speed.
+const CODE_BUCKET = "admin_2fa_code";
+const CODE_LIMIT = 5;
 import { verifyTOTP }           from "../_lib/totp.js";
 
 function generateBase32Secret(){
@@ -94,17 +101,27 @@ export async function onRequestPost(context){
       return jsonResponse({status:"error", message:"Could not record this change — try again."}, 503);
     }
   };
+  // A wrong code counts against this address's budget; past it, codes aren't even checked.
+  const codeBudget = async () => { const rl = await rateLimitCheck(env, CODE_BUCKET, request, CODE_LIMIT); return rl.blocked ? rateLimitResponse(rl.retryAfter) : null; };
+  const wrongCode = async (message) => { await rateLimitHit(env, CODE_BUCKET, request); return jsonResponse({status:"error", message}, 400); };
   // A code that proves the user still has their second factor: from the app, or a recovery code
-  // (which is spent). Returns a Response when it isn't one.
+  // (which is spent). Returns a Response when it isn't one. An app code is claimed like a sign-in's,
+  // so a code already used (to sign in, say) can't be used again here.
   const proveSecondFactor = async (code) => {
+    const limited = await codeBudget(); if(limited) return limited;
     if(looksLikeRecoveryCode(code)){
       if(await spendRecoveryCode(env, user, code)){ user = await getUserById(env.DB, user.id); return null; }
-      return jsonResponse({status:"error", message:"That recovery code is not right, or was already used."}, 400);
+      return wrongCode("That recovery code is not right, or was already used.");
     }
     const result = await verifyTOTP(user.totpSecret, code);
-    if(!result.valid) return jsonResponse({status:"error", message:"Invalid code — check your device and try again."}, 400);
+    if(!result.valid) return wrongCode("Invalid code — check your device and try again.");
+    if(!(await claimUserTotpCounter(env.DB, user.id, result.counter))){
+      return jsonResponse({status:"error", message:"That code was already used — wait for the next one from your authenticator app."}, 400);
+    }
     return null;
   };
+  // Turning two-step on or off ends this user's OTHER sessions (this one stays signed in).
+  const endOtherSessions = () => deleteUserSessions(env.DB, user.id, me.tokenHash || "");
   const makeRecoveryCodes = async () => {
     const codes = generateRecoveryCodes();
     await saveRecoveryCodes(env, user.id, codes);
@@ -128,8 +145,9 @@ export async function onRequestPost(context){
     if(user.totpSecret){
       return jsonResponse({status:"error", message:"Two-factor authentication is already on. To move it to a new device, disable it first with a code from your current app, then set it up again."}, 409);
     }
+    const limited = await codeBudget(); if(limited) return limited;
     const result = await verifyTOTP(proposedSecret, code);
-    if(!result.valid) return jsonResponse({status:"error", message:"Invalid code — check your device and try again."}, 400);
+    if(!result.valid) return wrongCode("Invalid code — check your device and try again.");
     const auditErr = await auditFirst("security.2fa_enabled");
     if(auditErr) return auditErr;
     let recoveryCodes = null, pending = null;
@@ -138,6 +156,7 @@ export async function onRequestPost(context){
       // Record counter so the setup code can't be immediately replayed.
       if(result.counter !== null) await claimUserTotpCounter(env.DB, user.id, result.counter);
       if(!recoveryCodesLeft(user)) recoveryCodes = await makeRecoveryCodes();
+      await endOtherSessions();
       pending = await refreshPending(env, request, await getUserById(env.DB, user.id));
     }catch(e){
       console.error("admin-2fa activate storage error:", e);
@@ -162,6 +181,7 @@ export async function onRequestPost(context){
     try{
       if(action === "disable"){
         await updateUser(env.DB, user.id, { totpSecret: null, totpLastCounter: null, recoveryCodes: null });
+        await endOtherSessions();
         return jsonResponse({status:"ok", message:"Two-factor authentication disabled."});
       }
       const res = jsonResponse({status:"ok", recoveryCodes: await makeRecoveryCodes()});

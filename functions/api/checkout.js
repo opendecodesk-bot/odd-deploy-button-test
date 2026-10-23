@@ -41,8 +41,8 @@
 import { classifyHost } from "../_lib/hostConfig.js";
 import { getCatalogData } from "../_lib/catalogCache.js";
 import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
-import { jsonResponse } from "../_lib/http.js";
-import { getOrderCheckoutState } from "../_lib/db.js";
+import { jsonResponse, verifyOrderToken } from "../_lib/http.js";
+import { getOrderCheckoutState, getOrderInvoice, invoiceExpired } from "../_lib/db.js";
 
 export async function onRequestPost(context){
   const { request, env } = context;
@@ -83,11 +83,25 @@ export async function onRequestPost(context){
   if(host.kind === "unknown"){
     return jsonResponse({status:"error", message:"Unrecognized host"}, 404);
   }
+  // Who is asking? Stripe's payment page shows the customer's name and email, so an order number on
+  // its own must not open one. Accepted: the token the order endpoint gave whoever placed this order
+  // (`checkoutToken`), or the order's own, unexpired invoice link (the emailed /?invoice=<token>).
+  const invoiceToken = /^[a-z0-9]{16,64}$/.test(String(body.invoiceToken || "")) ? String(body.invoiceToken) : "";
+  let viaInvoice = false;
+  if(invoiceToken){
+    const inv = await getOrderInvoice(env.DB, invoiceToken).catch(() => null);
+    viaInvoice = !!(inv && inv.orderId === String(orderId) && !invoiceExpired(inv));
+  }
+  const viaOrder = !viaInvoice && await verifyOrderToken(env, String(orderId), body.checkoutToken);
   // Storefront switched off (Global settings → Features): this endpoint is the storefront's own
   // "pay by card" step right after an order is placed, so it is closed with it. Payment links the
-  // admin emails a customer are Stripe links made in orders.js and don't come through here.
-  if((catalogData.features || {}).storefront === false && host.kind !== "admin"){
+  // admin emails a customer are Stripe links made in orders.js and don't come through here — and an
+  // invoice the shop sent (functions/api/invoice.js) still opens the card checkout for its order.
+  if((catalogData.features || {}).storefront === false && host.kind !== "admin" && !viaInvoice){
     return jsonResponse({status:"error", feature:"storefront", message:"Online ordering isn't available here."}, 403);
+  }
+  if(!viaInvoice && !viaOrder){
+    return jsonResponse({status:"error", message:"This payment link is no longer valid. Please place the order again, or use the link in your email."}, 403);
   }
 
   // Look up the REAL total from D1 — never trust a client-supplied amount.
@@ -129,8 +143,12 @@ export async function onRequestPost(context){
 
   // Return URLs — Stripe sends the customer back here after payment/cancel
   const origin = new URL(request.url).origin;
-  const successUrl = origin + "/?stripe=success&orderId=" + encodeURIComponent(orderId) + "&org=" + encodeURIComponent(orderOrgId);
-  const cancelUrl  = origin + "/?stripe=cancel&org=" + encodeURIComponent(orderOrgId);
+  // Paying from an invoice page (/?invoice=<token>, functions/api/invoice.js) returns the customer
+  // to that page (its token was checked against this order above).
+  const successUrl = viaInvoice ? origin + "/?invoice=" + invoiceToken + "&paid=1"
+    : origin + "/?stripe=success&orderId=" + encodeURIComponent(orderId) + "&org=" + encodeURIComponent(orderOrgId);
+  const cancelUrl  = viaInvoice ? origin + "/?invoice=" + invoiceToken
+    : origin + "/?stripe=cancel&orderId=" + encodeURIComponent(orderId) + "&org=" + encodeURIComponent(orderOrgId);
 
   // Stripe uses integer minor units (cents)
   const amountCents = Math.round(total * 100);

@@ -15,6 +15,7 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
 (async () => {
   global.rateLimitCheck = async () => ({ blocked: false });
   global.rateLimitHit = async () => {};
+  global.rateLimitCheckGlobal = async () => ({ blocked: false }); global.rateLimitHitGlobal = async () => {};
   global.rateLimitResponse = () => new Response("", { status: 429 });
   const auth = new Function(strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/access.js")) + "\n" +
     strip(read("functions/_lib/adminAuth.js")) +

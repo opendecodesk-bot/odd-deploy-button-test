@@ -165,7 +165,7 @@ const P_S700 = prodRow("LEAGUE-S700", "Hoodies & Layers", "Champion Powerblend P
     prodRow("LEAGUE-D", "Caps", "Cap", "", "", "16", "", "", "", "", "", "", "", "", "", "TRUE"),
     prodRow("LEAGUE-E", "Shirts", "Tall sizes", "", "64800", "20", "", "", "Navy", "Navy", "", "", "S|LT", "", "", "TRUE"),
   ], {});
-  ok("no SKU / unknown category / no price / bad upcharge are problems", r.skipped === 4 && /No SKU/.test(r.results[0].problems.join()) && /isn't a shirt, hoodie/.test(r.results[1].problems.join()) &&
+  ok("no SKU / unknown category / no price / bad upcharge are problems", r.skipped === 4 && /No SKU/.test(r.results[0].problems.join()) && /isn't one of this site's categories/.test(r.results[1].problems.join()) &&
     /No price/.test(r.results[2].problems.join()) && /should look like 2XL:1.00/.test(r.results[3].problems.join()));
   prods = await lib.getProductsByOrg(d1, "league", false);
   ok("a product whose blank isn't imported yet is still created, with a note and no links", !!prod("league-c") && r.results[4].blank.found === false && /import the blanks file first/.test(r.results[4].notes.join()));

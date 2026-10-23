@@ -132,7 +132,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   r = await call({ action: "createFromStatementLine", lineId: san.id, kind: "blanks", blankId: 7, vendor: "SanMar", vendorRef: "5521",
     lines: [{ size: "M", qty: 6, unitCost: 4 }, { size: "L", qty: 4, unitCost: 7 }] });
   const sanNow = r.body.lines && r.body.lines.find(l => l.id === san.id);
-  console.log("6 M @ $4 + 4 L @ $7 = $52: received into inventory and matched to the line:", r.status === 200 && sanNow.status === "matched" && sanNow.matched.length === 2 &&
+  console.log("6 M @ $4 + 4 L @ $7 = $52: received into inventory and matched to the line:", r.status === 200 && sanNow.status === "matched" && sanNow.matched.length === 1 && sanNow.matched[0].keys.length === 2 && sanNow.matched[0].parts.length === 2 &&   // one purchase = one entry (2026-10)
     d1.q("SELECT quantity FROM blank_sizes WHERE blankId=7 AND size='M'")[0].quantity === 8 && d1.q("SELECT quantity FROM blank_sizes WHERE blankId=7 AND size='L'")[0].quantity === 4);
   const mv = d1.q("SELECT accountId, vendor, vendorRef, substr(occurredAt,1,10) d FROM inventory_movements WHERE kind='purchase' AND blankId=7");
   await call({ action: "importStatement", accountId: 2, lines: [{ date: "2026-09-05", description: "SANMAR ORDER 5530", amount: -24.5 }] });
@@ -370,5 +370,5 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   console.log("Record order receives both blanks from the card and closes:", !ro.isConnected &&
     d1.q("SELECT count(*) n FROM inventory_movements WHERE kind='purchase'")[0].n === before + 2 &&
     d1.q("SELECT sum(qtyDelta*unitCostCents) c FROM inventory_movements WHERE kind='purchase' AND substr(occurredAt,1,10)='2026-09-16' AND accountId=2")[0].c === 3000);
-  console.log("Receive order button on the Blanks screen:", /id="blankOrderBtn"/.test(adminJs) && /showReceiveOrderModal\(\(\) => renderAdminBlanks\(app\)\)/.test(adminJs));
+  console.log("Receive order button on the Blanks screen:", /id="blankOrderBtn"/.test(adminJs) && /showReceiveOrderModal\(refresh\)/.test(adminJs));
 })().catch(e => { console.log("test44 crashed:", false); console.error(e); process.exit(1); });

@@ -57,7 +57,8 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const admin = (body) => run(orders.post, "admin", "orders", Object.assign({ key: "x" }, body));
   const quote = (items, zip = "43004") => run(shipping, "shipper", "shipping", { zip, items });
   const place = (orderId, items, extra) => run(orders.post, "shipper", "orders", Object.assign({ orderId, orgId: "shipper", customerName: "Cust", contact: "c@x.com", paymentMethod: "Venmo", items }, extra));
-  const pay = (orderId) => run(checkout, "shipper", "checkout", { orderId, orgId: "shipper" });
+  const { orderTokenFor } = require("./testlib/order-token");
+  const pay = async (orderId) => run(checkout, "shipper", "checkout", { orderId, orgId: "shipper", checkoutToken: await orderTokenFor(env, orderId) });
   const saved = (orderId) => lib.getOrderById(d1, orderId);
   const ohio = { name: "Pat", line1: "1 Main St", city: "Columbus", state: "OH", zip: "43004" };
   const indiana = { name: "Pat", line1: "1 Main St", city: "Indianapolis", state: "IN", zip: "46201" };
@@ -119,7 +120,7 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const oddQuote = await orders.signQuote(env, { orgId: "shipper", zip: "00100", items: K([{ productId: "tee", qty: 1 }]), amountCents: 900, method: "USPS Ground" });
   r = await place("Q-ODDZIP", [{ productId: "tee", size: "M", qty: 1 }], { shippingAddress: { ...indiana, zip: "00100" }, shippingQuoteToken: oddQuote });
   ok("a quote for a ZIP no state owns can't carry an address that names a state of its choosing", r.status === 400 && /valid ZIP/.test(r.body.message) && !(await saved("Q-ODDZIP")));
-  ok("the storefront stops at 50 a line and 20 lines too", /if\(qty > 50\)\{ alert\(/.test(read("public/index.html")) && /if\(cart\.length >= 20\)\{ alert\(/.test(read("public/index.html")));
+  ok("the storefront stops at 50 a line and 20 lines too (said on the product's card)", /if\(qty > 50\)\{ cardMsg_\(/.test(read("public/index.html")) && /if\(cart\.length >= 20\)\{ cardMsg_\(/.test(read("public/index.html")));
 
   console.log("\n=== Shipping, quote to follow ===");
   r = await quote([{ productId: "banner", qty: 1 }]);

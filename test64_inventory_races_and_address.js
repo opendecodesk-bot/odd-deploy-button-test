@@ -24,7 +24,7 @@ const A = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + stri
   "const requireAdmin = async () => null; const adminActor = () => 'test';\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   strip(read("functions/_lib/quoteToken.js")) + "\nconst verifyTurnstile = async () => ({ ok: true });\n" +
-  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: {}, orgs: {} });\n" +
+  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: { acme: 'acme' }, orgs: {} });\n" +
   "const sendOrderReceivedEmail = async () => false, sendPaymentConfirmedEmail = async () => false, sendCancellationEmail = async () => false, sendDesignVerificationEmail = async () => false, sendShippingPaymentEmail = async () => false;\n" +
   dbSrc + "\n" + strip(read("functions/_lib/catalogValidation.js")) + "\n" + strip(read("functions/api/orders.js")) + "\nreturn { post: onRequestPost, signQuote, canonicalItems };")();
 const api = A.post;
@@ -157,7 +157,7 @@ const api = A.post;
     const ENV = { DB: d1, SIGNING_SECRET: "s".repeat(40) };
     d1._raw.exec("UPDATE orgs SET shippingEnabled = 1 WHERE orgId = 'acme'");
     const capItems = [{ productId: "cap", qty: 1 }];
-    const storefront = (orderId, extra) => call({ orderId, orgId: "acme", customerName: "Bea", contact: "bea@example.com", paymentMethod: "Venmo", items: capItems, ...extra }, "https://example.com/api/orders");
+    const storefront = (orderId, extra) => call({ orderId, orgId: "acme", customerName: "Bea", contact: "bea@example.com", paymentMethod: "Venmo", items: capItems, ...extra }, "https://acme.example.com/api/orders");
     const shop = async (orderId, addr) => storefront(orderId, { shippingAddress: addr,
       shippingQuoteToken: await A.signQuote(ENV, { orgId: "acme", zip: String(addr.zip), items: A.canonicalItems(capItems), amountCents: 500, method: "USPS Ground" }) });
     await lib.setSalesTaxSettings(d1, { rateBps: 600, jurisdiction: "OH" });   // the home state is a setting: Ohio here

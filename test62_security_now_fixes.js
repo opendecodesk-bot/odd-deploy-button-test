@@ -31,7 +31,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
   "const requireAdmin = async () => null; const adminActor = () => 'test';\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   "const verifyQuote = async () => ({ ok: false }); const canonicalItems = () => ''; const verifyTurnstile = async () => ({ ok: true });\n" +
-  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: {}, orgs: {} });\n" +
+  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: { prime: 'prime' }, orgs: {} });\n" +
   "const ensureOrgDomain = async () => ({ configured: false }); const getOrgDomainStatus = async () => ({ configured: false });\n" +
   "const sendOrderReceivedEmail = (...a) => global.__sendReceived(...a), sendPaymentConfirmedEmail = async () => false, sendCancellationEmail = async () => false, sendDesignVerificationEmail = async () => false, sendShippingPaymentEmail = async () => false;\n" +
   dbSrc + "\n" + valSrc + "\n" + strip(read("functions/api/orders.js")) + "\nreturn onRequestPost;")();
@@ -138,7 +138,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
     console.log("\n=== P1: order-received email doesn't hold up the response ===");
     emailSentFor = []; pending.length = 0;
     const resP = call({ orderId: "PRIME-2", orgId: "prime", customerName: "Bea", contact: "bea@example.com", paymentMethod: "Venmo",
-      items: [{ productId: "polo", qty: 1 }] }, "https://example.com/api/orders");
+      items: [{ productId: "polo", qty: 1 }] }, "https://prime.example.com/api/orders");
     const res = await Promise.race([resP, new Promise((r) => setTimeout(() => r("timeout"), 2000))]);
     console.log("the order response returns while the email is still sending:", res !== "timeout" && res.status === 200 && emailSentFor.length === 0);
     console.log("the order is saved before the email goes out:", !!(await lib.getOrderById(d1, "PRIME-2")));
@@ -157,6 +157,7 @@ const api = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + st
       "const getCatalogData = async () => ({ subdomainMap: {} }); const classifyHost = () => ({ kind: 'admin' });\n" +
       "const requireAdmin = async () => null; const adminActor = () => 'owner@myshop.com'; const adminUser = () => ({ id: 1, role: 'admin' });\n" +
       "const require2fa = async () => false; const refreshPending = async () => null;\n" +
+      "const rateLimitCheck = async () => ({ blocked: false }), rateLimitHit = async () => {}, rateLimitResponse = () => null, deleteUserSessions = async () => {};\n" +
       "const generateRecoveryCodes = () => ['aaaaa-bbbbb']; const saveRecoveryCodes = async () => {}; const recoveryCodesLeft = () => 0;\n" +
       "const looksLikeRecoveryCode = () => false; const spendRecoveryCode = async () => false;\n" +
       "const getUserById = async () => ({ id: 1, email: 'owner@myshop.com', totpSecret: __s.activeSecret() });\n" +

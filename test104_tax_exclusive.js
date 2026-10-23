@@ -33,11 +33,12 @@ const ORDERS = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" +
   "const requireAdmin = async () => null; const adminActor = () => 'test';\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   strip(read("functions/_lib/quoteToken.js")) + "\nconst verifyTurnstile = async () => ({ ok: true });\n" +
-  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: {}, orgs: {} });\n" +
+  "const invalidateCatalogVersionCache = () => {}; const getCatalogData = async () => ({ subdomainMap: { acme: 'acme' }, orgs: {} });\n" +
   "const sendOrderReceivedEmail = async () => false, sendPaymentConfirmedEmail = async () => false, sendCancellationEmail = async () => false, sendDesignVerificationEmail = async () => false, sendShippingPaymentEmail = async () => false;\n" +
   dbSrc + "\n" + strip(read("functions/_lib/catalogValidation.js")) + "\n" + strip(read("functions/api/orders.js")) + "\nreturn { post: onRequestPost, signQuote, canonicalItems };")();
 const api = ORDERS.post;
 const QUOTE_ENV = { SIGNING_SECRET: "s".repeat(40) };
+const { orderTokenFor } = require("./testlib/order-token");
 const checkout = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +
   "const rateLimited = async () => ({ blocked: false }); const rateLimitResponse = () => null;\n" +
   "const getCatalogData = async () => ({ subdomainMap: { acme: 'acme' }, orgs: {} });\n" +
@@ -184,7 +185,7 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const pay = async (orderId) => {
     stripeCalls.length = 0;
     const res = await checkout({ env: { DB: d1, STRIPE_SECRET_KEY: "sk_test_x" },
-      request: { url: "https://acme.example.com/api/checkout", json: async () => ({ orderId, orgId: "acme" }), headers: { get: () => null } } });
+      request: { url: "https://acme.example.com/api/checkout", json: async () => ({ orderId, orgId: "acme", checkoutToken: await orderTokenFor({ STRIPE_SECRET_KEY: "sk_test_x" }, orderId) }), headers: { get: () => null } } });
     return { status: res.status, sent: stripeCalls[0] };
   };
   let c = await pay("DISC");
@@ -200,7 +201,7 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   ok("an out-of-state order is charged without tax ($55.00)", c.sent["line_items[0][price_data][unit_amount]"] === "5500");
 
   console.log("\n=== A storefront order through the real API ===");
-  const shop = (orderId, extra = {}, items = [{ productId: "polo", qty: 2 }]) => call({ orderId, orgId: "acme", customerName: "Bea", contact: "bea@example.com", paymentMethod: "Venmo", items, ...extra }, "https://example.com/api/orders");
+  const shop = (orderId, extra = {}, items = [{ productId: "polo", qty: 2 }]) => call({ orderId, orgId: "acme", customerName: "Bea", contact: "bea@example.com", paymentMethod: "Venmo", items, ...extra }, "https://acme.example.com/api/orders");
   r = await shop("WEB-1");
   o = await get("WEB-1");
   ok("pickup: 2 × $16 + $1.92 tax = $33.92, and the response tells the storefront so", r.status === 200 && r.body.taxMode === "exclusive" && r.body.total === 33.92 && r.body.salesTax === 1.92 && o.effectiveTotal === 33.92);
@@ -214,7 +215,7 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   ok("a non-taxable product in the cart isn't taxed: $16 + $0.96 + $10 = $26.96", r.body.total === 26.96 && r.body.salesTax === 0.96);
   await mode("inclusive");
   r = await shop("WEB-4");
-  ok("with tax-included prices the response is the plain one it always was", r.status === 200 && eq(r.body, { status: "ok" }) && (await get("WEB-4")).effectiveTotal === 32);
+  ok("with tax-included prices the response is the plain one it always was (plus the card-checkout token)", r.status === 200 && eq(Object.assign({}, r.body, { checkoutToken: undefined }), { status: "ok", checkoutToken: undefined }) && (await get("WEB-4")).effectiveTotal === 32);
   r = await call({ action: "createTestTransaction", org: "acme", amount: 5 });
   await mode("exclusive");
   r = await call({ action: "createTestTransaction", org: "acme", amount: 5 });

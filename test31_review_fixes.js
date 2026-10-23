@@ -30,6 +30,7 @@ function jsonReq(url, body, headers = {}){
     global.rateLimited = async () => ({ blocked: false, retryAfter: 0 });
 global.rateLimitCheck = async () => ({ blocked: false, retryAfter: 0 });
 global.rateLimitHit = async () => {};
+global.rateLimitCheckGlobal = async () => ({ blocked: false, retryAfter: 0 }); global.rateLimitHitGlobal = async () => {};
     global.rateLimitResponse = () => new Response("", { status: 429 });
     const ns = {};
     new Function("ns", strip(read("functions/_lib/http.js")) + "\n" + strip(read("functions/_lib/access.js")) + "\n" +

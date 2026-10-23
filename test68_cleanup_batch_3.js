@@ -93,7 +93,8 @@ const tick = () => new Promise(r => setTimeout(r, 3));
     const adminJs = read("public/admin.js");
     const csvSafe = new Function(adminJs.slice(adminJs.indexOf("function csvSafe("), adminJs.indexOf("\n}\n", adminJs.indexOf("function csvSafe(")) + 2) + "\nreturn csvSafe;")();
     console.log("neutralised: =, leading spaces before =, tab, carriage return, full-width ＝, @:",
-      ["=1+1", "  =1", "\t=1", "\rx", "＝1", "@SUM(A1)"].every(v => csvSafe(v).startsWith("'")));
+      ["=1+1", "  =1", "\t=1", "\r=1", "＝1", "@SUM(A1)"].every(v => csvSafe(v).startsWith("'")));
+    console.log("a tab or line break inside a value can't start a new cell or row:", csvSafe("Ann\t=HYPERLINK(1)") === "Ann =HYPERLINK(1)" && csvSafe("Ann\r\n=1+1") === "Ann =1+1" && !/[\t\r\n]/.test(csvSafe("a\tb\nc\rd\u2028e")));
     console.log("ordinary text and numbers are left alone:", csvSafe("Ann Smith") === "Ann Smith" && csvSafe("12.50") === "12.50" && csvSafe("") === "");
 
     console.log("\n=== A-2: dead storefront/admin modes are gone ===");

@@ -14,9 +14,12 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
   const cssRule = (sel) => (indexHtml.match(new RegExp("\\." + sel + "\\s*\\{([^}]*)\\}")) || [])[1] || "";
   console.log("prompt boxes (.admin-pass-box, storefront .ship-addr-box) have a max height and scroll:",
     ["admin-pass-box", "ship-addr-box"].every(c => /max-height:\s*calc\(100vh/.test(cssRule(c)) && /overflow-y:\s*auto/.test(cssRule(c))));
-  console.log("balance-mismatch and label-font windows scroll too:",
-    /Payment doesn't cover the full balance/.test(adminJs) && /width:420px;max-width:95vw;max-height:90vh;overflow-y:auto;box-shadow:0 8px 40px rgba\(0,0,0,.5\)/.test(adminJs) &&
-    /min-width:320px;max-width:95vw;max-height:90vh;overflow-y:auto/.test(adminJs));
+  // Every admin window is the one shared window (inventoryModal_), which scrolls inside its box.
+  const overlays = adminJs.match(/position:fixed;inset:0/g) || [];
+  console.log("every admin window is the shared one (one overlay in admin.js), and it scrolls inside the box:",
+    overlays.length === 1 && /function inventoryModal_\(title, bodyHtml, width, opts\)/.test(adminJs) && /max-width:95vw;max-height:90vh;overflow-y:auto/.test(adminJs) &&
+    ["Payment doesn't cover the full balance", "Label font settings", "Send design verification", "Shipping information", "Payments &amp; discount"].every(t => adminJs.includes('inventoryModal_("' + t)) &&
+    /inventoryModal_\(isNew \? "New blank" : "Edit blank"/.test(adminJs));
   // Orders table: capped at the screen height (horizontal scrollbar always in view), header pinned.
   console.log("orders table is height-capped with a pinned header row:", /class="admin-table-wrap orders-table-wrap"/.test(adminJs) &&
     /max-height:\s*50vh/.test(cssRule("orders-table-wrap")) && /overflow:\s*auto/.test(cssRule("orders-table-wrap")) &&
@@ -45,11 +48,26 @@ const read = (p) => fs.readFileSync(__dirname + "/" + p, "utf8");
   const open1 = w.showPaymentsModal("org1", "ORD-1");
   for (let i = 0; i < 50 && !w.document.getElementById("pmCloseBottom"); i++) await new Promise(res => setTimeout(res, 10));
   const inner = w.document.querySelector(".pm-inner");
-  console.log("Payments window: ✕ positioned inside the box, Close button at the bottom:", !!inner && inner.style.position === "relative" &&
-    inner.contains(w.document.getElementById("pmClose")) && inner.lastElementChild.contains(w.document.getElementById("pmCloseBottom")));
-  inner.parentElement.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+  console.log("Payments window: the shared window's ✕ in its header, a Close button at the bottom:", !!inner && !!inner.closest(".admin-modal") &&
+    !!inner.closest(".admin-modal").querySelector("[data-modal-close]") && inner.lastElementChild.contains(w.document.getElementById("pmCloseBottom")));
+  inner.closest(".admin-modal").dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
   const stillOpen = !!w.document.querySelector(".pm-inner");
   w.document.getElementById("pmCloseBottom").click();
   await open1;
   console.log("…a background click leaves it open; Close closes it:", stillOpen && !w.document.querySelector(".pm-inner"));
+
+  // Escape closes only the window on top: a confirm window over another window leaves the one below open.
+  const below = w.inventoryModal_("Below", "<p>x</p>").ov;
+  const ans = w.confirmModal_({ title: "On top?" });
+  await new Promise(res => setTimeout(res, 10));
+  w.document.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  console.log("Escape closes only the window on top (the confirm), not the one under it:", (await ans).ok === false && below.isConnected);
+  w.document.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  console.log("…a second Escape closes the next one:", !below.isConnected);
+  let dismissed = 0;
+  const m3 = w.inventoryModal_("Answers", "<button id='m3ok'>OK</button>", 300, { onClose: () => dismissed++ });
+  m3.ov.querySelector("[data-modal-close]").click();
+  const m4 = w.inventoryModal_("Answers", "", 300, { onClose: () => dismissed++ });
+  m4.close();
+  console.log("onClose runs for ✕ / Escape (a question answered 'cancelled'), not for the window's own buttons:", dismissed === 1);
 })().catch(e => { console.log("test46 crashed:", false); console.error(e); process.exit(1); });

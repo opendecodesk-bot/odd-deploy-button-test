@@ -14,6 +14,7 @@
 //     object URLs freed) and the admin (the product form's fields, Edit items keeping the design).
 // Real SQL (sql.js) with every migration + the real db.js, orders.js, catalog.js, customer-design.js.
 const fs = require("fs");
+const { autoConfirm } = require("./testlib/confirm.js");
 const { JSDOM, ResourceLoader } = require("jsdom");
 const { createD1 } = require("./testlib/d1-shim.js");
 
@@ -41,7 +42,7 @@ const upload = new Function("gate", hostSrc + "\n" + httpSrc + "\n" + strip(read
   "const verifyTurnstile = async (env, token) => gate.bot && token === 'tok' ? { ok: true } : { ok: false, message: 'Bot check failed' };\n" +
   "const getCatalogData = async () => ({ subdomainMap: " + JSON.stringify(SUBS) + ", orgs: {}, features: {} });\n" +
   strip(read("functions/api/customer-design.js")) + "\nreturn { post: onRequestPost, cleanUp: cleanUpCustomerDesigns };")(gate);
-const catalogApi = new Function("lib", hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => [];\nlet DB_;\n" +
+const catalogApi = new Function("lib", hostSrc + "\n" + httpSrc + "\nconst getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nlet DB_;\n" +
   "const getCatalogData = async (env) => ({ ...(await lib.getPublicCatalogData(env.DB)), subdomainMap: " + JSON.stringify(SUBS) + " });\n" +
   strip(read("functions/api/catalog.js")) + "\nreturn onRequestGet;")(lib);
 
@@ -406,11 +407,11 @@ const bucket = () => { const m = new Map(); return { m, put: async (k, b, o) => 
   };
   const box = (pid, loc) => d.getElementById("cd-" + pid + "-" + loc);
   ok("a product that needs the customer's design shows the box, saying so and the add-on", !!box("logo-tee", "customdesign") && !box("logo-tee", "customdesign").hidden &&
-    /Your design \(required\) \+\$5\.00/.test(d.querySelector("#price-logo-tee").closest(".product").textContent) && /PNG, JPG or WebP · up to 10 MB · at least 500 px/.test(box("logo-tee", "customdesign").textContent));
+    /Your design \(required\) \+\$5\.00/.test(d.querySelector("#price-logo-tee").closest(".product").textContent) && /PNG, JPG or WebP \(an iPhone or iPad photo is fine\) · up to 10 MB · at least 500 px/.test(box("logo-tee", "customdesign").textContent));
   ok("its listed price includes the add-on", d.getElementById("price-logo-tee").textContent === "$30.00");
   ok("the file box doesn't trigger the price refresh (no data-pid)", !box("logo-tee", "customdesign").querySelector(".cd-file").hasAttribute("data-pid"));
   d.querySelector('[data-action="add"][data-pid="logo-tee"]').click();
-  ok("Add is refused until the design is uploaded", (w._alerts || []).includes("Upload your design to order this item.") && w.eval("cart").length === 0);
+  ok("Add is refused until the design is uploaded", d.getElementById("cmsg-logo-tee").textContent === "Upload your design to order this item." && w.eval("cart").length === 0);
   bitmap = { width: 400, height: 300, close(){} };
   await choose(box("logo-tee", "customdesign").querySelector(".cd-file"), "tiny.png");
   await until(() => /too small/.test(box("logo-tee", "customdesign").querySelector(".cd-status").textContent));
@@ -446,7 +447,7 @@ const bucket = () => { const m = new Map(); return { m, put: async (k, b, o) => 
   d.getElementById("cdon-polo").checked = true; d.getElementById("cdon-polo").dispatchEvent(new w.Event("change", { bubbles: true }));
   ok("ticking it shows the box", !box("polo", "customdesign").hidden);
   d.querySelector('[data-action="add"][data-pid="polo"]').click();
-  ok("…and then needs the upload", (w._alerts || []).some(m => /untick “Use my own design instead”/.test(m)) && w.eval("cart").length === 2);
+  ok("…and then needs the upload", /untick “Use my own design instead”/.test(d.getElementById("cmsg-polo").textContent) && w.eval("cart").length === 2);
 
   // Configurable.
   const capSel = d.getElementById("loc-cap-front");
@@ -484,7 +485,7 @@ const bucket = () => { const m = new Map(); return { m, put: async (k, b, o) => 
   const calls = [];
   class L extends ResourceLoader { fetch(url, o){ if (url.includes("/admin.js")) return Promise.resolve(Buffer.from(adminJs)); return super.fetch(url, o); } }
   const adom = new JSDOM(read("public/index.html"), { runScripts: "dangerously", resources: new L(), url: "https://admin.example.com/", pretendToBeVisual: true,
-    beforeParse(win){ win.CSS = win.CSS || { escape: (v) => String(v) }; win.confirm = () => true;
+    beforeParse(win){ win.CSS = win.CSS || { escape: (v) => String(v) }; autoConfirm(win, () => true);
       win.fetch = async (url, init) => {
         const b = init && init.body ? JSON.parse(init.body) : {};
         if (b.action) calls.push(b);

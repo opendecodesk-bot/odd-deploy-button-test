@@ -1,4 +1,5 @@
 const { JSDOM, ResourceLoader } = require("jsdom");
+const { autoConfirm } = require("./testlib/confirm.js");
 const fs = require("fs");
 let html = fs.readFileSync(__dirname + "/public/index.html", "utf8");
 html = html.replace("const PROXY_MODE = false;", "const PROXY_MODE = true;");
@@ -159,7 +160,7 @@ function lastToastText(win){
   // untouched window.prompt() call — only the admin passphrase moved to
   // the masked-input overlay below.
   adminWindow.prompt = (msg) => (msg && msg.includes("amount")) ? "5.00" : null;
-  adminWindow.confirm = () => true; // auto-approve the "mark as paid"/"resend" confirmation dialogs
+  autoConfirm(adminWindow, () => true); // auto-approve the "mark as paid"/"resend" confirmation dialogs
   const openedUrls = [];
   adminWindow.open = (url) => { openedUrls.push(url); };
 

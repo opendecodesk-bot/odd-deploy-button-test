@@ -35,8 +35,24 @@
 const WINDOW_SECONDS = 60;
 const CLEANUP_PROBABILITY = 0.02; // ~1 in 50 writes also sweeps expired rows
 
+// Who to count against. An IPv4 address is counted as itself. An IPv6 address is counted by its /64 —
+// one home or one server gets a whole /64 (and usually far more), so counting each exact address let
+// a single machine have a fresh budget on every request just by moving within its own block.
 function clientIp(request){
-  return (request && request.headers && request.headers.get("CF-Connecting-IP")) || "unknown";
+  const ip = (request && request.headers && request.headers.get("CF-Connecting-IP")) || "unknown";
+  return ip.includes(":") ? ipv6Prefix64(ip) : ip;
+}
+export function ipv6Prefix64(ip){
+  let s = String(ip || "").toLowerCase().split("%")[0];
+  if(s.includes(".")) return s;                         // an IPv4-mapped form: leave it alone
+  let groups;
+  if(s.includes("::")){
+    const [head, tail] = s.split("::");
+    const h = head ? head.split(":") : [], t = tail ? tail.split(":") : [];
+    groups = h.concat(Array(Math.max(0, 8 - h.length - t.length)).fill("0"), t);
+  } else groups = s.split(":");
+  if(groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/.test(g))) return s;   // not something we can read: count it as written
+  return groups.slice(0, 4).map(g => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
 function hasDb(env){
@@ -56,14 +72,16 @@ function memIncrement(w){
 }
 function memCount(w){ const cur = _memCount.get(w.key); return cur ? cur.count : 0; }
 
-function windowInfo(bucket, request){
+// `request` null = one counter for the whole install (see the *Global functions below).
+function windowInfo(bucket, request, windowSeconds){
+  const span = windowSeconds || WINDOW_SECONDS;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const windowIndex = Math.floor(nowSeconds / WINDOW_SECONDS);
-  const windowEnd = (windowIndex + 1) * WINDOW_SECONDS;
+  const windowIndex = Math.floor(nowSeconds / span);
+  const windowEnd = (windowIndex + 1) * span;
   return {
-    key: "rl:" + bucket + ":" + clientIp(request) + ":" + windowIndex,
+    key: "rl:" + bucket + ":" + (request ? clientIp(request) : "*") + ":" + windowIndex,
     retryAfter: Math.max(windowEnd - nowSeconds, 1),
-    expiresAt: windowEnd + WINDOW_SECONDS, // keep one extra window, then sweep
+    expiresAt: windowEnd + span, // keep one extra window, then sweep
     nowSeconds,
   };
 }
@@ -124,6 +142,30 @@ export async function rateLimitHit(env, bucket, request){
   const w = windowInfo(bucket, request);
   try{ await increment(env.DB, w); }
   catch(err){ console.error("Rate limiter hit error (bucket=" + bucket + "), counting in memory:", err); memIncrement(w); }
+}
+
+// One budget for the WHOLE install over a longer window, whoever is asking — for counting failed
+// sign-ins. A per-address limit alone is no limit against someone with many addresses. Same
+// check-then-count pair as above; fails toward "not blocked" only when there is no database at all.
+export async function rateLimitCheckGlobal(env, bucket, limit, windowSeconds){
+  if(!hasDb(env) || !(limit > 0)) return OPEN;
+  const w = windowInfo(bucket, null, windowSeconds);
+  if(_blocked.has(w.key)) return blockedResult(w);
+  try{
+    const row = await env.DB.prepare("SELECT count FROM rate_limits WHERE key = ?").bind(w.key).first();
+    if(row && Number(row.count) >= limit){ _blocked.set(w.key, true); return blockedResult(w); }
+    return OPEN;
+  }catch(err){
+    console.error("Rate limiter global check error (bucket=" + bucket + "), checking memory:", err);
+    if(memCount(w) >= limit){ _blocked.set(w.key, true); return blockedResult(w); }
+    return OPEN;
+  }
+}
+export async function rateLimitHitGlobal(env, bucket, windowSeconds){
+  if(!hasDb(env)) return;
+  const w = windowInfo(bucket, null, windowSeconds);
+  try{ await increment(env.DB, w); }
+  catch(err){ console.error("Rate limiter global hit error (bucket=" + bucket + "), counting in memory:", err); memIncrement(w); }
 }
 
 export function rateLimitResponse(retryAfter){
