@@ -21,14 +21,13 @@ email aren't set up by the button yet, so they're out of scope this time.
 
 You don't need a domain name, a terminal, or any programming.
 
-**Costs.** Everything the test creates fits within Cloudflare's free allowances. One part, R2 file
-storage, asks for a payment card on file even though the free allowance is $0. If Cloudflare asks
-you to switch on R2 or add a card, see step 3.
+**Costs.** Everything the test creates fits within Cloudflare's free allowances, and nothing should
+ask for a payment card. File storage (Cloudflare R2, which needs a card on file) is left out of this
+test, so product pictures, receipts and design files can't be uploaded yet.
 
 **What it creates in your accounts:**
 - a copy of this code in your GitHub account;
-- a Worker (the app), a D1 database, a Durable Object and possibly three R2 storage buckets in your
-  Cloudflare account.
+- a Worker (the app), a D1 database and a Durable Object in your Cloudflare account.
 
 How to remove all of it is at the end. Nothing is sent to the OpenDecoDesk project: the app runs
 entirely in your account.
@@ -37,26 +36,27 @@ entirely in your account.
 
 ### 1. Press the button
 
-Open this link, and sign in to Cloudflare and GitHub when asked:
+Open this link, and sign in to Cloudflare and GitHub when asked. Please use this link rather than
+Cloudflare's own "Create an app → import a repository": that route skips steps this app needs.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/opendecodesk-bot/odd-deploy-button-test)
 
-### 2. Choose a setup password
+### 2. Fill in Cloudflare's page
 
-Cloudflare's page shows a few settings. Most can stay as they are. One, **PROXY_ADMIN_PASSPHRASE**,
-is filled in with example text: replace it with a password of **12 characters or more** that you
-make up. It isn't your Cloudflare or GitHub password. Write it down; you need it in step 5.
+Cloudflare's page shows a few settings. Change these three and leave the rest as they are:
 
-Then click **Deploy** (or **Create and deploy**).
+- **Create private Git repository**: tick it, so the copy in your GitHub account isn't public.
+- **PROXY_ADMIN_PASSPHRASE** (your setup password): the box shows dots, but it holds example text.
+  Click into it, delete everything, and type a password of **12 characters or more** that you make
+  up. It isn't your Cloudflare or GitHub password. Write it down; you need it in step 5.
+- **Enable Preview builds**: switch it off. This app doesn't use them.
 
-### 3. If it asks about R2
+Then click **Deploy**.
 
-R2 is Cloudflare's file storage, used for product pictures and receipts. It needs a card on file,
-even at $0. Either choice is fine for this test:
-- **Switch it on** if you're comfortable adding a card. The free allowance is far more than this
-  test uses.
-- **Stop here** if you'd rather not, and tell us exactly what the page said. That alone is a useful
-  result.
+### 3. If it asks for a card or an upgrade
+
+It shouldn't. If any page asks you to upgrade, switch on R2 or add a card, stop and tell us exactly
+what it said (a screenshot is ideal).
 
 ### 4. Wait for the build
 
@@ -97,7 +97,7 @@ Please send these back to whoever gave you this link. Short answers are perfect.
 
 1. **How far did you get?** (step number, and what you saw)
 2. **What did Cloudflare's page ask for**, and was anything confusing?
-3. **Did it ask about R2 or a card?** What did you choose?
+3. **Did anything ask for a card or an upgrade?**
 4. **Did the build succeed?** If not, the build log.
 5. **First sign-in:** did it work, and was it clear what to do?
 6. **Looking around:** what was confusing, what looked broken, and what would you expect to find
@@ -113,6 +113,5 @@ rather not share before sending them.
 In the **Cloudflare dashboard**:
 - **Workers & Pages**: delete the Worker.
 - **D1**: delete the `opendecodesk-db` database.
-- **R2**, if created: empty and delete the `opendecodesk-…` buckets.
 
 In **GitHub**: open your copy, then **Settings → Delete this repository** at the bottom.
