@@ -29,6 +29,45 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const A = await makeAuth({ passphrase: "a long setup password" });
   ok("a setup password of 12 characters or more does", (await A.signIn("", "a long setup password")).body.pending === "account");
 
+  console.log("\n=== The site's own domain ===");
+  // Requests to any address (the harness's own helper always uses admin.example.com).
+  const req = (url, body, cookie) => { const h = { origin: new URL(url).origin, cookie: cookie ? "__Host-odd_admin=" + cookie : "", "cf-connecting-ip": "203.0.113.9" };
+    return { url, method: "POST", json: async () => body, headers: { get: (n) => h[String(n).toLowerCase()] || null } }; };
+  const { answer } = require("./testlib/auth-harness");
+  const W = "https://opendecodesk.someone.workers.dev", S = await import("./scripts/setup.mjs");
+  const B = await makeAuth({ passphrase: "a long setup password" });
+  delete B.env.ROOT_DOMAIN;                                     // a button install: no domain yet
+  const site = () => S.parseSiteSetting(B.d1.q("SELECT value FROM global_settings WHERE key = 'site'")[0]);
+  const signInAt = async (origin, email, key) => answer(await B.raw["/api/admin-session"].POST({ request: req(origin + "/api/admin-session", { email, key }), env: B.env }));
+  const first = await signInAt(W, "", "a long setup password");
+  await B.password({ action: "account", name: "Olive Owner", email: "olive@myshop.com", next: "correct horse battery" }, first.cookie);
+  const own = await signInAt(W, "olive@myshop.com", "correct horse battery");
+  ok("signing in on the workers.dev address works and records nothing about a domain", own.status === 200 && !own.body.pending && !site().adminHostSeen && !site().rootDomain);
+  const shop = { action: "createOrg", orgId: "league", subdomain: "league", name: "League" };
+  const made = await answer(await B.raw["/api/orders"].POST({ request: req(W + "/api/orders", shop, own.cookie), env: B.env, waitUntil: () => {} }));
+  ok("a shop can't be created there yet: its address would be <name>.example.com", made.status === 409 && made.body.code === "no_domain" && /own domain/.test(made.body.message) && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 0);
+
+  B.env.ROOT_DOMAIN = "myshop.com";                              // the Setup page's domain step
+  const there = await signInAt("https://admin.myshop.com", "olive@myshop.com", "correct horse battery");
+  ok("the first sign-in on admin.<domain> records that the domain works, which lets the next deploy switch workers.dev off", there.status === 200 &&
+    site().adminHostSeen === true && site().rootDomain === "myshop.com" && site().adminSubdomain === "admin");
+  const again = await signInAt(W, "olive@myshop.com", "correct horse battery");
+  ok("…and a later sign-in on the workers.dev address (still on until that deploy) doesn't undo it", again.status === 200 && site().adminHostSeen === true);
+  const madeNow = await answer(await B.raw["/api/orders"].POST({ request: req("https://admin.myshop.com/api/orders", shop, there.cookie), env: B.env, waitUntil: () => {} }));
+  ok("with a domain, shops can be created again", madeNow.body.code !== "no_domain" && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 1);
+
+  const catalog = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +
+    "const getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nconst getCatalogData = async () => ({ subdomainMap: {}, business: {}, features: {} });\n" +
+    strip(read("functions/api/catalog.js")) + "\nreturn onRequestGet;")();
+  const adminAnswer = async (host, e) => JSON.parse(await (await catalog({ request: { url: `https://${host}/api/catalog` }, env: e })).text());
+  const noDomain = await adminAnswer("opendecodesk.someone.workers.dev", {}), withDomain = await adminAnswer("admin.myshop.com", { ROOT_DOMAIN: "myshop.com" });
+  ok("the admin is told the site's domain, or \"\" when there is none — never example.com", noDomain.status === "admin" && noDomain.site.rootDomain === "" && withDomain.site.rootDomain === "myshop.com");
+  const adminJs = read("public/admin.js");
+  ok("the admin (the shop wizard too) no longer works the domain out from its own address", /function siteRootDomain_\(\)\{ return String\(\(typeof siteInfo_/.test(adminJs) && !/siteRootDomain_[^\n]*location\.hostname/.test(adminJs) &&
+    !/location\.hostname\.split\("\."\)\.slice\(1\)/.test(adminJs) && /siteInfo_ = data\.site \|\| \{\}/.test(read("public/index.html")));
+  ok("…and the wizard stops before creating a shop when there is no domain, with the same words as the server", /if \(!siteRootDomain_\(\)\) return NO_DOMAIN_YET_;/.test(adminJs) &&
+    adminJs.includes(`NO_DOMAIN_YET_ = "${made.body.message}"`));
+
   console.log("\n=== What the button reads ===");
   const example = read(".dev.vars.example").split("\n").filter(l => l.trim() && !l.startsWith("#"));
   const pkg = JSON.parse(read("package.json")), toml = read("wrangler.toml");

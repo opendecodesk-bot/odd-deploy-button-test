@@ -35,9 +35,11 @@ let _boxPresetsCache = null; // cached from DB; null = not yet loaded
 // every same-origin /api call automatically. localStorage only remembers a
 // non-secret marker ({token:"cookie", expires}) so we know not to re-prompt.
 // Sessions last 24 hours.
-// The install's root domain, worked out from where the admin panel itself is served
-// ("admin.myshop.com" → "myshop.com"); shops live at <subdomain>.<root domain>.
-function siteRootDomain_(){ const h = String(location.hostname || ""); const i = h.indexOf("."); return i > 0 ? h.slice(i + 1) : h; }
+// The install's root domain, from /api/catalog's admin answer (index.html keeps it in siteInfo_);
+// shops live at <subdomain>.<root domain>. "" while the site has no domain yet (a Deploy-button
+// install on its workers.dev address): never guessed from this page's own address.
+function siteRootDomain_(){ return String((typeof siteInfo_ !== "undefined" && siteInfo_ && siteInfo_.rootDomain) || ""); }
+const NO_DOMAIN_YET_ = "This site doesn't have its own domain yet, so shops can't be created: each shop's address is <name>.<your domain>.";
 const ADMIN_SESSION_STORAGE_KEY = "oddAdminSession";
 
 function loadStoredSession(){
@@ -2464,7 +2466,7 @@ async function showShippingModal(order){
         `<div style="font-size:14px;font-weight:700;color:#1d4ed8;margin-bottom:10px;">Shipping Payment</div>` +
         `<div style="font-size:13px;line-height:1.7;">${safeHtml}</div>` +
         `<div style="margin:14px 0 8px;text-align:center;"><span style="display:inline-block;background:#1d4ed8;color:#fff;font-size:13px;font-weight:700;padding:9px 22px;border-radius:5px;">Pay Shipping →</span></div>` +
-        `<div style="font-size:11px;color:#555;padding-top:8px;border-top:1px solid #e5e7eb;margin-top:8px;">${escapeHtml(bizName_())} — ${escapeHtml(siteRootDomain_())}</div>`;
+        `<div style="font-size:11px;color:#555;padding-top:8px;border-top:1px solid #e5e7eb;margin-top:8px;">${escapeHtml(bizName_())}${siteRootDomain_() ? " — " + escapeHtml(siteRootDomain_()) : ""}</div>`;
     }
     function refreshEmailBody(){
       const el = document.getElementById("shipEmailBody");
@@ -3190,7 +3192,7 @@ function changeRequestCell(verif, rowspan, org){
   const m = String(verif.respondedAt).match(/^(\d{4})-(\d{2})-(\d{2})/);
   const d = m ? `${+m[2]}/${+m[3]}/${m[1]}` : new Date(verif.respondedAt).toLocaleDateString();
   const orgSubdomain = (org && org.subdomain) || (window._adminOrgRegistry||[]).find(o=>o.orgId===verif.orgId)?.subdomain;
-  const verifyUrl = orgSubdomain
+  const verifyUrl = orgSubdomain && siteRootDomain_()
     ? `https://${orgSubdomain}.${siteRootDomain_()}/?verify=${encodeURIComponent(verif.token)}`
     : `/?verify=${encodeURIComponent(verif.token)}`;
   return `<td rowspan="${rowspan}"><a href="${escapeHtml(verifyUrl)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;cursor:pointer;">${d}</a></td>`;
@@ -6776,14 +6778,14 @@ function wizScreen_(step){
       const made = !!_wiz.orgId;
       return { title: "What's the shop called?", help: "Usually the group it's for — a club, a team, a school. You can change it later.",
         html: `<input type="text" id="wizName" class="wiz-input" maxlength="80" value="${escapeHtml(o.name || "")}" placeholder="e.g. Northside Rowing Club" autofocus>
-          <div class="wiz-sub-line" id="wizAddr">${made ? `Web address: <strong>${escapeHtml(o.subdomain)}</strong>.${escapeHtml(location.hostname.split(".").slice(1).join("."))}` : ""}</div>
+          <div class="wiz-sub-line" id="wizAddr">${made ? `Web address: <strong>${escapeHtml(o.subdomain)}</strong>.${escapeHtml(siteRootDomain_() || "<your domain>")}` : ""}</div>
           <details class="wiz-more"><summary>Change the web address</summary>
             ${made ? "" : `<label>Shop ID <input type="text" id="wizId" class="wiz-input" maxlength="40"></label>`}
             <label>Web address <input type="text" id="wizSub" class="wiz-input" maxlength="40" value="${made ? escapeHtml(o.subdomain || "") : ""}"></label>
             ${made ? `<div class="wiz-note">The old address stops working for this shop. Links already shared with customers will need the new one.</div>` : ""}</details>`,
         wire: (root) => {
           const n = root.querySelector("#wizName"), id = root.querySelector("#wizId"), sub = root.querySelector("#wizSub"), addr = root.querySelector("#wizAddr");
-          const host = escapeHtml(location.hostname.split(".").slice(1).join("."));
+          const host = escapeHtml(siteRootDomain_() || "<your domain>");
           const show = () => { addr.innerHTML = sub.value ? `Web address: <strong>${escapeHtml(sub.value)}</strong>.${host}` : ""; };
           if (made) { sub.oninput = show; return; }
           let idTouched = false, subTouched = false;
@@ -6810,6 +6812,7 @@ function wizScreen_(step){
             return "";
           }
           const orgId = val("#wizId"), subdomain = val("#wizSub");
+          if (!siteRootDomain_()) return NO_DOMAIN_YET_;
           if (!/^[a-z0-9-]{2,40}$/.test(orgId)) return "The shop ID needs 2–40 lowercase letters, numbers or dashes.";
           if (orgId === "all") return "“all” is reserved — pick another shop ID under “Change the web address”.";
           { const why = webAddressProblem_(subdomain, null); if (why) return why + " Change it under “Change the web address”."; }
@@ -7436,7 +7439,7 @@ function wizCheckScreen_(){
 
 function wizLiveScreen_(){
   const o = _wiz.org || {}, st = _wiz.state;
-  const root = location.hostname.split(".").slice(1).join(".");
+  const root = siteRootDomain_();
   const url = o.subdomain && root ? `https://${o.subdomain}.${root}/` : "";
   if (st.live && o.ready) return {
     title: "Your shop is open 🎉", noNext: true,
@@ -8812,7 +8815,7 @@ function renderOrgForm(app, org){
         <label>Web address <span class="req" title="Required">*</span>
           <input type="text" id="orgFormSubdomain" value="${escapeHtml(org ? org.subdomain : "")}" placeholder="e.g. club404">
         </label>
-        <div class="admin-note">Filled in from the name. Lowercase letters / numbers only — becomes &lt;address&gt;.${escapeHtml(siteRootDomain_())}. Creating the shop also sets that address up in Cloudflare.</div>
+        <div class="admin-note">${siteRootDomain_() ? `Filled in from the name. Lowercase letters / numbers only — becomes &lt;address&gt;.${escapeHtml(siteRootDomain_())}. Creating the shop also sets that address up in Cloudflare.` : escapeHtml(NO_DOMAIN_YET_)}</div>
         ${isEdit ? `<div id="orgDomainBox" data-org="${escapeHtml(org.orgId)}" style="margin:-4px 0 12px;padding:8px 10px;border:1px solid #ddd;border-radius:6px;background:#fff;color:#111;font-size:13px;">Checking custom domain&hellip;</div>` : ""}
         <label>Small heading above the name (optional)
           <input type="text" id="orgFormEyebrow" value="${escapeHtml(org ? org.eyebrow : "")}" placeholder="e.g. Team store">
@@ -8970,7 +8973,7 @@ async function loadOrgTierBox_(orgId){
 // One line describing an org's custom-domain state, from a getOrgDomainStatus / setupOrgDomain /
 // createOrg `domain` result.
 function orgDomainText_(d, subdomain){
-  const host = (d && d.hostname) || (subdomain ? subdomain + "." + siteRootDomain_() : "the shop's subdomain");
+  const host = (d && d.hostname) || (subdomain && siteRootDomain_() ? subdomain + "." + siteRootDomain_() : "the shop's subdomain");
   if (!d || !d.configured) return `Automatic domain setup isn't configured — add ${host} under Workers & Pages → Custom domains in Cloudflare.`;
   if (d.error) return `Custom domain for ${host} was NOT set up: ${d.error}`;
   if (!d.exists) return `${host} hasn't been added to Cloudflare yet.`;

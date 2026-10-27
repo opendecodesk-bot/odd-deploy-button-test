@@ -2461,6 +2461,11 @@ export async function onRequestPost(context) {
       if (!body.orgId || !body.subdomain || !body.name) {
         return jsonResponse({ status: "error", message: "Missing orgId, subdomain, or name" }, 400);
       }
+      // A Deploy-button install has no domain until its Setup step: a shop made now would get an
+      // address (<subdomain>.example.com) that can never work.
+      if (!env.ROOT_DOMAIN && /\.workers\.dev$/i.test(new URL(request.url).hostname)) {
+        return jsonResponse({ status: "error", code: "no_domain", message: "This site doesn't have its own domain yet, so shops can't be created: each shop's address is <name>.<your domain>." }, 409);
+      }
       const orgCheck = validateOrgFields(body, true);
       if (orgCheck.error) return jsonResponse({ status: "error", message: orgCheck.error }, 400);
       // The admin's own label(s) (ADMIN_SUBDOMAIN) are reserved too — validateOrgFields doesn't know them.

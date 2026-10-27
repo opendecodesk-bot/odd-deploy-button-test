@@ -29,7 +29,7 @@
  *   Revokes the session in the cookie (server-side) and clears the cookie.
  */
 
-import { classifyHost }       from "../_lib/hostConfig.js";
+import { classifyHost, rootDomain } from "../_lib/hostConfig.js";
 import { getCatalogData }     from "../_lib/catalogCache.js";
 import { rateLimited, rateLimitResponse, rateLimitCheckGlobal, rateLimitHitGlobal } from "../_lib/rateLimit.js";
 import { jsonResponse }       from "../_lib/http.js";
@@ -44,7 +44,7 @@ import { accessEnabled, verifyAccess } from "../_lib/access.js";
 import { verifyTOTP }         from "../_lib/totp.js";
 import {
   recordFailedAdminLogin, insertAuditLog, getUserByEmail, getUserById, insertFirstAdmin, insertUser, getBootstrapState,
-  updateUser, setUserRoleAndStatus, claimUserTotpCounter,
+  updateUser, setUserRoleAndStatus, claimUserTotpCounter, noteAdminHostSeen,
 } from "../_lib/db.js";
 
 async function getHost(env, request){
@@ -175,6 +175,13 @@ export async function onRequestPost(context){
   }catch(e){
     console.error("admin-session: could not issue a session:", e);
     return jsonResponse({status:"error", message:"Session storage unavailable — try again."}, 503);
+  }
+
+  // A sign-in on admin.<root domain> (not the workers.dev address) proves the domain works: noted
+  // once, so the next deploy may switch workers.dev off. Never a reason to refuse the sign-in.
+  if(env.ROOT_DOMAIN && !/\.workers\.dev$/i.test(new URL(request.url).hostname)){
+    try{ await noteAdminHostSeen(env.DB, rootDomain(env), new URL(request.url).hostname.split(".")[0].toLowerCase()); }
+    catch(e){ console.error("admin-session: could not note the admin host:", e); }
   }
 
   // `session:"cookie"` tells admin.js the credential lives in the cookie; the

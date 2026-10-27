@@ -188,7 +188,12 @@ export async function onRequestGet(context){
     // org names/list here — that stays gated behind the passphrase in
     // orders.js (action: "listOrgs"), so hitting this subdomain alone
     // can't be used to scrape the client list.
-    return jsonResponse({status:"admin", business: catalogData.business || {}, country, features});
+    // site.rootDomain: where shops live (<subdomain>.<root>); "" while the site has no domain yet
+    // (a Deploy-button install on its workers.dev address) — the admin must not guess it. Cleaned up
+    // as hostConfig's rootDomain() does, written out here because older tests load this file with
+    // its hostConfig import line removed.
+    const siteRoot = env && env.ROOT_DOMAIN ? String(env.ROOT_DOMAIN).trim().toLowerCase().replace(/\.$/, "").replace(/^www\./, "") : "";
+    return jsonResponse({status:"admin", business: catalogData.business || {}, country, features, site: { rootDomain: siteRoot }});
   } else {
     // Unknown hostname — refuse rather than treating it like a known host.
     return jsonResponse({status:"error", message:"Unrecognized host", business: catalogData.business || {}, country, features}, 404);

@@ -25,6 +25,9 @@
 // account, users and two-step endpoints and the role checks are the real ones, and the first
 // sign-in is with the "installer's passphrase" this prints. For looking at the sign-in screens,
 // the Users page, or the admin as a Back office user or a manager.
+//
+//   node scripts/admin-local.js --no-domain → the admin as a Deploy-button install sees it before its
+//                                             Setup step: the site has no domain (shops wait for one).
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
@@ -149,7 +152,8 @@ const SESSION = `<script>try{localStorage.setItem("oddAdminSession",JSON.stringi
         // The switches under Global settings → Features, as the real /api/catalog sends them.
         const row = await d1.prepare("SELECT value FROM global_settings WHERE key='features'").first();
         let features = {}; try { features = row ? JSON.parse(row.value) : {}; } catch (e) {}
-        return send(res, 200, JSON.stringify({ status: "admin", features }));
+        // site.rootDomain as on an install with a domain (--no-domain: as a Deploy-button install before its Setup step).
+        return send(res, 200, JSON.stringify({ status: "admin", features, site: { rootDomain: process.argv.includes("--no-domain") ? "" : "example.com" } }));
       }
       if (real && real.raw[url.pathname] && real.raw[url.pathname][req.method]) {
         let raw = ""; for await (const chunk of req) raw += chunk;

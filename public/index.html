@@ -1170,6 +1170,8 @@ let currentOrgId = null;
 // request's Host header server-side. null on the root/generic domain
 // or an unrecognized host; this session then never learns any org exists.
 let currentOrg = null;
+// On the admin host: { rootDomain } from /api/catalog ("" until the site has a domain). admin.js reads it.
+let siteInfo_ = {};
 
 async function resolveCurrentOrg(){
   try{
@@ -1181,7 +1183,7 @@ async function resolveCurrentOrg(){
     applyBusiness_(data.business);
     applyCountry_(data.country);
     applyFeatures_(data.features);
-    if(data.status === "admin") return {admin:true};
+    if(data.status === "admin"){ siteInfo_ = data.site || {}; return {admin:true}; }
     // Global settings → Features → Storefront is off: no shop is served here (see catalog.js).
     if(data.status === "closed") return {closed:true};
     if(data.status !== "ok") return null;

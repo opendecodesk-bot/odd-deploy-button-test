@@ -2111,6 +2111,23 @@ export async function setSettingRaw(db, key, value) {
   await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)").bind(key, String(value)).run();
 }
 
+// The site's own address ('site'): { rootDomain, adminSubdomain, adminHostSeen }. adminHostSeen is
+// set the first time a sign-in completes on admin.<rootDomain>; `npm run deploy` switches the
+// workers.dev address off only after that (scripts/setup.mjs parseSiteSetting), so a domain whose
+// certificate isn't ready yet can't lock the owner out.
+export async function getSiteSetting(db) {
+  try { const v = JSON.parse(await getSettingRaw(db, "site") || "{}"); return v && typeof v === "object" && !Array.isArray(v) ? v : {}; }
+  catch { return {}; }
+}
+
+// Records that the admin was reached on its own domain. Returns true when that changed anything.
+export async function noteAdminHostSeen(db, rootDomain, adminSubdomain) {
+  const cur = await getSiteSetting(db);
+  if (cur.adminHostSeen === true && cur.rootDomain === rootDomain && cur.adminSubdomain === adminSubdomain) return false;
+  await setSettingRaw(db, "site", JSON.stringify({ ...cur, rootDomain, adminSubdomain, adminHostSeen: true }));
+  return true;
+}
+
 export async function deleteSettingRaw(db, key) {
   await db.prepare("DELETE FROM global_settings WHERE key = ?").bind(key).run();
 }
