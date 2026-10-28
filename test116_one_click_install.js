@@ -55,6 +55,15 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   ok("…and a later sign-in on the workers.dev address (still on until that deploy) doesn't undo it", again.status === 200 && site().adminHostSeen === true);
   const madeNow = await answer(await B.raw["/api/orders"].POST({ request: req("https://admin.myshop.com/api/orders", shop, there.cookie), env: B.env, waitUntil: () => {} }));
   ok("with a domain, shops can be created again", madeNow.body.code !== "no_domain" && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 1);
+  B.env.SIGNING_SECRET = "a signing secret for the preview links";
+  const previewAt = async (origin, cookie) => answer(await B.raw["/api/orders"].POST({ request: req(origin + "/api/orders", { action: "getPreviewLink", org: "league" }, cookie), env: B.env, waitUntil: () => {} }));
+  const linked = await previewAt("https://admin.myshop.com", there.cookie);
+  ok("a draft preview links to the shop's own address on the domain", linked.status === 200 && /^https:\/\/league\.myshop\.com\/\?preview=/.test(linked.body.url));
+  delete B.env.ROOT_DOMAIN;
+  const unlinked = await previewAt(W, own.cookie);
+  ok("…and without a domain it is refused with the same words, never a link to <shop>.example.com", unlinked.status === 409 && unlinked.body.code === "no_domain" && unlinked.body.message === made.body.message && !unlinked.body.url &&
+    /if \(!siteRootDomain_\(\)\) return showToast\(NO_DOMAIN_YET_, true\);/.test(read("public/admin.js")));
+  B.env.ROOT_DOMAIN = "myshop.com"; delete B.env.SIGNING_SECRET;
 
   const catalog = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +
     "const getReadyToShipByOrg = async () => []; const getBlankReadyByOrg = async () => ({});\nconst getCatalogData = async () => ({ subdomainMap: {}, business: {}, features: {} });\n" +

@@ -39,7 +39,7 @@ let _boxPresetsCache = null; // cached from DB; null = not yet loaded
 // shops live at <subdomain>.<root domain>. "" while the site has no domain yet (a Deploy-button
 // install on its workers.dev address): never guessed from this page's own address.
 function siteRootDomain_(){ return String((typeof siteInfo_ !== "undefined" && siteInfo_ && siteInfo_.rootDomain) || ""); }
-const NO_DOMAIN_YET_ = "This site doesn't have its own domain yet, so shops can't be created: each shop's address is <name>.<your domain>.";
+const NO_DOMAIN_YET_ = "This site doesn't have its own domain yet, so shops can't be created or previewed: each shop's address is <name>.<your domain>.";
 const ADMIN_SESSION_STORAGE_KEY = "oddAdminSession";
 
 function loadStoredSession(){
@@ -6457,6 +6457,7 @@ async function loadPublishStates_(){
 }
 // Opens the shop's page as it will look after Publish (a signed link, good for an hour).
 async function previewShop_(orgId){
+  if (!siteRootDomain_()) return showToast(NO_DOMAIN_YET_, true);   // the server refuses too (no_domain)
   const tab = window.open("", "_blank");
   try {
     const r = await hoopApi_({ action: "getPreviewLink", org: orgId });
