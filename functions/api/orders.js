@@ -42,6 +42,7 @@ const vendorPriceAudit_ = (list) => (list || []).slice(0, 200).map(c => ({ color
 import { checkShippedDeliveries, checkBlankShipments } from "../_lib/deliveryCheck.js";
 import { ensureOrgDomain, getOrgDomainStatus } from "../_lib/customDomain.js";
 import { setupStatus, setupSummary } from "../_lib/setupStatus.js";
+import { connectCloudflare, cloudflareTokenLink, workersDevParts } from "../_lib/cloudflareSetup.js";
 import { rateLimited, rateLimitResponse } from "../_lib/rateLimit.js";
 import { jsonResponse, featureOffResponse, signOrderToken } from "../_lib/http.js";
 import {
@@ -105,6 +106,7 @@ import {
   saveExpenseCategory, deleteExpenseCategory, listExpenses, getExpense, saveExpense, deleteExpense, expenseMonth, getExpenseSummary,
   getRefundedCents, getDepositPayments, linkPaymentsToCashout, cashoutNetCents_,
   receiveBlanks, writeOffBlanks, getBlankMovements, markBlankPricesChecked, getBlankVendorPriceHistory, getProductPriceChanges, confirmProductPrices, getBlankPriceReminder, getBlanksNeedingPriceCheck, getBlankProductUses, recomputeBlankAverageCosts, planVendorBlanks, applyVendorBlanks, cleanColorGroups_, suggestColorGroups, listVendorConnections, getVendorConnectionRow, saveVendorConnection, setVendorConnectionStatus, deleteVendorConnection, linkBlanksToVendorConnection,
+  getSiteSetting, setSiteDomain,
   getPublishedOrg, setOrgReady, getShopWizard, saveShopWizard, deleteShopWizard, listShopWizards, setProductLinksFromBlank, publishShop, getPublishState, getDraftCatalogShop, signPreviewToken,
   planDiscardShopChanges, discardShopChanges, applyProductPrices,
   getBrandRules, setBrandRules, DEFAULT_BRAND_RULES, brandRuleFor_, listBrandApprovals, addBrandApproval, revokeBrandApproval, getBrandApproval,
@@ -149,7 +151,7 @@ const CATALOG_ADMIN_ACTIONS = new Set([
   "createOrg", "updateOrg", "listOrgsAdmin", "setupOrgDomain", "getOrgDomainStatus",
   "listProducts", "createProduct", "updateProduct", "setProductVisible", "setProductOrder", "createProductVersion", "copyProductVersionSettings", "separateProductVersion", "copyProductsFromOrg", "importProducts", "importBlanks", "getBlanksToOrder",
   "freeShippingSuggestions", "getVendorShipping", "setVendorShipping", "recordRestockOrder", "cancelRestockOrder",
-  "getGlobalSettings", "updateGlobalSettings", "getSetupStatus", "getMachineSettings", "updateMachineSettings",
+  "getGlobalSettings", "updateGlobalSettings", "getSetupStatus", "getCloudflareSetup", "connectCloudflare", "getMachineSettings", "updateMachineSettings",
   "getShipFromAddress", "updateShipFromAddress", "getBusinessProfile", "updateBusinessProfile",
   "getLocaleSettings", "updateLocaleSettings", "getFeatures", "updateFeatures",
   "getSalesTaxSettings", "updateSalesTaxSettings",
@@ -232,6 +234,8 @@ const ADMIN_ONLY_ACTIONS = [
   // Ordering from a supplier spends the shop's money (the card / terms the supplier has on file): admin only.
   "previewSupplierOrder", "placeSupplierOrder", "listSupplierOrders", "checkSupplierOrderShipments", "cancelSupplierOrder",
   "updateBrandRules",
+  // The domain step (Global settings → Your domain): a Cloudflare key that can change the account's Workers and DNS.
+  "getCloudflareSetup", "connectCloudflare",
 ];
 const MANAGER_ACTIONS = [
   "getPublishState", "getPreviewLink",                            // publish per shop (migrations/0076)
@@ -2979,6 +2983,48 @@ export async function onRequestPost(context) {
       ]);
       const items = setupStatus(env, { business, salesTax, locale });
       return jsonResponse({ status: "ok", items, summary: setupSummary(items) });
+    }
+
+    // ---- The domain step of a Deploy-button install (functions/_lib/cloudflareSetup.js). Shown while the
+    // site has no ROOT_DOMAIN and the admin is open on its workers.dev address.
+    if (body.action === "getCloudflareSetup") {
+      const site = await getSiteSetting(env.DB).catch(() => ({}));
+      const host = new URL(request.url).hostname;
+      return jsonResponse({ status: "ok", cloudflare: {
+        hasDomain: !!env.ROOT_DOMAIN, onWorkersDev: !!workersDevParts(host),
+        rootDomain: env.ROOT_DOMAIN ? rootDomain(env) : (site.rootDomain || ""),
+        adminSubdomain: adminSubdomains(env)[0], adminHostSeen: site.adminHostSeen === true,
+        tokenLink: cloudflareTokenLink(),
+      } });
+    }
+    if (body.action === "connectCloudflare") {
+      if (env.ROOT_DOMAIN) return jsonResponse({ status: "error", message: "This site already has its domain (" + rootDomain(env) + ")." }, 409);
+      const host = new URL(request.url).hostname;
+      if (!workersDevParts(host)) return jsonResponse({ status: "error", message: "Do this step on the admin's workers.dev address (the one Cloudflare gave you when you deployed)." }, 409);
+      const wanted = String(body.domain || "").trim().toLowerCase().slice(0, 253);
+      const refused = await auditStrict({ orgId: null, orderId: null, action: "site.domain_connect", detail: { domain: wanted || null } });
+      if (refused) return refused;
+      const adminLabel = adminSubdomains(env)[0];
+      let done;
+      try { done = await connectCloudflare({ token: body.token, domain: wanted, hostname: host, adminSubdomain: adminLabel }); }
+      catch (e) {
+        if (!e.userFacing) console.error("connectCloudflare failed:", e && e.message);
+        audit({ orgId: null, orderId: null, action: "site.domain_connect_failed", detail: { domain: wanted || null, error: e.userFacing ? e.message : "unexpected" } });
+        return jsonResponse({ status: "error", code: e.code || null, message: e.userFacing ? e.message : "Couldn't reach Cloudflare. Try again in a minute." }, e.userFacing ? 400 : 502);
+      }
+      if (done.status === "choose") return jsonResponse({ status: "ok", choose: done.zones });
+      await setSiteDomain(env.DB, done.rootDomain, adminLabel);
+      // Shops built in preview mode get their addresses now, with the settings just saved (this request's
+      // env is from before them).
+      const withDomain = { ...env, CF_API_TOKEN: done.cfg.token, CF_ACCOUNT_ID: done.cfg.accountId, CF_ZONE_ID: done.cfg.zoneId, CF_WORKER_NAME: done.cfg.service, ROOT_DOMAIN: done.rootDomain };
+      const shops = [];
+      for (const org of await getAllOrgs(env.DB)) {
+        if (!org.subdomain) continue;
+        try { const d = await ensureOrgDomain(withDomain, org.subdomain); shops.push({ orgId: org.orgId, hostname: d.hostname, ok: true }); }
+        catch (e) { shops.push({ orgId: org.orgId, hostname: org.subdomain + "." + done.rootDomain, ok: false, error: e.userFacing ? e.message : "Couldn't reach Cloudflare." }); }
+      }
+      audit({ orgId: null, orderId: null, action: "site.domain_connected", detail: { rootDomain: done.rootDomain, adminHost: done.adminHost, steps: done.steps, shops } });
+      return jsonResponse({ status: "ok", connected: { rootDomain: done.rootDomain, adminHost: done.adminHost, adminUrl: done.adminUrl, shops } });
     }
 
     if (body.action === "updateGlobalSettings") {

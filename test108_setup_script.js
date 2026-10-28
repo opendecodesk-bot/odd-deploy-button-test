@@ -422,7 +422,7 @@ const UUID = [hex(8, "1a"), hex(4, "b"), hex(4, "c"), hex(4, "d"), hex(12, "e")]
     st.db._raw.exec(`INSERT INTO orgs (orgId, subdomain, name, createdAt, updatedAt) VALUES ('league-101', 'league', 'League', 't', 't')`);
     u = await up();
     let t = S.readWranglerToml(st.tomlAtDeploy);
-    ok("the next build lists the admin's own hostname and every shop's — or the deploy would detach them", !u.error && t.hosts.join() === "office.myshop.com,league.myshop.com" && st.files.length === 1);
+    ok("the next build lists no hostname: the app attached the admin's and the shops' itself, and a deploy that lists none leaves them alone", !u.error && t.hosts.length === 0 && st.files.length === 1 && /attached by the app/.test(u.text) && /myshop\.com/.test(u.text));
     ok("…and keeps the workers.dev address on until the admin has been reached on the new domain", u.result.workersDev === true && t.workersDev === true);
     st.db._raw.exec(`UPDATE global_settings SET value = '{"rootDomain":"myshop.com","adminSubdomain":"office","adminHostSeen":true}' WHERE key = 'site'`);
     u = await up();

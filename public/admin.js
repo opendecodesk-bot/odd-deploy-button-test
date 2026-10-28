@@ -7493,6 +7493,64 @@ function blankWeightText_(p) {
   return lo === hi ? `${lo} oz` : `${lo}–${hi} oz`;
 }
 
+// Global settings → Your domain: the domain step of a site installed with the Deploy to Cloudflare button
+// (functions/_lib/cloudflareSetup.js). Shown only on the admin's workers.dev address: before the site has a
+// domain, the steps to connect one; after, where the admin has moved to.
+async function loadDomainSetup_(){
+  const box = document.getElementById("domainSetupBox");
+  if (!box || !adminCan_("admin")) return;
+  let d;
+  try { d = (await hoopApi_({ action: "getCloudflareSetup" })).cloudflare; } catch (e) { return; }
+  if (!d || !d.onWorkersDev) { box.innerHTML = ""; return; }
+  if (d.hasDomain) { box.innerHTML = domainMovedHtml_(d.adminSubdomain + "." + d.rootDomain, null); return; }
+  box.innerHTML = `<div class="admin-form domain-setup" style="max-width:none;border:1px solid #fed7aa;border-radius:6px;padding:12px 14px;margin-bottom:14px;background:#fff;color:#111;">
+    <h2 style="margin:0 0 8px;">Your domain</h2>
+    <div class="admin-note" style="margin-bottom:10px;">This admin is on Cloudflare's own address for now. You can build shops and preview them, but they can take orders only once the site has its own domain: the admin moves to <b>${escapeHtml(d.adminSubdomain)}.</b><i>your domain</i>, and each shop gets <i>its name</i>.<i>your domain</i>.</div>
+    <ol style="margin:0 0 10px 18px;padding:0;line-height:1.5;font-size:14px;">
+      <li style="margin-bottom:8px;"><b>Put your domain on Cloudflare</b>, if it isn't already: in <a href="https://dash.cloudflare.com/" target="_blank" rel="noopener">Cloudflare</a>, Domains → Add a domain. Cloudflare walks you through it; the last step is changing the domain's nameservers where you bought it. Wait until Cloudflare shows the domain as Active.</li>
+      <li style="margin-bottom:8px;"><b>Make a key for this site.</b> <a class="admin-btn" id="cfTokenLink" href="${escapeHtml(d.tokenLink)}" target="_blank" rel="noopener">Make the key on Cloudflare</a>
+        <div class="admin-note">Cloudflare opens with the permissions filled in. Scroll to the bottom, click <b>Continue to summary</b>, then <b>Create Token</b>, and copy the key it shows.</div></li>
+      <li><b>Paste the key here.</b>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;"><input type="password" id="cfToken" autocomplete="off" spellcheck="false" placeholder="The key from Cloudflare" style="flex:1 1 240px;min-width:0;">
+        <button class="admin-btn" id="cfConnectBtn" onclick="connectDomain_()">Connect</button></div></li>
+    </ol>
+    <div id="cfDomainChoose"></div>
+    <div class="admin-error" id="cfDomainError" role="alert"></div>
+    <div class="admin-note" style="margin-top:8px;">What the key can do: change this Cloudflare account's Workers, their web addresses and your domain's DNS records (and, later, file storage for pictures). It is kept as a secret on this site's Worker and never shown again. Deleting it in Cloudflare (My Profile → API Tokens) stops the site attaching new shops' addresses; nothing else breaks.</div>
+  </div>`;
+}
+async function connectDomain_(domain){
+  const err = document.getElementById("cfDomainError"), btn = document.getElementById("cfConnectBtn"), choose = document.getElementById("cfDomainChoose");
+  const token = (document.getElementById("cfToken") || {}).value || "";
+  if (err) err.textContent = "";
+  if (!token.trim()) { if (err) err.textContent = "Paste the key Cloudflare showed you first."; return; }
+  if (btn) { btn.disabled = true; btn.textContent = "Connecting…"; }
+  let d;
+  try { d = await hoopApi_({ action: "connectCloudflare", token: token.trim(), domain: domain || "" }); }
+  catch (e) { if (err) err.textContent = e.message; if (btn) { btn.disabled = false; btn.textContent = "Connect"; } return; }
+  if (btn) { btn.disabled = false; btn.textContent = "Connect"; }
+  if (d.choose) {
+    choose.innerHTML = `<div style="margin:8px 0;"><label for="cfDomainPick"><b>Which domain is this site's?</b></label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;"><select id="cfDomainPick">${d.choose.map(z => `<option value="${escapeHtml(z.name)}">${escapeHtml(z.name)}${z.active ? "" : " (waiting for its nameservers)"}</option>`).join("")}</select>
+      <button class="admin-btn" onclick="connectDomain_(document.getElementById('cfDomainPick').value)">Use this domain</button></div></div>`;
+    return;
+  }
+  const box = document.getElementById("domainSetupBox");
+  if (box && d.connected) box.innerHTML = domainMovedHtml_(d.connected.adminHost, d.connected.shops);
+}
+// After the domain step: where the admin is now, and how each existing shop's address went.
+function domainMovedHtml_(adminHost, shops){
+  const url = "https://" + adminHost + "/";
+  const failed = (shops || []).filter(x => !x.ok);
+  return `<div class="admin-form domain-setup" style="max-width:none;border:1px solid #bbf7d0;border-radius:6px;padding:12px 14px;margin-bottom:14px;background:#fff;color:#111;">
+    <h2 style="margin:0 0 8px;">Your domain is connected</h2>
+    <div style="font-size:14px;line-height:1.5;">The admin's address is now <a href="${escapeHtml(url)}"><b>${escapeHtml(adminHost)}</b></a>. Open it and sign in with the same email and password. Its security certificate can take a few minutes to arrive: if the page doesn't open yet, wait and try again.</div>
+    <div class="admin-note" style="margin-top:6px;">Once you have signed in there, this address (workers.dev) is switched off.${(shops || []).length ? ` ${shops.length - failed.length} of ${shops.length} shop address${shops.length === 1 ? "" : "es"} set up.` : ""}</div>
+    ${failed.length ? `<div class="wiz-warn" style="margin-top:8px;">${failed.map(x => `<div><b>${escapeHtml(x.hostname)}</b>: ${escapeHtml(x.error || "not set up")}</div>`).join("")}<div style="margin-top:4px;">Fix that in Cloudflare, then open the shop's settings and click Set up domain.</div></div>` : ""}
+    <div class="admin-actions" style="margin-top:10px;"><a class="admin-btn" href="${escapeHtml(url)}">Open ${escapeHtml(adminHost)}</a></div>
+  </div>`;
+}
+
 async function loadSetupStatus_(){
   const box = document.getElementById("setupStatusBox");
   if (!box || !adminCan_("admin")) return;
@@ -7517,11 +7575,13 @@ async function renderGlobalSettings(app){
       <h1>Global settings</h1>
       <div class="stitch stitch-thick"></div>
     </div>
+    <div id="domainSetupBox"></div>
     <div id="setupStatusBox"></div>
     <div class="admin-panel" style="--org-accent:var(--accent);" id="adminPanel">
       <div class="admin-summary">Loading&hellip;</div>
     </div>
   `;
+  loadDomainSetup_();
   loadSetupStatus_();
   try{
     const res = await fetch("/api/orders", {

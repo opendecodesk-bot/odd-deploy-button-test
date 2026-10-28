@@ -2133,12 +2133,26 @@ export async function getSiteSetting(db) {
   catch { return {}; }
 }
 
+// The domain a Deploy-button site was given in its Setup step (functions/_lib/cloudflareSetup.js). A new or
+// changed domain hasn't been reached yet, so the workers.dev address stays on until it is (noteAdminHostSeen).
+export async function setSiteDomain(db, rootDomain, adminSubdomain) {
+  const cur = await getSiteSetting(db);
+  const same = cur.rootDomain === rootDomain && cur.adminSubdomain === adminSubdomain;
+  await setSettingRaw(db, "site", JSON.stringify({ ...cur, rootDomain, adminSubdomain, viaSetup: true,
+    adminHostSeen: same && cur.adminHostSeen === true, workersDevOff: same && cur.workersDevOff === true }));
+}
+
 // Records that the admin was reached on its own domain. Returns true when that changed anything.
 export async function noteAdminHostSeen(db, rootDomain, adminSubdomain) {
   const cur = await getSiteSetting(db);
   if (cur.adminHostSeen === true && cur.rootDomain === rootDomain && cur.adminSubdomain === adminSubdomain) return false;
   await setSettingRaw(db, "site", JSON.stringify({ ...cur, rootDomain, adminSubdomain, adminHostSeen: true }));
   return true;
+}
+
+// The workers.dev address of a site set up in the admin has been switched off (admin-session.js).
+export async function noteWorkersDevOff(db) {
+  await setSettingRaw(db, "site", JSON.stringify({ ...(await getSiteSetting(db)), workersDevOff: true }));
 }
 
 export async function deleteSettingRaw(db, key) {

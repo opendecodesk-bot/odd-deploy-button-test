@@ -19,7 +19,8 @@ email aren't set up by the button yet, so they're out of scope this time.
 - A **GitHub account** (free). The button saves a copy of the code there. Sign up at
   <https://github.com/signup>.
 
-You don't need a domain name, a terminal, or any programming.
+You don't need a domain name, a terminal, or any programming. (Step 7, connecting a domain, is
+optional.)
 
 **Costs.** Everything the test creates fits within Cloudflare's free allowances, and nothing should
 ask for a payment card. File storage (Cloudflare R2, which needs a card on file) is left out of this
@@ -87,11 +88,25 @@ email and password again. Everything you made is kept. The sign-in box has the s
 ### 6. Look around (10 minutes)
 
 Click through the back office as if you ran a small shop. You can build a shop with **New shop
-setup** and look at it with **Preview**, but it can't open for orders yet: each shop's address is part
-of your own domain, and setting up a domain isn't built into this test yet. Everything else is fair
-game.
+setup** and look at it with **Preview**, but it can't open for orders until the site has its own
+domain (step 7): each shop's address is part of it. Everything else is fair game.
 
-### 7. Optional: check an update keeps your data
+### 7. Optional: connect a domain (10 minutes)
+
+Only if you have a domain to spare that is already on this Cloudflare account and shows as
+**Active** there. Don't use one that carries your email or a website you care about: this adds an
+`admin.` address and one address per shop to it.
+
+1. In the back office, open **Settings → Global settings**. The **Your domain** box is at the top.
+2. Follow its three steps. **Make the key on Cloudflare** opens Cloudflare's key page with
+   everything filled in: scroll down, click **Continue to summary**, then **Create Token**, copy the
+   key and paste it into the box. Click **Connect**.
+3. It should say **Your domain is connected**. Open the `admin.` address it shows (its certificate
+   can take a few minutes) and sign in with your own email and password.
+4. If you built a shop in step 6, open it: it should now have its own address, and **Go live**
+   should work.
+
+### 8. Optional: check an update keeps your data
 
 This checks that a new build keeps your account and data.
 1. In GitHub, open your copy of the code and edit any line of `README.md` with the pencil icon.
@@ -109,8 +124,10 @@ Please send these back to whoever gave you this link. Short answers are perfect.
 5. **First sign-in:** did it work, and was it clear what to do?
 6. **Looking around:** what was confusing, what looked broken, and what would you expect to find
    that wasn't there?
-7. **Step 7** (if you did it): did your account and data survive?
-8. **Anything else**, including what you expected the button to do that it didn't.
+7. **Step 7** (if you did it): did the domain connect, and did the `admin.` address and the shop's
+   address open? Which step, if any, was unclear?
+8. **Step 8** (if you did it): did your account and data survive?
+9. **Anything else**, including what you expected the button to do that it didn't.
 
 Screenshots help. **Please never send passwords or keys**, and check build logs for anything you'd
 rather not share before sending them.
@@ -120,5 +137,8 @@ rather not share before sending them.
 In the **Cloudflare dashboard**:
 - **Workers & Pages**: delete the Worker.
 - **D1**: delete the `opendecodesk-db` database.
+
+If you connected a domain (step 7): in Cloudflare, **My Profile → API Tokens**, delete the
+**OpenDecoDesk** key, and check the domain's **DNS** page for any `admin.` or shop records left over.
 
 In **GitHub**: open your copy, then **Settings → Delete this repository** at the bottom.

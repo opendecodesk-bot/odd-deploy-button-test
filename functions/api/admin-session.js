@@ -42,9 +42,10 @@ import {
 } from "../_lib/adminAuth.js";
 import { accessEnabled, verifyAccess } from "../_lib/access.js";
 import { verifyTOTP }         from "../_lib/totp.js";
+import { disableWorkersDev }  from "../_lib/cloudflareSetup.js";
 import {
   recordFailedAdminLogin, insertAuditLog, getUserByEmail, getUserById, insertFirstAdmin, insertUser, getBootstrapState,
-  updateUser, setUserRoleAndStatus, claimUserTotpCounter, noteAdminHostSeen,
+  updateUser, setUserRoleAndStatus, claimUserTotpCounter, noteAdminHostSeen, getSiteSetting, noteWorkersDevOff,
 } from "../_lib/db.js";
 
 async function getHost(env, request){
@@ -182,6 +183,17 @@ export async function onRequestPost(context){
   if(env.ROOT_DOMAIN && !/\.workers\.dev$/i.test(new URL(request.url).hostname)){
     try{ await noteAdminHostSeen(env.DB, rootDomain(env), new URL(request.url).hostname.split(".")[0].toLowerCase()); }
     catch(e){ console.error("admin-session: could not note the admin host:", e); }
+    // A site given its domain in the admin (functions/_lib/cloudflareSetup.js) no longer needs its
+    // workers.dev address: switched off now, and tried again at later sign-ins until that works.
+    if(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME){
+      const off = (async () => {
+        const site = await getSiteSetting(env.DB);
+        if(!site.viaSetup || site.workersDevOff) return;
+        await disableWorkersDev({ token: env.CF_API_TOKEN, accountId: env.CF_ACCOUNT_ID, service: env.CF_WORKER_NAME });
+        await noteWorkersDevOff(env.DB);
+      })().catch(e => console.error("admin-session: could not switch the workers.dev address off:", e && e.message));
+      if(typeof context.waitUntil === "function") context.waitUntil(off); else await off;
+    }
   }
 
   // `session:"cookie"` tells admin.js the credential lives in the cookie; the
