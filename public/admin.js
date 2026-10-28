@@ -302,7 +302,13 @@ function promptAdminPassphrase(){
         <input type="email" id="adminEmailInput" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" value="${escapeHtml(rememberedAdminEmail_())}" style="margin-bottom:10px;" />
         <label for="adminPassInput">Password</label>
         <input type="password" id="adminPassInput" name="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" />
-        <p style="font-size:12px;margin:8px 0 0;color:#666;">New install? Leave the email empty and type the passphrase the installer printed.</p>
+        <p style="font-size:12px;margin:8px 0 0;color:#666;">New install? Leave the email empty and type the setup password: the one you chose on Cloudflare's page, or the passphrase the installer printed.</p>
+        <details class="admin-forgot" style="font-size:12px;margin:8px 0 0;color:#444;">
+          <summary style="cursor:pointer;">Forgot your password?</summary>
+          <p style="margin:6px 0 0;">Ask an admin: they can give you a new one under Users.</p>
+          <p style="margin:6px 0 0;">The only admin? Give the site a new setup password: in the Cloudflare dashboard open <strong>Workers &amp; Pages</strong> → this site's Worker → <strong>Settings</strong> → <strong>Variables and Secrets</strong>, and change <strong>PROXY_ADMIN_PASSPHRASE</strong> to something new, 12 characters or more (installed from a terminal? run <code>npm run setup -- --new-passphrase</code> instead). Then sign in here with the email empty and that new setup password, and set your email and password again.</p>
+          <p style="margin:6px 0 0;">This signs everyone out and every user needs a new password. Shops, orders and settings are kept.</p>
+        </details>
         <div class="admin-pass-actions">
           <button type="button" class="admin-pass-cancel">Cancel</button>
           <button type="submit" class="admin-pass-submit">Submit</button>

@@ -2111,6 +2111,19 @@ export async function setSettingRaw(db, key, value) {
   await db.prepare("INSERT OR REPLACE INTO global_settings (key, value) VALUES (?, ?)").bind(key, String(value)).run();
 }
 
+// SIGNING_SECRET for an install that has none: Cloudflare's Deploy page asks only for the setup
+// password. Made once (32 random bytes) and kept here ('signingSecret'), never sent to a page;
+// INSERT OR IGNORE so two first requests at once end up with the same one. src/worker.js passes it
+// on as env.SIGNING_SECRET. A Worker secret set later must be this same value, or links already sent
+// (previews, invoices, receipts) stop working.
+export async function ensureSigningSecret(db) {
+  const have = await getSettingRaw(db, "signingSecret");
+  if (have) return have;
+  const fresh = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, "0")).join("");
+  await db.prepare("INSERT OR IGNORE INTO global_settings (key, value) VALUES ('signingSecret', ?)").bind(fresh).run();
+  return await getSettingRaw(db, "signingSecret");
+}
+
 // The site's own address ('site'): { rootDomain, adminSubdomain, adminHostSeen }. adminHostSeen is
 // set the first time a sign-in completes on admin.<rootDomain>; `npm run deploy` switches the
 // workers.dev address off only after that (scripts/setup.mjs parseSiteSetting), so a domain whose

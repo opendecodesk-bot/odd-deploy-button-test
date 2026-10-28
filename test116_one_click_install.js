@@ -68,6 +68,30 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   ok("…and the wizard stops before creating a shop when there is no domain, with the same words as the server", /if \(!siteRootDomain_\(\)\) return NO_DOMAIN_YET_;/.test(adminJs) &&
     adminJs.includes(`NO_DOMAIN_YET_ = "${made.body.message}"`));
 
+  console.log("\n=== The signing secret ===");
+  // Cloudflare's page asks only for the setup password, so a button install has no SIGNING_SECRET
+  // (draft previews, invoices, receipts and design links are signed with it). The Worker makes one.
+  const wk = await import("./src/worker.js");
+  const { createD1 } = require("./testlib/d1-shim.js");
+  const sd1 = await createD1(); sd1._raw.exec(read("schema.sql"));
+  const e1 = await wk.withSigningSecret({ DB: sd1 }), e2 = await wk.withSigningSecret({ DB: sd1, PROXY_ADMIN_PASSPHRASE: "x" });
+  const stored = sd1.q("SELECT value FROM global_settings WHERE key = 'signingSecret'");
+  ok("with none set, a random one is made once, kept in the database, and handed on as env.SIGNING_SECRET", /^[0-9a-f]{64}$/.test(e1.SIGNING_SECRET) && e2.SIGNING_SECRET === e1.SIGNING_SECRET &&
+    stored.length === 1 && stored[0].value === e1.SIGNING_SECRET && e1.DB === sd1 && e2.PROXY_ADMIN_PASSPHRASE === "x");
+  const ownSecret = { DB: sd1, SIGNING_SECRET: "the site's own" };
+  ok("a site with its own SIGNING_SECRET keeps it (the env is passed on untouched)", (await wk.withSigningSecret(ownSecret)) === ownSecret);
+  const lib = await import("./functions/_lib/db.js");
+  const d2 = await createD1(); d2._raw.exec(read("schema.sql"));
+  const [s1, s2] = await Promise.all([lib.ensureSigningSecret(d2), lib.ensureSigningSecret(d2)]);
+  ok("two first requests at once end up with the same secret", s1 === s2 && d2.q("SELECT value FROM global_settings WHERE key = 'signingSecret'")[0].value === s1);
+  const workerSrc = read("src/worker.js");
+  ok("every request and the scheduled roll-up get it", /env = await withSigningSecret\(env\);\n  return handler\(/.test(workerSrc) && /handleScheduled\(event, env\) \{\n  env = await withSigningSecret\(env\);/.test(workerSrc));
+
+  console.log("\n=== A forgotten password ===");
+  ok("the sign-in box says what to do: ask an admin, or (the only admin) give the site a new setup password in Cloudflare and sign in with it",
+    /Forgot your password\?/.test(adminJs) && /they can give you a new one under Users/.test(adminJs) && /Variables and Secrets<\/strong>, and change <strong>PROXY_ADMIN_PASSPHRASE/.test(adminJs) &&
+    /npm run setup -- --new-passphrase/.test(adminJs) && /every user needs a new password/.test(adminJs) && /the one you chose on Cloudflare's page/.test(adminJs));
+
   console.log("\n=== What the button reads ===");
   const example = read(".dev.vars.example").split("\n").filter(l => l.trim() && !l.startsWith("#"));
   const pkg = JSON.parse(read("package.json")), toml = read("wrangler.toml");

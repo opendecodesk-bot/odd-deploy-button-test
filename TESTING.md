@@ -78,11 +78,17 @@ Open the `workers.dev` address.
 If it says the setup password is still the example one or too short: in Cloudflare, open the Worker,
 then **Settings → Variables and Secrets**, change `PROXY_ADMIN_PASSPHRASE`, and try again.
 
+**Forgot your password later?** Give the site a new setup password: in Cloudflare, open the Worker,
+then **Settings → Variables and Secrets**, and change `PROXY_ADMIN_PASSPHRASE` to something new (12
+characters or more). Then sign in with the email empty and that new setup password, and set your
+email and password again. Everything you made is kept. The sign-in box has the same steps under
+"Forgot your password?".
+
 ### 6. Look around (10 minutes)
 
-Click through the back office as if you ran a small shop. **Please don't create a shop or set a
-domain:** those need setup steps that aren't built yet, and they will fail on a `workers.dev`
-address. Everything else is fair game.
+Click through the back office as if you ran a small shop. Creating a shop is refused for now: each
+shop's address is part of your own domain, and setting up a domain isn't built into this test yet.
+Everything else is fair game.
 
 ### 7. Optional: check an update keeps your data
 
