@@ -43,9 +43,18 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   await B.password({ action: "account", name: "Olive Owner", email: "olive@myshop.com", next: "correct horse battery" }, first.cookie);
   const own = await signInAt(W, "olive@myshop.com", "correct horse battery");
   ok("signing in on the workers.dev address works and records nothing about a domain", own.status === 200 && !own.body.pending && !site().adminHostSeen && !site().rootDomain);
+  const ordersAt = async (origin, body, cookie) => answer(await B.raw["/api/orders"].POST({ request: req(origin + "/api/orders", body, cookie), env: B.env, waitUntil: () => {} }));
   const shop = { action: "createOrg", orgId: "league", subdomain: "league", name: "League" };
-  const made = await answer(await B.raw["/api/orders"].POST({ request: req(W + "/api/orders", shop, own.cookie), env: B.env, waitUntil: () => {} }));
-  ok("a shop can't be created there yet: its address would be <name>.example.com", made.status === 409 && made.body.code === "no_domain" && /own domain/.test(made.body.message) && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 0);
+  const made = await ordersAt(W, shop, own.cookie);
+  ok("a shop can be built before the site has a domain, with no address set up for it (it would be <name>.example.com)", made.status === 200 && made.body.domain && made.body.domain.noDomain === true &&
+    B.d1.q("SELECT count(*) n FROM orgs")[0].n === 1 && !B.d1.q("SELECT ready FROM orgs WHERE orgId='league'")[0].ready);
+  const openIt = await ordersAt(W, { action: "setOrgReady", orgId: "league", ready: true }, own.cookie);
+  const openAtBirth = await ordersAt(W, { ...shop, orgId: "club", subdomain: "club", name: "Club", ready: true }, own.cookie);
+  const league = (await ordersAt(W, { action: "listOrgsAdmin" }, own.cookie)).body.orgs.find(o => o.orgId === "league");
+  const openByForm = await ordersAt(W, { ...league, action: "updateOrg", ready: true }, own.cookie);
+  ok("…but it can't be opened for orders: not from the wizard, not made open, not from the shop form — each says why",
+    [openIt, openAtBirth, openByForm].every(r => r.status === 409 && r.body.code === "no_domain" && /can't open for orders until your site has its own domain/.test(r.body.message)) &&
+    !B.d1.q("SELECT ready FROM orgs WHERE orgId='league'")[0].ready && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 1);
 
   B.env.ROOT_DOMAIN = "myshop.com";                              // the Setup page's domain step
   const there = await signInAt("https://admin.myshop.com", "olive@myshop.com", "correct horse battery");
@@ -53,8 +62,8 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
     site().adminHostSeen === true && site().rootDomain === "myshop.com" && site().adminSubdomain === "admin");
   const again = await signInAt(W, "olive@myshop.com", "correct horse battery");
   ok("…and a later sign-in on the workers.dev address (still on until that deploy) doesn't undo it", again.status === 200 && site().adminHostSeen === true);
-  const madeNow = await answer(await B.raw["/api/orders"].POST({ request: req("https://admin.myshop.com/api/orders", shop, there.cookie), env: B.env, waitUntil: () => {} }));
-  ok("with a domain, shops can be created again", madeNow.body.code !== "no_domain" && B.d1.q("SELECT count(*) n FROM orgs")[0].n === 1);
+  const openNow = await ordersAt("https://admin.myshop.com", { action: "setOrgReady", orgId: "league", ready: true }, there.cookie);
+  ok("with a domain, the shop can be opened for orders", openNow.status === 200 && openNow.body.ready === true && !!B.d1.q("SELECT ready FROM orgs WHERE orgId='league'")[0].ready);
   B.env.SIGNING_SECRET = "a signing secret for the preview links";
   const previewAt = async (origin, cookie) => answer(await B.raw["/api/orders"].POST({ request: req(origin + "/api/orders", { action: "getPreviewLink", org: "league" }, cookie), env: B.env, waitUntil: () => {} }));
   const linked = await previewAt("https://admin.myshop.com", there.cookie);
@@ -86,8 +95,9 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const adminJs = read("public/admin.js");
   ok("the admin (the shop wizard too) no longer works the domain out from its own address", /function siteRootDomain_\(\)\{ return String\(\(typeof siteInfo_/.test(adminJs) && !/siteRootDomain_[^\n]*location\.hostname/.test(adminJs) &&
     !/location\.hostname\.split\("\."\)\.slice\(1\)/.test(adminJs) && /siteInfo_ = data\.site \|\| \{\}/.test(read("public/index.html")));
-  ok("…and the wizard stops before creating a shop when there is no domain, with the same words as the server", /if \(!siteRootDomain_\(\)\) return NO_DOMAIN_YET_;/.test(adminJs) &&
-    adminJs.includes(`NO_DOMAIN_YET_ = "${made.body.message}"`));
+  ok("…and with no domain the wizard warns on its first screen and goes on in preview mode, with the server's own words", adminJs.includes(`NO_DOMAIN_YET_ = "${openIt.body.message}"`) &&
+    /noDomain && !made \? \{ nextLabel: "Continue in preview mode" \}/.test(adminJs) && /\$\{noDomain \? `<div class="wiz-warn">\$\{escapeHtml\(NO_DOMAIN_YET_\)\}<\/div>` : ""\}/.test(adminJs) && !/return NO_DOMAIN_YET_;/.test(adminJs));
+  ok("…and its last step offers Preview instead of opening the shop", /if \(!root\) return \{\n    title: "Ready to open the shop\?", noNext: true,/.test(adminJs) && /onclick="previewShop_\(/.test(adminJs));
 
   console.log("\n=== The signing secret ===");
   // Cloudflare's page asks only for the setup password, so a button install has no SIGNING_SECRET

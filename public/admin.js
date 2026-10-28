@@ -39,7 +39,7 @@ let _boxPresetsCache = null; // cached from DB; null = not yet loaded
 // shops live at <subdomain>.<root domain>. "" while the site has no domain yet (a Deploy-button
 // install on its workers.dev address): never guessed from this page's own address.
 function siteRootDomain_(){ return String((typeof siteInfo_ !== "undefined" && siteInfo_ && siteInfo_.rootDomain) || ""); }
-const NO_DOMAIN_YET_ = "This site doesn't have its own domain yet, so shops can't be created: each shop's address is <name>.<your domain>.";
+const NO_DOMAIN_YET_ = "This shop can't open for orders until your site has its own domain: each shop's address is <name>.<your domain>. Until then you can build it and preview it.";
 const ADMIN_SESSION_STORAGE_KEY = "oddAdminSession";
 
 function loadStoredSession(){
@@ -6781,9 +6781,10 @@ function wizScreen_(step){
   const picked = (name) => [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(x => x.value);
   switch (step.id) {
     case "name": {
-      const made = !!_wiz.orgId;
+      const made = !!_wiz.orgId, noDomain = !siteRootDomain_();
       return { title: "What's the shop called?", help: "Usually the group it's for — a club, a team, a school. You can change it later.",
-        html: `<input type="text" id="wizName" class="wiz-input" maxlength="80" value="${escapeHtml(o.name || "")}" placeholder="e.g. Northside Rowing Club" autofocus>
+        ...(noDomain && !made ? { nextLabel: "Continue in preview mode" } : {}),
+        html: `${noDomain ? `<div class="wiz-warn">${escapeHtml(NO_DOMAIN_YET_)}</div>` : ""}<input type="text" id="wizName" class="wiz-input" maxlength="80" value="${escapeHtml(o.name || "")}" placeholder="e.g. Northside Rowing Club" autofocus>
           <div class="wiz-sub-line" id="wizAddr">${made ? `Web address: <strong>${escapeHtml(o.subdomain)}</strong>.${escapeHtml(siteRootDomain_() || "<your domain>")}` : ""}</div>
           <details class="wiz-more"><summary>Change the web address</summary>
             ${made ? "" : `<label>Shop ID <input type="text" id="wizId" class="wiz-input" maxlength="40"></label>`}
@@ -6818,7 +6819,6 @@ function wizScreen_(step){
             return "";
           }
           const orgId = val("#wizId"), subdomain = val("#wizSub");
-          if (!siteRootDomain_()) return NO_DOMAIN_YET_;
           if (!/^[a-z0-9-]{2,40}$/.test(orgId)) return "The shop ID needs 2–40 lowercase letters, numbers or dashes.";
           if (orgId === "all") return "“all” is reserved — pick another shop ID under “Change the web address”.";
           { const why = webAddressProblem_(subdomain, null); if (why) return why + " Change it under “Change the web address”."; }
@@ -7455,6 +7455,12 @@ function wizLiveScreen_(){
         <a class="admin-btn admin-btn-secondary" href="#catalog/orgs/${encodeURIComponent(o.orgId)}/products">Its products</a>
         <a class="admin-btn admin-btn-secondary" href="#wizard/${encodeURIComponent(o.orgId)}/products">Add more products</a></div>
       <div class="wiz-note">Changes you make from now on are drafts until you publish the shop again (Manage catalog → Publish).</div>`,
+    save: async () => "" };
+  if (!root) return {
+    title: "Ready to open the shop?", noNext: true,
+    html: `<div class="wiz-warn">${escapeHtml(NO_DOMAIN_YET_)}</div>
+      <div class="wiz-actions"><button type="button" class="admin-btn" onclick="previewShop_(${escapeHtml(JSON.stringify(o.orgId || ""))})">Preview the shop</button></div>
+      <div class="wiz-note">When your site has its own domain, come back to this step to open the shop for orders.</div>`,
     save: async () => "" };
   return {
     title: "Ready to open the shop?",
@@ -8980,6 +8986,7 @@ async function loadOrgTierBox_(orgId){
 // createOrg `domain` result.
 function orgDomainText_(d, subdomain){
   const host = (d && d.hostname) || (subdomain && siteRootDomain_() ? subdomain + "." + siteRootDomain_() : "the shop's subdomain");
+  if (d && d.noDomain) return "This shop gets its web address when your site has its own domain.";
   if (!d || !d.configured) return `Automatic domain setup isn't configured — add ${host} under Workers & Pages → Custom domains in Cloudflare.`;
   if (d.error) return `Custom domain for ${host} was NOT set up: ${d.error}`;
   if (!d.exists) return `${host} hasn't been added to Cloudflare yet.`;

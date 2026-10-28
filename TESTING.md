@@ -86,9 +86,10 @@ email and password again. Everything you made is kept. The sign-in box has the s
 
 ### 6. Look around (10 minutes)
 
-Click through the back office as if you ran a small shop. Creating a shop is refused for now: each
-shop's address is part of your own domain, and setting up a domain isn't built into this test yet.
-Everything else is fair game.
+Click through the back office as if you ran a small shop. You can build a shop with **New shop
+setup** and look at it with **Preview**, but it can't open for orders yet: each shop's address is part
+of your own domain, and setting up a domain isn't built into this test yet. Everything else is fair
+game.
 
 ### 7. Optional: check an update keeps your data
 
