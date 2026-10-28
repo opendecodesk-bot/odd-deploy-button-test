@@ -60,9 +60,21 @@ const ok = (d, c) => { console.log(d + ":", !!c); c ? pass++ : fail++; };
   const linked = await previewAt("https://admin.myshop.com", there.cookie);
   ok("a draft preview links to the shop's own address on the domain", linked.status === 200 && /^https:\/\/league\.myshop\.com\/\?preview=/.test(linked.body.url));
   delete B.env.ROOT_DOMAIN;
-  const unlinked = await previewAt(W, own.cookie);
-  ok("…and without a domain it is refused with the same words, never a link to <shop>.example.com", unlinked.status === 409 && unlinked.body.code === "no_domain" && unlinked.body.message === made.body.message && !unlinked.body.url &&
-    /if \(!siteRootDomain_\(\)\) return showToast\(NO_DOMAIN_YET_, true\);/.test(read("public/admin.js")));
+  const devLink = await previewAt(W, own.cookie);
+  ok("without a domain, the draft preview opens on the admin's own workers.dev address and names its shop", devLink.status === 200 &&
+    /^https:\/\/opendecodesk\.someone\.workers\.dev\/\?shop=league&preview=\d+\.[0-9a-f]{64}$/.test(devLink.body.url));
+  const { prelude } = require("./testlib/auth-harness");
+  const shopCatalog = new Function(prelude().replace("const getCatalogData = async () => ({ subdomainMap: {}, business: {} });", "let getCatalogData;") +
+    strip(read("functions/api/catalog.js")) + "\nreturn { get: onRequestGet, set: (f) => { getCatalogData = f; } };")();
+  const dbLib = await import("./functions/_lib/db.js");
+  shopCatalog.set(async () => ({ ...(await dbLib.getPublicCatalogData(B.d1)), subdomainMap: {} }));
+  const at = async (u, e = B.env) => JSON.parse(await (await shopCatalog.get({ request: { url: u.replace(/^(https:\/\/[^/]+)\//, "$1/api/catalog") }, env: e })).text());
+  const shown = await at(devLink.body.url);
+  ok("…where that link shows the shop's draft, which takes no orders", shown.status === "ok" && shown.preview === true && shown.orgId === "league" && shown.catalog.name === "League");
+  const tok = new URL(devLink.body.url).searchParams.get("preview");
+  const probes = [W + "/?shop=other&preview=" + tok, W + "/?shop=league&preview=" + tok.replace(/.$/, c => c === "0" ? "1" : "0"), W + "/?shop=league", W + "/?shop=league&preview=1.ab"];
+  ok("a token for another shop, a changed or missing token: the admin answer, nothing about the shop", (await Promise.all(probes.map(u => at(u)))).every(a => a.status === "admin" && !a.catalog && !a.orgId));
+  ok("…and once the site has a domain, the workers.dev address serves no shop at all", (await at(devLink.body.url, { ...B.env, ROOT_DOMAIN: "myshop.com" })).status === "admin");
   B.env.ROOT_DOMAIN = "myshop.com"; delete B.env.SIGNING_SECRET;
 
   const catalog = new Function(strip(read("functions/_lib/hostConfig.js")) + "\n" + strip(read("functions/_lib/http.js")) + "\n" +

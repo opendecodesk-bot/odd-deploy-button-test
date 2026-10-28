@@ -324,7 +324,7 @@ for (const [feature, actions] of Object.entries(FEATURE_ACTIONS)) for (const a o
 const featureLabel_ = (key) => (FEATURES.find(f => f.key === key) || { label: key }).label;
 const NO_SHIPPING_FEATURE_MSG = "Carrier shipping is turned off (Global settings → Features → Shipping). Use Local pickup or a custom delivery option with a flat fee instead.";
 // A Deploy-button install before its Setup step (noDomainYet in onRequestPost). public/admin.js says the same (NO_DOMAIN_YET_).
-const NO_DOMAIN_MSG = "This site doesn't have its own domain yet, so shops can't be created or previewed: each shop's address is <name>.<your domain>.";
+const NO_DOMAIN_MSG = "This site doesn't have its own domain yet, so shops can't be created: each shop's address is <name>.<your domain>.";
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -333,8 +333,8 @@ export async function onRequestPost(context) {
   const clientIp = request.headers.get("CF-Connecting-IP") || null;
   const auditEntry = (args) => ({ ...args, actor: adminActor(request), ip: clientIp });
   // A Deploy-button install has no domain until its Setup step, and every shop's address is
-  // <subdomain>.<domain>: anything that would make or link to a shop's address is refused until then
-  // (rootDomain(env) would say example.com).
+  // <subdomain>.<domain> (rootDomain(env) would say example.com): no shop is made until then, and a
+  // draft preview opens on the admin's own workers.dev address instead (catalog.js).
   const noDomainYet = () => !env.ROOT_DOMAIN && /\.workers\.dev$/i.test(new URL(request.url).hostname);
   const noDomainResponse = () => jsonResponse({ status: "error", code: "no_domain", message: NO_DOMAIN_MSG }, 409);
   // Costs and margins (pricing awareness, migrations/0067) are a manager's. Staff save products and blanks
@@ -3433,9 +3433,9 @@ export async function onRequestPost(context) {
     if (body.action === "getPreviewLink") {
       const org = await getOrgById(env.DB, String(body.org || ""));
       if (!org) return jsonResponse({ status: "error", message: "Shop not found" }, 404);
-      if (noDomainYet()) return noDomainResponse();
       const token = await signPreviewToken(env, org.orgId);
       if (!token) return jsonResponse({ status: "error", message: "Set the SIGNING_SECRET variable first — the preview link is signed with it." }, 400);
+      if (noDomainYet()) return jsonResponse({ status: "ok", url: `https://${new URL(request.url).host}/?shop=${encodeURIComponent(org.orgId)}&preview=${encodeURIComponent(token)}`, expiresInMinutes: 60 });
       const root = rootDomain(env);   // the install's root domain (ROOT_DOMAIN), where every shop's address lives
       return jsonResponse({ status: "ok", url: `https://${org.subdomain}.${root}/?preview=${encodeURIComponent(token)}`, expiresInMinutes: 60 });
     }

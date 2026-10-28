@@ -1176,8 +1176,9 @@ let siteInfo_ = {};
 async function resolveCurrentOrg(){
   try{
     // The admin's draft preview (?preview=<signed token>, migrations/0076) is passed through; the server decides.
-    const pv = new URLSearchParams(window.location.search).get("preview");
-    const res = await fetch("/api/catalog" + (pv ? "?preview=" + encodeURIComponent(pv) : ""));
+    // On a site with no domain yet it opens on the admin's workers.dev address and names its shop (?shop=).
+    const qs = new URLSearchParams(window.location.search), pv = qs.get("preview"), pvShop = qs.get("shop");
+    const res = await fetch("/api/catalog" + (pv ? "?preview=" + encodeURIComponent(pv) + (pvShop ? "&shop=" + encodeURIComponent(pvShop) : "") : ""));
     if(!res.ok){ try{ const d = await res.json(); applyBusiness_(d.business); applyCountry_(d.country); applyFeatures_(d.features); }catch(e){} return null; }
     const data = await res.json();
     applyBusiness_(data.business);
